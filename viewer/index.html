@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C5 RSSI Viewer</title>
+<style>
+:root {
+  --bg: #f6f6f4;
+  --panel: #ffffff;
+  --text: #1d1d1b;
+  --muted: #6b6b66;
+  --border: #deded8;
+  --accent: #1f6feb;
+  --accent-text: #ffffff;
+  --trace: #1f6feb;
+  --band: rgba(31, 111, 235, 0.18);
+  --clip: #d1242f;
+  --grid: #e8e8e2;
+  --peak: #bf8700;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111213;
+    --panel: #1a1b1d;
+    --text: #e6e6e3;
+    --muted: #9a9a94;
+    --border: #2e2f32;
+    --accent: #4c8dff;
+    --accent-text: #0b0c0d;
+    --trace: #6ea2ff;
+    --band: rgba(110, 162, 255, 0.2);
+    --clip: #ff6b6b;
+    --grid: #25262a;
+    --peak: #e3b341;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1200px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; flex: 1; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+button, select, input[type=number] {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+input[type=number] { width: 90px; }
+input[type=range] { width: 180px; accent-color: var(--accent); }
+label { color: var(--muted); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.stat { display: grid; }
+.stat span { color: var(--muted); font-size: 12px; }
+.stat b { font-size: 20px; font-variant-numeric: tabular-nums; font-weight: 600; }
+#chart { width: 100%; height: 360px; display: block; }
+#log { height: 90px; overflow: auto; margin: 0; font: 12px/1.4 ui-monospace, Menlo, monospace; color: var(--muted); white-space: pre-wrap; }
+.notice { color: var(--clip); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>C5 RSSI Viewer</h1>
+    <span id="conn" class="muted">Disconnected</span>
+    <button id="connect">Connect</button>
+  </header>
+  <p id="unsupported" class="notice" hidden>This browser has no WebSerial. Use Chrome or Edge, or open with ?demo to see synthetic data.</p>
+
+  <section class="panel row" aria-label="Channel">
+    <label>Raceband</label>
+    <span id="channels" class="row"></span>
+    <label for="freq">MHz</label>
+    <input id="freq" type="number" min="5180" max="5950" step="1">
+    <button id="tune">Tune</button>
+  </section>
+
+  <section class="panel row" aria-label="Receiver">
+    <label for="gain">Gain</label>
+    <input id="gain" type="range" min="0" max="62" step="1">
+    <b id="gainval">-</b>
+    <button id="bw">BW40</button>
+    <label for="window">Window</label>
+    <select id="window">
+      <option value="2">2 s</option>
+      <option value="5">5 s</option>
+      <option value="10" selected>10 s</option>
+      <option value="30">30 s</option>
+      <option value="60">60 s</option>
+    </select>
+    <button id="pause">Pause</button>
+    <button id="resetpeak">Reset peak</button>
+    <button id="record">Record CSV</button>
+  </section>
+
+  <section class="panel stats" aria-label="Readings">
+    <div class="stat"><span>Now (dB)</span><b id="now">-</b></div>
+    <div class="stat"><span>Peak (dB)</span><b id="peak">-</b></div>
+    <div class="stat"><span>Clipped</span><b id="clip">-</b></div>
+    <div class="stat"><span>Frequency</span><b id="curfreq">-</b></div>
+    <div class="stat"><span>Samples/s</span><b id="rate">-</b></div>
+    <div class="stat"><span>Last retune</span><b id="retune">-</b></div>
+  </section>
+
+  <section class="panel"><canvas id="chart"></canvas></section>
+  <section class="panel"><pre id="log"></pre></section>
+</main>
+<script>
+const RACEBAND = [5658, 5695, 5732, 5769, 5806, 5843, 5880, 5917];
+const CAPACITY = 120000;
+const SAMPLES_PER_READING = 4096;
+const Y_MIN = -10, Y_MAX = 22;
+
+const $ = id => document.getElementById(id);
+const state = {
+  t: new Float64Array(CAPACITY),
+  db: new Float32Array(CAPACITY),
+  clip: new Float32Array(CAPACITY),
+  head: 0,
+  count: 0,
+  peak: -Infinity,
+  paused: false,
+  recording: null,
+  rateCount: 0,
+  rateStart: performance.now(),
+  freq: null,
+  gain: null,
+  bw40: true,
+};
+let writer = null;
+
+/* pwr is mean(I^2 + Q^2) * 100 over one reading; 4-bit samples top out near 21 dB. */
+function toDb(pwrX100) {
+  return 10 * Math.log10(Math.max(pwrX100, 1) / 100);
+}
+
+function handleLine(line) {
+  const parts = line.trim().split(/\s+/);
+  switch (parts[0]) {
+  case 'S': {
+    const t = Number(parts[1]) / 1e6;
+    const db = toDb(Number(parts[2]));
+    const clip = Number(parts[3]) / SAMPLES_PER_READING;
+    if (!Number.isFinite(t) || !Number.isFinite(db)) return;
+    state.rateCount++;
+    if (state.recording) state.recording.push(`${parts[1]},${parts[2]},${parts[3]},${state.freq ?? ''},${state.gain ?? ''}`);
+    if (state.paused) return;
+    state.t[state.head] = t;
+    state.db[state.head] = db;
+    state.clip[state.head] = clip;
+    state.head = (state.head + 1) % CAPACITY;
+    state.count = Math.min(state.count + 1, CAPACITY);
+    state.peak = Math.max(state.peak, db);
+    return;
+  }
+  case 'I': {
+    const [freq, gain, bw, retune] = parts.slice(1).map(Number);
+    if (freq !== state.freq) state.peak = -Infinity;
+    state.freq = freq;
+    state.gain = gain;
+    state.bw40 = bw === 1;
+    $('curfreq').textContent = `${freq} MHz`;
+    $('retune').textContent = retune ? `${(retune / 1000).toFixed(2)} ms` : '-';
+    if (document.activeElement !== $('gain')) $('gain').value = gain;
+    $('gainval').textContent = gain;
+    $('bw').textContent = state.bw40 ? 'BW40' : 'BW20';
+    $('bw').classList.toggle('on', !state.bw40);
+    for (const b of $('channels').children) b.classList.toggle('on', Number(b.dataset.mhz) === freq);
+    return;
+  }
+  default:
+    if (line.trim()) log(line);
+  }
+}
+
+function log(msg) {
+  const el = $('log');
+  el.textContent += msg.replace(/\x1b\[[0-9;]*m/g, '') + '\n';
+  if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-10000);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function send(cmd) {
+  if (demo) return demo.command(cmd);
+  if (!writer) return;
+  await writer.write(new TextEncoder().encode(cmd + '\n'));
+}
+
+async function connect() {
+  const port = await navigator.serial.requestPort();
+  await port.open({ baudRate: 115200 });
+  writer = port.writable.getWriter();
+  $('conn').textContent = 'Connected';
+  $('connect').disabled = true;
+  port.addEventListener('disconnect', () => {
+    writer = null;
+    $('conn').textContent = 'Disconnected';
+    $('connect').disabled = false;
+  });
+  await send('?');
+
+  const reader = port.readable.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const l of lines) handleLine(l);
+    }
+  } catch (e) {
+    log(`read error: ${e.message}`);
+  }
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function draw() {
+  const canvas = $('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const left = 36, right = w - 8, top = 8, bottom = h - 22;
+  const y = db => bottom - (db - Y_MIN) / (Y_MAX - Y_MIN) * (bottom - top);
+
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.fillStyle = cssVar('--muted');
+  ctx.strokeStyle = cssVar('--grid');
+  ctx.lineWidth = 1;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let db = Y_MIN; db <= Y_MAX; db += 4) {
+    ctx.beginPath();
+    ctx.moveTo(left, y(db) + 0.5);
+    ctx.lineTo(right, y(db) + 0.5);
+    ctx.stroke();
+    ctx.fillText(db, left - 6, y(db));
+  }
+
+  const windowS = Number($('window').value);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const step = windowS <= 5 ? 1 : windowS <= 10 ? 2 : windowS <= 30 ? 5 : 10;
+  for (let s = 0; s <= windowS; s += step) {
+    const x = right - s / windowS * (right - left);
+    ctx.fillText(s === 0 ? 'now' : `-${s}s`, x, bottom + 6);
+  }
+  if (state.count === 0) return;
+
+  const latest = state.t[(state.head - 1 + CAPACITY) % CAPACITY];
+  const cols = Math.max(1, Math.floor(right - left));
+  const lo = new Float32Array(cols).fill(Infinity);
+  const hi = new Float32Array(cols).fill(-Infinity);
+  const sum = new Float32Array(cols);
+  const n = new Uint32Array(cols);
+  const clip = new Float32Array(cols);
+  for (let k = 0; k < state.count; k++) {
+    const i = (state.head - 1 - k + CAPACITY) % CAPACITY;
+    const age = latest - state.t[i];
+    if (age > windowS || age < 0) break;
+    const c = Math.min(cols - 1, Math.floor((1 - age / windowS) * cols));
+    const v = state.db[i];
+    lo[c] = Math.min(lo[c], v);
+    hi[c] = Math.max(hi[c], v);
+    sum[c] += v;
+    clip[c] = Math.max(clip[c], state.clip[i]);
+    n[c]++;
+  }
+
+  ctx.fillStyle = cssVar('--band');
+  for (let c = 0; c < cols; c++) {
+    if (!n[c]) continue;
+    ctx.fillRect(left + c, y(hi[c]), 1, Math.max(1, y(lo[c]) - y(hi[c])));
+  }
+  ctx.fillStyle = cssVar('--clip');
+  for (let c = 0; c < cols; c++) {
+    if (clip[c] > 0.01) ctx.fillRect(left + c, bottom - 4, 1, 4);
+  }
+  ctx.strokeStyle = cssVar('--trace');
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let started = false;
+  for (let c = 0; c < cols; c++) {
+    if (!n[c]) continue;
+    const py = y(sum[c] / n[c]);
+    if (started) ctx.lineTo(left + c, py); else ctx.moveTo(left + c, py);
+    started = true;
+  }
+  ctx.stroke();
+
+  if (Number.isFinite(state.peak)) {
+    ctx.strokeStyle = cssVar('--peak');
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, y(state.peak) + 0.5);
+    ctx.lineTo(right, y(state.peak) + 0.5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function updateStats() {
+  const now = performance.now();
+  const elapsed = (now - state.rateStart) / 1000;
+  if (elapsed >= 1) {
+    $('rate').textContent = Math.round(state.rateCount / elapsed);
+    state.rateCount = 0;
+    state.rateStart = now;
+  }
+  if (state.count) {
+    const i = (state.head - 1 + CAPACITY) % CAPACITY;
+    $('now').textContent = state.db[i].toFixed(1);
+    $('clip').textContent = `${(state.clip[i] * 100).toFixed(1)}%`;
+  }
+  $('peak').textContent = Number.isFinite(state.peak) ? state.peak.toFixed(1) : '-';
+}
+
+function frame() {
+  draw();
+  updateStats();
+  requestAnimationFrame(frame);
+}
+
+function downloadCsv(rows) {
+  const blob = new Blob(['t_us,pwr_x100,clip,freq_mhz,gain\n' + rows.join('\n') + '\n'], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `rssi-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* Synthetic device for trying the page without hardware: noise plus a drone
+ * pass every 4 s whose strength depends on how far the tuned channel is from R3. */
+function makeDemo() {
+  let freq = RACEBAND[2], gain = 40, bw40 = true, t0 = performance.now();
+  const status = () => handleLine(`I ${freq} ${gain} ${bw40 ? 1 : 0} 0`);
+  setInterval(() => {
+    const now = performance.now();
+    for (let k = 0; k < 16; k++) {
+      const t = (now - t0) / 1000 + k / 1000;
+      const d = ((t % 4) - 2) * 25;
+      const near = 40 / (1 + d * d);
+      const off = Math.abs(freq - RACEBAND[2]);
+      const sig = near * Math.pow(10, -off / (bw40 ? 30 : 15)) * Math.pow(10, (gain - 40) / 20);
+      const pwr = Math.min(12800, 250 + sig * 100 * (1 + 0.3 * (Math.random() - 0.5)));
+      const clip = Math.round(Math.max(0, pwr - 3000) / 10);
+      handleLine(`S ${Math.round(t * 1e6)} ${Math.round(pwr)} ${clip}`);
+    }
+  }, 16);
+  setInterval(status, 1000);
+  status();
+  return {
+    command(cmd) {
+      const arg = Number(cmd.slice(1));
+      if (cmd[0] === 'f') freq = arg;
+      if (cmd[0] === 'g') gain = arg;
+      if (cmd[0] === 'b') bw40 = arg !== 0;
+      status();
+    },
+  };
+}
+
+for (const [i, mhz] of RACEBAND.entries()) {
+  const b = document.createElement('button');
+  b.textContent = `R${i + 1}`;
+  b.title = `${mhz} MHz`;
+  b.dataset.mhz = mhz;
+  b.addEventListener('click', () => send(`f${mhz}`));
+  $('channels').append(b);
+}
+$('tune').addEventListener('click', () => send(`f${$('freq').value}`));
+$('freq').addEventListener('keydown', e => { if (e.key === 'Enter') send(`f${$('freq').value}`); });
+$('gain').addEventListener('input', () => { $('gainval').textContent = $('gain').value; });
+$('gain').addEventListener('change', () => send(`g${$('gain').value}`));
+$('bw').addEventListener('click', () => send(`b${state.bw40 ? 0 : 1}`));
+$('resetpeak').addEventListener('click', () => { state.peak = -Infinity; });
+$('pause').addEventListener('click', () => {
+  state.paused = !state.paused;
+  $('pause').classList.toggle('on', state.paused);
+});
+$('record').addEventListener('click', () => {
+  if (state.recording) {
+    downloadCsv(state.recording);
+    state.recording = null;
+    $('record').textContent = 'Record CSV';
+    $('record').classList.remove('on');
+  } else {
+    state.recording = [];
+    $('record').textContent = 'Stop and save';
+    $('record').classList.add('on');
+  }
+});
+$('connect').addEventListener('click', () => connect().catch(e => log(`connect failed: ${e.message}`)));
+
+const demo = new URLSearchParams(location.search).has('demo') ? makeDemo() : null;
+if (demo) {
+  $('conn').textContent = 'Demo data';
+  $('connect').disabled = true;
+} else if (!('serial' in navigator)) {
+  $('unsupported').hidden = false;
+  $('connect').disabled = true;
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
