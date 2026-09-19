@@ -1,9 +1,11 @@
 /**
  * main.c - RSSI meter for analog FPV video on the ESP32-C5.
  *
- * PARLIO RX streams MODEM_DIAG I/Q into a cyclic DMA ring with no CPU
- * involvement. Once per millisecond a task averages I^2 + Q^2 over the ring
- * and prints one line over USB. See viewer/ for the host side and README.md
+ * PARLIO RX streams MODEM_DIAG I/Q bytes into a cyclic DMA ring with no CPU
+ * involvement. Once per millisecond a task averages signal power over the
+ * ring and prints one line over USB. With an 8-bit single-component layout,
+ * power is 2 * mean(Q^2) (or I^2): FM keeps the phasor rotating, so each
+ * component carries half the power on average. See viewer/ for the host side and README.md
  * for the line protocol.
  */
 
@@ -29,6 +31,9 @@
 #define IQ_RATE_HZ    40000000u
 #define RING_BYTES    16384u
 #define SAMPLE_STRIDE 4u
+#define SAMPLES_PER_READING (RING_BYTES / SAMPLE_STRIDE)
+#define DUMP_BYTES    1024u
+#define DUMP_CHUNK    128u
 #define PARLIO_PERI_ID 9
 #define STATUS_PERIOD_MS 1000u
 
@@ -36,18 +41,28 @@ static const char *TAG = "rssi";
 
 static DMA_ATTR __attribute__((aligned(64))) uint8_t s_ring[RING_BYTES];
 
-/* Low byte: I^2 + Q^2 of the signed 4-bit pair. High byte: 1 if clipped. */
-static uint16_t s_power_lut[256];
+/* Indexed by one captured byte, in units of 8-bit LSB^2. Bits 0-15: power at
+ * the layout's full resolution. Bits 16-23: power using only the top 4 bits
+ * of each component, divided by 256. Bit 24: clipped. */
+static uint32_t s_power_luts[RF_LAYOUT_COUNT][256];
 
 static volatile uint32_t s_retune_us;
 
 static void build_power_lut(void)
 {
     for (int b = 0; b < 256; ++b) {
-        int q = (int8_t)((b & 0x0f) << 4) >> 4;
-        int i = (int8_t)(b & 0xf0) >> 4;
-        bool clip = i == -8 || i == 7 || q == -8 || q == 7;
-        s_power_lut[b] = (uint16_t)((i * i + q * q) | (clip ? 0x100 : 0));
+        int q4 = (int8_t)((b & 0x0f) << 4) >> 4;
+        int i4 = (int8_t)(b & 0xf0) >> 4;
+        uint32_t p4 = (uint32_t)(i4 * i4 + q4 * q4);
+        bool clip4 = i4 == -8 || i4 == 7 || q4 == -8 || q4 == 7;
+        s_power_luts[RF_LAYOUT_IQ4][b] = (p4 * 256u) | (p4 << 16) | (clip4 ? 1u << 24 : 0u);
+
+        int v = (int8_t)b;
+        int v4 = v >> 4;
+        bool clip8 = v == -128 || v == 127;
+        uint32_t p8 = (uint32_t)(2 * v * v);
+        s_power_luts[RF_LAYOUT_Q8][b] = p8 | ((uint32_t)(2 * v4 * v4) << 16) | (clip8 ? 1u << 24 : 0u);
+        s_power_luts[RF_LAYOUT_I8][b] = s_power_luts[RF_LAYOUT_Q8][b];
     }
 }
 
@@ -60,19 +75,17 @@ static esp_err_t start_capture(void)
         .trans_queue_depth = 1u,
         .max_recv_size = sizeof(s_ring),
         .dma_burst_size = 32u,
-        .data_width = 8u,
+        .data_width = RF_IQ_LANES,
         .clk_src = PARLIO_CLK_SRC_DEFAULT,
         .exp_clk_freq_hz = IQ_RATE_HZ,
         .clk_in_gpio_num = -1,
         .clk_out_gpio_num = -1,
         .valid_gpio_num = -1,
-        .data_gpio_nums = {
-            GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_7,
-            GPIO_NUM_10, GPIO_NUM_5, GPIO_NUM_3, GPIO_NUM_4,
-        },
         .flags = { .free_clk = true },
     };
-    esp_err_t err = parlio_new_rx_unit(&cfg, &rx);
+    parlio_rx_unit_config_t cfg_pins = cfg;
+    memcpy(cfg_pins.data_gpio_nums, rf_iq_pins, sizeof(rf_iq_pins));
+    esp_err_t err = parlio_new_rx_unit(&cfg_pins, &rx);
     if (err != ESP_OK) return err;
 
     parlio_rx_delimiter_handle_t delim;
@@ -98,7 +111,7 @@ static esp_err_t start_capture(void)
         if (AHB_DMA.channel[ch].in.in_peri_sel.peri_in_sel_chn != PARLIO_PERI_ID) continue;
         uint32_t first = AHB_DMA.channel[ch].in.in_dscr_bf0.val;
         dma_descriptor_t *d = (dma_descriptor_t *)(uintptr_t)first;
-        for (int n = 0; d && n < 16; ++n) {
+        for (int n = 0; d && n < 32; ++n) {
             d->dw0.suc_eof = 0;
             d = d->next;
             if ((uintptr_t)d == first) break;
@@ -114,12 +127,31 @@ static void out(const char *buf, size_t len)
         usb_serial_jtag_write_bytes(buf, len, 0);
 }
 
+/* Raw bytes for checking the bit mapping on the host, as D lines of hex. */
+static void dump_samples(void)
+{
+    static uint8_t snap[DUMP_BYTES];
+    (void)esp_cache_msync(s_ring, sizeof(s_ring), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    memcpy(snap, s_ring, sizeof(snap));
+
+    char line[24 + DUMP_CHUNK * 2];
+    for (unsigned c = 0; c < DUMP_BYTES / DUMP_CHUNK; ++c) {
+        int n = snprintf(line, sizeof(line), "D %u %u %u ", (unsigned)rf_get_layout(), c,
+                         DUMP_BYTES / DUMP_CHUNK);
+        for (unsigned w = 0; w < DUMP_CHUNK; ++w)
+            n += snprintf(line + n, sizeof(line) - n, "%02x", snap[c * DUMP_CHUNK + w]);
+        line[n++] = '\n';
+        usb_serial_jtag_write_bytes(line, n, pdMS_TO_TICKS(100));
+    }
+}
+
 static void print_status(void)
 {
     char line[64];
-    int n = snprintf(line, sizeof(line), "I %u %u %u %u %lu\n",
+    int n = snprintf(line, sizeof(line), "I %u %u %u %u %u %lu\n",
                      rf_get_freq(), rf_get_gain(), rf_get_bw40() ? 1u : 0u,
-                     rf_get_external_antenna() ? 1u : 0u, (unsigned long)s_retune_us);
+                     rf_get_external_antenna() ? 1u : 0u, (unsigned)rf_get_layout(),
+                     (unsigned long)s_retune_us);
     out(line, n);
 }
 
@@ -134,17 +166,21 @@ static void measure_task(void *arg)
         vTaskDelayUntil(&wake, 1);
 
         (void)esp_cache_msync(s_ring, sizeof(s_ring), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        uint32_t sum = 0, clip = 0;
+        const uint32_t *lut = s_power_luts[rf_get_layout()];
+        uint32_t sum = 0, sum4 = 0, clip = 0;
         for (uint32_t i = 0; i < RING_BYTES; i += SAMPLE_STRIDE) {
-            uint16_t v = s_power_lut[s_ring[i]];
-            sum += v & 0xffu;
-            clip += v >> 8;
+            uint32_t v = lut[s_ring[i]];
+            sum += v & 0xffffu;
+            sum4 += (v >> 16) & 0xffu;
+            clip += v >> 24;
         }
-        uint32_t pwr_x100 = (uint32_t)((uint64_t)sum * 100u / (RING_BYTES / SAMPLE_STRIDE));
+        uint32_t pwr_x100 = (uint32_t)((uint64_t)sum * 100u / SAMPLES_PER_READING);
+        uint32_t pwr4_x100 = (uint32_t)((uint64_t)sum4 * 25600u / SAMPLES_PER_READING);
 
-        used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu\n",
+        used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu %lu\n",
                          (unsigned long long)esp_timer_get_time(),
-                         (unsigned long)pwr_x100, (unsigned long)clip);
+                         (unsigned long)pwr_x100, (unsigned long)pwr4_x100,
+                         (unsigned long)clip);
         if (used > sizeof(batch) - 64) {
             out(batch, used);
             used = 0;
@@ -175,6 +211,13 @@ static void handle_command(char *line)
         break;
     case 'a':
         rf_set_external_antenna(arg != 0);
+        break;
+    case 'm':
+        if (arg < 0 || arg >= RF_LAYOUT_COUNT) err = ESP_ERR_INVALID_ARG;
+        else rf_set_layout((rf_layout_t)arg);
+        break;
+    case 'd':
+        dump_samples();
         break;
     case '?':
         break;

@@ -11,15 +11,35 @@ This branch is an experiment. The docs in [docs/](docs/) describe the original C
 ```mermaid
 flowchart LR
     A[Antenna] --> B[C5 Wi-Fi PHY<br/>tuned to the FPV channel,<br/>fixed gain]
-    B -->|4-bit I/Q on MODEM_DIAG| C[GPIO loopback]
+    B -->|8 of the 20 I/Q bits on MODEM_DIAG| C[GPIO loopback]
     C --> D[PARLIO RX 40 MHz<br/>16 KiB cyclic DMA ring]
-    D -->|every 1 ms| E[Task: mean of I² + Q²<br/>over 4096 samples]
+    D -->|every 1 ms| E[Task: mean power<br/>over 4096 samples]
     E -->|text line| F[USB serial]
     F --> G[viewer/index.html]
 ```
 
 - [main/rf.c](main/rf.c) starts Wi-Fi receive-only, disables the vendor AGC, forces continuous sampling, and routes I/Q to GPIO. It tunes any frequency from 5180 to 5950 MHz by landing on the nearest Wi-Fi channel and then calling the undocumented `phy_set_freq()`.
-- [main/main.c](main/main.c) captures the I/Q into a DMA ring that refills itself with no CPU involvement. Once per millisecond it averages I² + Q² over every 4th byte of the ring (about 410 µs of signal) and prints the result.
+- [main/main.c](main/main.c) captures the I/Q into a DMA ring that refills itself with no CPU involvement. Once per millisecond it averages signal power over every 4th byte of the ring (about 410 µs of signal) and prints the result.
+
+## Capture layouts
+
+The ADC produces 10-bit I and Q, and MODEM_DIAG exposes them on 20 lines. PARLIO RX on the C5 captures at most 8 lines, so the firmware picks 8 of them, switchable at runtime:
+
+| Layout | Command | Byte contents | Power |
+|---|---|---|---|
+| I+Q 4-bit | `m0` | I[9:6] in the high nibble, Q[9:6] in the low nibble | I² + Q² |
+| Q 8-bit | `m1` | Q[9:2] | 2 × Q² |
+| I 8-bit | `m2` | I[9:2] | 2 × I² |
+
+The 8-bit layouts give up one component. Video keeps an FM carrier rotating, so over 410 µs each component carries half the power, and doubling Q² recovers the total. Each extra bit adds about 6 dB between the noise floor and clipping, so 8-bit should cover about 45 dB against about 20 dB for 4-bit.
+
+Only DIAG 6-9 (Q[9:6]) and 16-19 (I[9:6]) are verified on hardware. The 8-bit layouts assume DIAG n carries Q[n] and DIAG 10+n carries I[n]. To check, select Q 8-bit with a VTX nearby, click "Capture raw samples", and read:
+
+- The bit table: bits that sit at 0% or 100% ones are stuck, and bits that toggle close to 100% of the time are clocks. Real low bits sit near 50% ones and toggle around 50%.
+- The histogram: real bits give a smooth shape. Unrelated low bits give flat steps between the lines every 16 values, and stuck ones give isolated spikes. The summary sentence reports the step size as a ratio, where near 1 is smooth.
+- The waveform: the 8-bit trace should follow the 4-bit staircase closely and fill in between its steps.
+
+The live chart always draws a second trace computed from only the top 4 bits of the same samples, so the gain in range is visible directly.
 
 ## Build
 
@@ -59,8 +79,9 @@ The graph shows the mean in each pixel column as a line, the min/max range as a 
 
 Each line from the board is one record:
 
-- `S <t_us> <pwr_x100> <clip>` is one reading. `pwr_x100` is 100 × mean(I² + Q²) over 4096 samples, so dB = 10·log10(pwr_x100 / 100). `clip` counts samples where I or Q hit the 4-bit limit.
-- `I <freq_mhz> <gain> <bw40> <external_antenna> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
+- `S <t_us> <pwr_x100> <pwr4_x100> <clip>` is one reading. `pwr_x100` is 100 × the mean power over 4096 samples in units of 8-bit LSB², so dB = 10·log10(pwr_x100 / 100). `pwr4_x100` is the same using only the top 4 bits of each component, on the same scale. `clip` counts samples at the layout's limit.
+- `I <freq_mhz> <gain> <bw40> <external_antenna> <layout> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
+- `D <layout> <chunk> <chunks> <hex>` carries part of a raw capture: 1024 consecutive bytes split over 8 lines.
 - `E <command>: <error>` reports a rejected command.
 - Anything else is ESP-IDF log output.
 
@@ -70,17 +91,20 @@ Commands to the board are one line each:
 - `g<n>` sets the fixed receive gain, 0 to 62. Higher is more sensitive. It starts at 40.
 - `b0` or `b1` selects the BW20 (±10 MHz) or BW40 (±20 MHz) analog filter. BW20 rejects neighboring channels better.
 - `a0` or `a1` selects the on-board antenna or the U.FL connector (GPIO26). It starts on the on-board antenna.
+- `m0`, `m1` or `m2` selects the capture layout. It starts at `m0`.
+- `d` sends a raw capture as `D` lines.
 - `?` requests an `I` line.
 
 ## What to test first
 
-1. R8 tunes at all. Tune `f5917` with a VTX on R8 and confirm the reading rises when you bring it close. 5917 MHz is above every Wi-Fi channel, so this is untested.
-2. A walk-past gives a clean peak. Try a few gains: too high and the noise floor sits near the top with clipping on every pass, too low and passes at a distance disappear.
-3. A neighbor on the adjacent Raceband channel doesn't raise the reading much, in BW40 and BW20.
-4. The viewer reports close to 1000 samples/s.
+1. The low bits are real: see [Capture layouts](#capture-layouts). If they are, use Q 8-bit for everything else.
+2. R8 tunes at all. Tune `f5917` with a VTX on R8 and confirm the reading rises when you bring it close. 5917 MHz is above every Wi-Fi channel, so this is untested.
+3. A walk-past gives a clean peak. Try a few gains: too high and the noise floor sits near the top with clipping on every pass, too low and passes at a distance disappear.
+4. A neighbor on the adjacent Raceband channel doesn't raise the reading much, in BW40 and BW20.
+5. The viewer reports close to 1000 samples/s.
 
 ## Limits
 
-- Readings are relative dB, not dBm. At a fixed gain the 4-bit samples cover roughly 20 to 25 dB between the noise floor and clipping. That is enough to spot a close pass but not to measure distance.
+- Readings are relative dB, not dBm.
 - Retune time is unmeasured; the viewer shows it as "Last retune". Readings taken during a retune are meaningless.
 - Everything below Wi-Fi driver level uses undocumented Espressif functions and register addresses tied to ESP-IDF 6.0.

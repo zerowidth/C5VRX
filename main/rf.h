@@ -1,7 +1,24 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "driver/gpio.h"
 #include "esp_err.h"
+
+/* rf_iq_pins[n] carries bit n of each captured byte. */
+#define RF_IQ_LANES 8
+extern const gpio_num_t rf_iq_pins[RF_IQ_LANES];
+
+/* What each captured byte holds. PARLIO RX is limited to 8 lines, so full
+ * resolution means giving up one of I or Q. */
+typedef enum {
+    RF_LAYOUT_IQ4 = 0, /* high nibble signed I[9:6], low nibble signed Q[9:6] */
+    RF_LAYOUT_Q8 = 1,  /* signed Q[9:2] */
+    RF_LAYOUT_I8 = 2,  /* signed I[9:2] */
+    RF_LAYOUT_COUNT
+} rf_layout_t;
+
+void rf_set_layout(rf_layout_t layout);
+rf_layout_t rf_get_layout(void);
 
 /* Receive-only Wi-Fi PHY with MODEM_DIAG I/Q routed to GPIO. See rf.c. */
 esp_err_t rf_start(void);

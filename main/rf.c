@@ -47,15 +47,19 @@
 /* Waveshare ESP32-C5-Zero: low selects the on-board antenna, high the U.FL. */
 #define ANTENNA_SEL_GPIO GPIO_NUM_26
 
-/* Must match the PARLIO RX data_gpio_nums order in main.c. */
-static const gpio_num_t s_iq_pins[8] = {
-    GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_7,   /* Q[9:6] */
-    GPIO_NUM_10, GPIO_NUM_5, GPIO_NUM_3, GPIO_NUM_4,   /* I[9:6] */
+const gpio_num_t rf_iq_pins[RF_IQ_LANES] = {
+    GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_7,
+    GPIO_NUM_10, GPIO_NUM_5, GPIO_NUM_3, GPIO_NUM_4,
 };
-static const uint8_t s_iq_diag[8] = {
-    6u, 7u, 8u, 9u,
-    16u, 17u, 18u, 19u,
+
+/* Only DIAG 6-9 = Q[9:6] and 16-19 = I[9:6] are hardware-verified. The 8-bit
+ * layouts assume the pattern continues: DIAG n = Q[n], DIAG 10+n = I[n]. */
+static const uint8_t s_layout_diag[RF_LAYOUT_COUNT][RF_IQ_LANES] = {
+    [RF_LAYOUT_IQ4] = { 6, 7, 8, 9, 16, 17, 18, 19 },
+    [RF_LAYOUT_Q8]  = { 2, 3, 4, 5, 6, 7, 8, 9 },
+    [RF_LAYOUT_I8]  = { 12, 13, 14, 15, 16, 17, 18, 19 },
 };
+static rf_layout_t s_layout = RF_LAYOUT_IQ4;
 
 extern int lmac_stop_hw_txq(void);
 extern void phy_disable_agc(void);
@@ -116,8 +120,8 @@ static esp_err_t lock_rx_only(void)
 static esp_err_t route_modem_iq(void)
 {
     uint64_t mask = 0u;
-    for (unsigned lane = 0u; lane < 8u; ++lane)
-        mask |= 1ULL << s_iq_pins[lane];
+    for (unsigned lane = 0u; lane < RF_IQ_LANES; ++lane)
+        mask |= 1ULL << rf_iq_pins[lane];
     const gpio_config_t cfg = {
         .pin_bit_mask = mask,
         .mode = GPIO_MODE_INPUT_OUTPUT,
@@ -127,11 +131,7 @@ static esp_err_t route_modem_iq(void)
     };
     esp_err_t err = gpio_config(&cfg);
     if (err != ESP_OK) return err;
-    for (unsigned lane = 0u; lane < 8u; ++lane) {
-        esp_rom_gpio_connect_out_signal(s_iq_pins[lane],
-                                        MODEM_DIAG0_IDX + s_iq_diag[lane],
-                                        false, false);
-    }
+    rf_set_layout(s_layout);
     return ESP_OK;
 }
 
@@ -283,4 +283,19 @@ void rf_set_external_antenna(bool external)
 bool rf_get_external_antenna(void)
 {
     return s_external_antenna;
+}
+
+void rf_set_layout(rf_layout_t layout)
+{
+    s_layout = layout;
+    for (unsigned lane = 0u; lane < RF_IQ_LANES; ++lane) {
+        esp_rom_gpio_connect_out_signal(rf_iq_pins[lane],
+                                        MODEM_DIAG0_IDX + s_layout_diag[layout][lane],
+                                        false, false);
+    }
+}
+
+rf_layout_t rf_get_layout(void)
+{
+    return s_layout;
 }
