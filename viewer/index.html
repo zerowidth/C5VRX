@@ -18,6 +18,7 @@
   --clip: #d1242f;
   --grid: #e8e8e2;
   --peak: #bf8700;
+  --trace4: #cf222e;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -33,6 +34,7 @@
     --clip: #ff6b6b;
     --grid: #25262a;
     --peak: #e3b341;
+    --trace4: #ff8182;
   }
 }
 * { box-sizing: border-box; }
@@ -69,6 +71,15 @@ label { color: var(--muted); }
 #chart { width: 100%; height: 360px; display: block; }
 #log { height: 90px; overflow: auto; margin: 0; font: 12px/1.4 ui-monospace, Menlo, monospace; color: var(--muted); white-space: pre-wrap; }
 .notice { color: var(--clip); }
+.legend { display: flex; gap: 16px; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 6px; }
+.rawplots { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 12px; }
+.rawplots canvas { width: 100%; height: 200px; display: block; }
+.rawplots h3 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 4px; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; }
+th, td { padding: 2px 10px 2px 0; text-align: right; }
+th { color: var(--muted); font-weight: 500; }
+td:first-child, th:first-child { text-align: left; }
 </style>
 </head>
 <body>
@@ -94,6 +105,12 @@ label { color: var(--muted); }
     <b id="gainval">-</b>
     <button id="bw">BW40</button>
     <button id="ant" title="Antenna: on-board chip antenna or U.FL connector">On-board antenna</button>
+    <label for="layout">Capture</label>
+    <select id="layout">
+      <option value="0">I+Q 4-bit</option>
+      <option value="1">Q 8-bit</option>
+      <option value="2">I 8-bit</option>
+    </select>
     <label for="window">Window</label>
     <select id="window">
       <option value="2">2 s</option>
@@ -109,6 +126,7 @@ label { color: var(--muted); }
 
   <section class="panel stats" aria-label="Readings">
     <div class="stat"><span>Now (dB)</span><b id="now">-</b></div>
+    <div class="stat"><span>Top 4 bits (dB)</span><b id="now4">-</b></div>
     <div class="stat"><span>Peak (dB)</span><b id="peak">-</b></div>
     <div class="stat"><span>Clipped</span><b id="clip">-</b></div>
     <div class="stat"><span>Frequency</span><b id="curfreq">-</b></div>
@@ -116,19 +134,43 @@ label { color: var(--muted); }
     <div class="stat"><span>Last retune</span><b id="retune">-</b></div>
   </section>
 
-  <section class="panel"><canvas id="chart"></canvas></section>
+  <section class="panel">
+    <div class="legend"><span><i style="background: var(--trace)"></i>Full resolution</span><span><i style="background: var(--trace4)"></i>Top 4 bits only</span></div>
+    <canvas id="chart"></canvas>
+  </section>
+
+  <section class="panel" aria-label="Raw capture">
+    <div class="row">
+      <button id="capture">Capture raw samples</button>
+      <span id="rawinfo" class="muted">1024 consecutive samples at 40 MS/s, for checking the bit mapping.</span>
+    </div>
+    <div id="raw" class="rawplots" hidden>
+      <div><h3>Bits</h3><table id="bits"></table></div>
+      <div><h3 id="plot1title"></h3><canvas id="plot1"></canvas></div>
+      <div><h3 id="plot2title"></h3><canvas id="plot2"></canvas></div>
+    </div>
+  </section>
   <section class="panel"><pre id="log"></pre></section>
 </main>
 <script>
 const RACEBAND = [5658, 5695, 5732, 5769, 5806, 5843, 5880, 5917];
 const CAPACITY = 120000;
 const SAMPLES_PER_READING = 4096;
-const Y_MIN = -10, Y_MAX = 22;
+const Y_MIN = -12, Y_MAX = 48;
+const LAYOUTS = ['I+Q 4-bit', 'Q 8-bit', 'I 8-bit'];
+/* Bit n of each captured byte, per layout: [signal, GPIO]. */
+const PINS = [1, 0, 25, 7, 10, 5, 3, 4];
+const LANES = [
+  ['Q6', 'Q7', 'Q8', 'Q9', 'I6', 'I7', 'I8', 'I9'],
+  ['Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7', 'Q8', 'Q9'],
+  ['I2', 'I3', 'I4', 'I5', 'I6', 'I7', 'I8', 'I9'],
+];
 
 const $ = id => document.getElementById(id);
 const state = {
   t: new Float64Array(CAPACITY),
   db: new Float32Array(CAPACITY),
+  db4: new Float32Array(CAPACITY),
   clip: new Float32Array(CAPACITY),
   head: 0,
   count: 0,
@@ -141,10 +183,12 @@ const state = {
   gain: null,
   bw40: true,
   externalAntenna: false,
+  layout: 0,
+  dump: [],
 };
 let writer = null;
 
-/* pwr is mean(I^2 + Q^2) * 100 over one reading; 4-bit samples top out near 21 dB. */
+/* pwr is 100 * mean power in 8-bit LSB^2, so full scale is about 45 dB. */
 function toDb(pwrX100) {
   return 10 * Math.log10(Math.max(pwrX100, 1) / 100);
 }
@@ -155,13 +199,15 @@ function handleLine(line) {
   case 'S': {
     const t = Number(parts[1]) / 1e6;
     const db = toDb(Number(parts[2]));
-    const clip = Number(parts[3]) / SAMPLES_PER_READING;
-    if (!Number.isFinite(t) || !Number.isFinite(db)) return;
+    const db4 = toDb(Number(parts[3]));
+    const clip = Number(parts[4]) / SAMPLES_PER_READING;
+    if (!Number.isFinite(t) || !Number.isFinite(db) || !Number.isFinite(clip)) return;
     state.rateCount++;
-    if (state.recording) state.recording.push(`${parts[1]},${parts[2]},${parts[3]},${state.freq ?? ''},${state.gain ?? ''}`);
+    if (state.recording) state.recording.push(`${parts.slice(1, 5).join(',')},${state.freq ?? ''},${state.gain ?? ''},${state.layout}`);
     if (state.paused) return;
     state.t[state.head] = t;
     state.db[state.head] = db;
+    state.db4[state.head] = db4;
     state.clip[state.head] = clip;
     state.head = (state.head + 1) % CAPACITY;
     state.count = Math.min(state.count + 1, CAPACITY);
@@ -169,7 +215,10 @@ function handleLine(line) {
     return;
   }
   case 'I': {
-    const [freq, gain, bw, ant, retune] = parts.slice(1).map(Number);
+    const [freq, gain, bw, ant, layout, retune] = parts.slice(1).map(Number);
+    if (layout !== state.layout) state.peak = -Infinity;
+    state.layout = layout;
+    if (document.activeElement !== $('layout')) $('layout').value = layout;
     if (freq !== state.freq) state.peak = -Infinity;
     state.freq = freq;
     state.gain = gain;
@@ -183,6 +232,13 @@ function handleLine(line) {
     $('bw').textContent = state.bw40 ? 'BW40' : 'BW20';
     $('bw').classList.toggle('on', !state.bw40);
     for (const b of $('channels').children) b.classList.toggle('on', Number(b.dataset.mhz) === freq);
+    return;
+  }
+  case 'D': {
+    const [layout, chunk, total] = parts.slice(1, 4).map(Number);
+    if (chunk === 0) state.dump = [];
+    for (let i = 0; i < parts[4].length; i += 2) state.dump.push(parseInt(parts[4].slice(i, i + 2), 16));
+    if (chunk === total - 1) showRaw(layout, Uint8Array.from(state.dump));
     return;
   }
   default:
@@ -257,7 +313,7 @@ function draw() {
   ctx.lineWidth = 1;
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
-  for (let db = Y_MIN; db <= Y_MAX; db += 4) {
+  for (let db = Y_MIN; db <= Y_MAX; db += 6) {
     ctx.beginPath();
     ctx.moveTo(left, y(db) + 0.5);
     ctx.lineTo(right, y(db) + 0.5);
@@ -280,6 +336,7 @@ function draw() {
   const lo = new Float32Array(cols).fill(Infinity);
   const hi = new Float32Array(cols).fill(-Infinity);
   const sum = new Float32Array(cols);
+  const sum4 = new Float32Array(cols);
   const n = new Uint32Array(cols);
   const clip = new Float32Array(cols);
   for (let k = 0; k < state.count; k++) {
@@ -291,6 +348,7 @@ function draw() {
     lo[c] = Math.min(lo[c], v);
     hi[c] = Math.max(hi[c], v);
     sum[c] += v;
+    sum4[c] += state.db4[i];
     clip[c] = Math.max(clip[c], state.clip[i]);
     n[c]++;
   }
@@ -304,17 +362,21 @@ function draw() {
   for (let c = 0; c < cols; c++) {
     if (clip[c] > 0.01) ctx.fillRect(left + c, bottom - 4, 1, 4);
   }
-  ctx.strokeStyle = cssVar('--trace');
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  let started = false;
-  for (let c = 0; c < cols; c++) {
-    if (!n[c]) continue;
-    const py = y(sum[c] / n[c]);
-    if (started) ctx.lineTo(left + c, py); else ctx.moveTo(left + c, py);
-    started = true;
-  }
-  ctx.stroke();
+  const line = (sums, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    for (let c = 0; c < cols; c++) {
+      if (!n[c]) continue;
+      const py = y(sums[c] / n[c]);
+      if (started) ctx.lineTo(left + c, py); else ctx.moveTo(left + c, py);
+      started = true;
+    }
+    ctx.stroke();
+  };
+  line(sum4, cssVar('--trace4'));
+  line(sum, cssVar('--trace'));
 
   if (Number.isFinite(state.peak)) {
     ctx.strokeStyle = cssVar('--peak');
@@ -339,9 +401,117 @@ function updateStats() {
   if (state.count) {
     const i = (state.head - 1 + CAPACITY) % CAPACITY;
     $('now').textContent = state.db[i].toFixed(1);
+    $('now4').textContent = state.db4[i].toFixed(1);
     $('clip').textContent = `${(state.clip[i] * 100).toFixed(1)}%`;
   }
   $('peak').textContent = Number.isFinite(state.peak) ? state.peak.toFixed(1) : '-';
+}
+
+function setupCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = '11px system-ui, sans-serif';
+  return { ctx, w, h };
+}
+
+const signed = (v, bits) => (v << (32 - bits)) >> (32 - bits);
+
+function showRaw(layout, bytes) {
+  $('raw').hidden = false;
+  const n = bytes.length;
+
+  const rows = ['<tr><th>Bit</th><th>Signal</th><th>GPIO</th><th>Ones</th><th>Toggles</th></tr>'];
+  for (let b = 7; b >= 0; b--) {
+    let ones = 0, toggles = 0;
+    for (let i = 0; i < n; i++) {
+      ones += (bytes[i] >> b) & 1;
+      if (i && ((bytes[i] ^ bytes[i - 1]) >> b) & 1) toggles++;
+    }
+    rows.push(`<tr><td>${b}</td><td>${LANES[layout][b]}</td><td>${PINS[b]}</td><td>${(100 * ones / n).toFixed(0)}%</td><td>${(100 * toggles / (n - 1)).toFixed(0)}%</td></tr>`);
+  }
+  $('bits').innerHTML = rows.join('');
+
+  const muted = cssVar('--muted'), trace = cssVar('--trace'), trace4 = cssVar('--trace4'), grid = cssVar('--grid');
+  if (layout === 0) {
+    const cells = new Uint32Array(256);
+    for (const v of bytes) cells[v]++;
+    const max = Math.max(...cells);
+    $('plot1title').textContent = 'I vs Q (4-bit cells, darker = more samples)';
+    const { ctx, w, h } = setupCanvas($('plot1'));
+    const size = Math.min(w, h), cell = size / 16, x0 = (w - size) / 2;
+    ctx.fillStyle = trace;
+    for (let v = 0; v < 256; v++) {
+      if (!cells[v]) continue;
+      const i4 = signed(v >> 4, 4), q4 = signed(v & 15, 4);
+      ctx.globalAlpha = 0.15 + 0.85 * cells[v] / max;
+      ctx.fillRect(x0 + (i4 + 8) * cell, (7 - q4) * cell, cell - 1, cell - 1);
+    }
+    ctx.globalAlpha = 1;
+    $('rawinfo').textContent = `${n} samples, ${cells.filter(Boolean).length} of 256 cells used.`;
+    drawWave($('plot2'), 'I and Q, first 160 samples', [
+      [Array.from(bytes, v => signed(v >> 4, 4) * 16), trace],
+      [Array.from(bytes, v => signed(v & 15, 4) * 16), trace4],
+    ]);
+    return;
+  }
+
+  const vals = Array.from(bytes, v => signed(v, 8));
+  const hist = new Uint32Array(256);
+  for (const v of vals) hist[v + 128]++;
+  let edge = 0, edgeN = 0, inner = 0, innerN = 0;
+  for (let j = 1; j < 256; j++) {
+    const d = Math.abs(hist[j] - hist[j - 1]);
+    if (j % 16 === 0) { edge += d; edgeN++; } else { inner += d; innerN++; }
+  }
+  const ratio = (edge / edgeN) / Math.max(inner / innerN, 1e-9);
+  const name = layout === 1 ? 'Q' : 'I';
+  $('rawinfo').textContent = `${n} samples, ${hist.filter(Boolean).length} distinct values. ` +
+    `Histogram jumps at 16-value boundaries are ${ratio.toFixed(1)}x the jumps elsewhere: near 1 means bits 0-3 continue bits 4-7 smoothly, much larger means they don't.`;
+
+  $('plot1title').textContent = `${name} histogram, 8-bit (lines every 16 values)`;
+  const { ctx, w, h } = setupCanvas($('plot1'));
+  const max = Math.max(...hist);
+  ctx.strokeStyle = grid;
+  for (let j = 0; j <= 256; j += 16) {
+    ctx.beginPath();
+    ctx.moveTo(j / 256 * w + 0.5, 0);
+    ctx.lineTo(j / 256 * w + 0.5, h);
+    ctx.stroke();
+  }
+  ctx.fillStyle = trace;
+  for (let j = 0; j < 256; j++) {
+    const bh = hist[j] / max * (h - 4);
+    ctx.fillRect(j / 256 * w, h - bh, Math.max(1, w / 256 - 0.5), bh);
+  }
+  drawWave($('plot2'), `${name}, first 160 samples: 8-bit and top 4 bits only`, [
+    [vals.map(v => (v >> 4) * 16), trace4],
+    [vals, trace],
+  ]);
+}
+
+function drawWave(canvas, title, series) {
+  canvas.previousElementSibling.textContent = title;
+  const { ctx, w, h } = setupCanvas(canvas);
+  const count = 160;
+  ctx.strokeStyle = cssVar('--grid');
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2 + 0.5);
+  ctx.lineTo(w, h / 2 + 0.5);
+  ctx.stroke();
+  for (const [vals, color] of series) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    for (let i = 0; i < count && i < vals.length; i++) {
+      const x = i / (count - 1) * w, yy = h / 2 - vals[i] / 128 * (h / 2 - 2);
+      if (i) ctx.lineTo(x, yy); else ctx.moveTo(x, yy);
+    }
+    ctx.stroke();
+  }
 }
 
 function frame() {
@@ -351,7 +521,7 @@ function frame() {
 }
 
 function downloadCsv(rows) {
-  const blob = new Blob(['t_us,pwr_x100,clip,freq_mhz,gain\n' + rows.join('\n') + '\n'], { type: 'text/csv' });
+  const blob = new Blob(['t_us,pwr_x100,pwr4_x100,clip,freq_mhz,gain,layout\n' + rows.join('\n') + '\n'], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `rssi-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
@@ -360,10 +530,26 @@ function downloadCsv(rows) {
 }
 
 /* Synthetic device for trying the page without hardware: noise plus a drone
- * pass every 4 s whose strength depends on how far the tuned channel is from R3. */
+ * pass every 4 s whose strength depends on how far the tuned channel is from R3.
+ * Raw dumps are an FM carrier whose low bits are genuine. */
 function makeDemo() {
-  let freq = RACEBAND[2], gain = 40, bw40 = true, ant = 0, t0 = performance.now();
-  const status = () => handleLine(`I ${freq} ${gain} ${bw40 ? 1 : 0} ${ant} 0`);
+  let freq = RACEBAND[2], gain = 40, bw40 = true, ant = 0, layout = 0, t0 = performance.now();
+  const status = () => handleLine(`I ${freq} ${gain} ${bw40 ? 1 : 0} ${ant} ${layout} 0`);
+  const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+  const dump = () => {
+    const bytes = [];
+    let phase = 0;
+    for (let k = 0; k < 1024; k++) {
+      phase += 2 * Math.PI * (1.5e6 + 4e6 * Math.sin(k / 40)) / 40e6;
+      const clamp = v => Math.max(-128, Math.min(127, Math.round(v)));
+      const i8 = clamp(55 * Math.cos(phase) + 4 * gauss()), q8 = clamp(55 * Math.sin(phase) + 4 * gauss());
+      bytes.push(layout === 0 ? (((i8 >> 4) & 15) << 4) | ((q8 >> 4) & 15) : (layout === 1 ? q8 : i8) & 255);
+    }
+    for (let c = 0; c < 8; c++) {
+      const hex = bytes.slice(c * 128, c * 128 + 128).map(b => b.toString(16).padStart(2, '0')).join('');
+      handleLine(`D ${layout} ${c} 8 ${hex}`);
+    }
+  };
   setInterval(() => {
     const now = performance.now();
     for (let k = 0; k < 16; k++) {
@@ -372,9 +558,10 @@ function makeDemo() {
       const near = 40 / (1 + d * d);
       const off = Math.abs(freq - RACEBAND[2]);
       const sig = near * Math.pow(10, -off / (bw40 ? 30 : 15)) * Math.pow(10, (gain - 40) / 20);
-      const pwr = Math.min(12800, 250 + sig * 100 * (1 + 0.3 * (Math.random() - 0.5)));
-      const clip = Math.round(Math.max(0, pwr - 3000) / 10);
-      handleLine(`S ${Math.round(t * 1e6)} ${Math.round(pwr)} ${clip}`);
+      const pwr = Math.min(3276800, 1000 + sig * 25600 * (1 + 0.3 * (Math.random() - 0.5)));
+      const pwr4 = Math.max(0, pwr - 3000) * 0.9;
+      const clip = Math.round(Math.max(0, pwr - 1500000) / 1000);
+      handleLine(`S ${Math.round(t * 1e6)} ${Math.round(layout === 0 ? pwr4 : pwr)} ${Math.round(pwr4)} ${clip}`);
     }
   }, 16);
   setInterval(status, 1000);
@@ -386,6 +573,8 @@ function makeDemo() {
       if (cmd[0] === 'g') gain = arg;
       if (cmd[0] === 'b') bw40 = arg !== 0;
       if (cmd[0] === 'a') ant = arg;
+      if (cmd[0] === 'm') layout = arg;
+      if (cmd[0] === 'd') return dump();
       status();
     },
   };
@@ -405,6 +594,8 @@ $('gain').addEventListener('input', () => { $('gainval').textContent = $('gain')
 $('gain').addEventListener('change', () => send(`g${$('gain').value}`));
 $('bw').addEventListener('click', () => send(`b${state.bw40 ? 0 : 1}`));
 $('ant').addEventListener('click', () => send(`a${state.externalAntenna ? 0 : 1}`));
+$('layout').addEventListener('change', () => send(`m${$('layout').value}`));
+$('capture').addEventListener('click', () => send('d'));
 $('resetpeak').addEventListener('click', () => { state.peak = -Infinity; });
 $('pause').addEventListener('click', () => {
   state.paused = !state.paused;
