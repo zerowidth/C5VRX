@@ -1,231 +1,85 @@
-<div align="center">
-  <img src="assets/c5vrx-logo.jpg" alt="C5VRX logo" width="760" />
+# C5 RSSI
 
-  <p><strong>ESP32-C5 Analog 5.8 GHz FPV Receiver</strong></p>
-  <p>From live RF to real-time analog NTSC composite video with one Seeed Studio XIAO ESP32-C5 and a passive resistor DAC.</p>
+Firmware that turns a Seeed XIAO ESP32-C5 into a 1 kHz signal-strength meter for one analog 5.8 GHz FPV channel, as a cheaper stand-in for an RX5808 in a lap timer. It reuses the C5VRX trick of streaming the Wi-Fi PHY's raw I/Q samples out through GPIO, but only measures power: there is no demodulator, DAC, or video output. The board needs nothing but an antenna and USB.
 
-  <p>
-    <img src="https://img.shields.io/badge/status-production%20proven-success" alt="Production proven" />
-    <img src="https://img.shields.io/badge/chip-ESP32--C5-111111" alt="ESP32-C5" />
-    <img src="https://img.shields.io/badge/RF-5.8%20GHz%20(48%20channels)-6f42c1" alt="5.8 GHz" />
-    <img src="https://img.shields.io/badge/output-analog%20CVBS%20NTSC-orange" alt="Analog CVBS" />
-    <img src="https://img.shields.io/badge/architecture-Zero--EOF%20Circular%20GDMA-blueviolet" alt="Zero-EOF GDMA" />
-    <img src="https://img.shields.io/badge/license-GPL--3.0--only-blue" alt="GPL-3.0-only" />
-  </p>
-</div>
+A WebSerial page in [viewer/](viewer/index.html) graphs the readings and changes channel, gain, and bandwidth.
 
----
+This branch is an experiment. The docs in [docs/](docs/) describe the original C5VRX video receiver, not this firmware.
 
-## What is C5VRX?
+## How it works
 
-**C5VRX-3** turns the **Seeed Studio XIAO ESP32-C5** (ESP32-C5 RISC-V SoC) into a standalone 5.8 GHz analog video (FPV) receiver.
-
-It captures raw Wi-Fi PHY I/Q samples directly from the 5 GHz RF front-end at 40 MS/s, demodulates Wideband FM (WBFM) in real-time hardware using the ESP32-C5 **BitScrambler**, and outputs analog NTSC composite video (CVBS) via **PARLIO TX** and a 6-bit passive resistor DAC ladder into standard 75-ohm FPV goggles or monitors.
-
-```text
-5.8 GHz Analog FPV (48 Channels)
-        │
-        ▼
-ESP32-C5 RF / MODEM_DIAG Bus (40 MS/s Q4/I4)
-        │
-        ▼
-PARLIO RX @ 40 MS/s (POS sample edge, pure continuous hardware GDMA)
-        │
-        ▼
-Circular GDMA Ring (16 KiB in HP SRAM, Zero-EOF patched)
-        │
-        ▼
-Phase5 BitScrambler Demodulator (fm.bsasm: 50 ns discriminator, embedded LUT)
-        │
-        ▼
-PARLIO TX @ 40 MHz ([D,D] mode -> 20 MS/s unique CVBS output)
-        │
-        ▼
-6-bit Resistor DAC Ladder + 470 pF Filter -> 75-ohm Goggles
+```mermaid
+flowchart LR
+    A[Antenna] --> B[C5 Wi-Fi PHY<br/>tuned to the FPV channel,<br/>fixed gain]
+    B -->|4-bit I/Q on MODEM_DIAG| C[GPIO loopback]
+    C --> D[PARLIO RX 40 MHz<br/>16 KiB cyclic DMA ring]
+    D -->|every 1 ms| E[Task: mean of I² + Q²<br/>over 4096 samples]
+    E -->|text line| F[USB serial]
+    F --> G[viewer/index.html]
 ```
 
-After startup, the CPU does not process pixels; the entire pipeline runs continuously in dedicated silicon peripherals (AHB GDMA $\to$ BitScrambler $\to$ PARLIO TX).
+- [main/rf.c](main/rf.c) starts Wi-Fi receive-only, disables the vendor AGC, forces continuous sampling, and routes I/Q to GPIO. It tunes any frequency from 5180 to 5950 MHz by landing on the nearest Wi-Fi channel and then calling the undocumented `phy_set_freq()`.
+- [main/main.c](main/main.c) captures the I/Q into a DMA ring that refills itself with no CPU involvement. Once per millisecond it averages I² + Q² over every 4th byte of the ring (about 410 µs of signal) and prints the result.
 
----
+## Build
 
-## Key Innovations & Architectural Highlights
+Docker is the only requirement. From the repository root:
 
-### 1. The Breakthrough: Zero-EOF Circular GDMA
-- **The Problem**: In continuous loop mode, the stock ESP-IDF PARLIO TX driver injected a GDMA EOF (`suc_eof = 1`) on every cyclic ring wrap (confirmed in [espressif/esp-idf#19091](https://github.com/espressif/esp-idf/issues/19091)). This triggered periodic hardware stalls, causing a 1-second vertical sync drop and jagged horizontal line jitter ("kartels").
-- **The Solution**: C5VRX-3 patches `dw0.suc_eof = 0` across the descriptor ring in SRAM after driver initialization, paired with 64-byte aligned cache synchronization (`sync_dma_c2m`).
-- **The Result**: Truly gapless, infinite circular streaming with zero wrap bubbles, rock-solid vertical sync lock, and crystal-clear horizontal alignment.
-
-### 2. Dual-Loop Adaptive AGC with $Q_{\text{phase}}$ Coherence Tracking
-- Eliminates both the erratic hunting of stock packet AGC and the "noise trap" of blind power measurement (where background thermal noise keeps measured power elevated even in deep fades).
-- Computes real-time integer FM phase coherence:
-  $$Q_{\text{phase}} = \frac{\text{count}(P \ge 8 \land \text{Dot} > 0 \land |\text{Cross}| \le \text{Dot})}{255} \times 100\%$$
-- **Dynamic Gain Adaptation**: As signal degrades ($Q_{\text{phase}} < 68\%$ or $P_{\text{median}} < 18$) without clipping, the receiver actively steps RF gain up towards Gain 62 to lift weak carriers above the ADC quantizer floor.
-- **Fast Overload Safety Rem**: Instant gain cut ($\Delta G = -4 / -6$) if clipping occurs ($N_{\text{clip}} \ge 4$ and $P_{\text{median}} > 18$).
-- **Deadband Lock**: Zero register writes when locked in the clean target zone ($Q_{\text{phase}} \ge 70\%, P_{\text{median}} \in [18, 30]$).
-
-### 3. Dynamic Bandwidth Gearbox (BW40 <-> BW20)
-- **BW40 (Wide / Color)**: Default mode keeping the full 20 MHz baseband analog filter open (`phy_wifi_fbw_sel(1)`) for vibrant color subcarrier fidelity and horizontal resolution.
-- **BW20 (+3 dB Long-Range Survival)**: In severe fades ($G \ge 56$ and $Q_{\text{phase}} < 55\%$ or $P_{\text{median}} < 16$), the receiver automatically downshifts to BW20 (`phy_wifi_fbw_sel(0)`), halving thermal noise bandwidth for an immediate **$+3\text{ dB}$ SNR boost** (+41% range). Automatically upshifts back to BW40 when signal recovers.
-
-### 4. Soft-Noise Squelched Phase5 Demodulator
-- The `fm.bsasm` BitScrambler program implements soft-noise squelching: phase deltas around $\pm 180^\circ$ (deltas $-16 \dots -12$ and $+13 \dots +15$) are mapped to blanking pedestal (DAC code 20) instead of sync tip (DAC code 0).
-- Eliminates false horizontal sync pulses and screen tearing during noise bursts and static.
-
----
-
-## Hardware Pinout & Circuit (Seeed Studio XIAO ESP32-C5)
-
-Connect a 6-bit binary-weighted resistor DAC ladder to the XIAO pins, meeting at the `VIDEO` node:
-
-| XIAO Pin | ESP32-C5 GPIO | Bit Weight | Series Resistor |
-|:---:|:---:|:---:|:---:|
-| **D4** | GPIO 23 | Bit 0 (LSB) | 8.2 kΩ |
-| **D5** | GPIO 24 | Bit 1 | 3.9 kΩ |
-| **D6** | GPIO 11 | Bit 2 | 2.0 kΩ |
-| **D7** | GPIO 12 | Bit 3 | 1.0 kΩ |
-| **D8** | GPIO 8  | Bit 4 | 470 Ω |
-| **D9** | GPIO 9  | Bit 5 (MSB) | 240 Ω |
-| **GND** | GND | Ground | Ground reference |
-
-### Recommended Analog Filters:
-1. **Shunt Termination**: 200 Ω resistor from `VIDEO` to `GND`. When connected to goggles with standard 75 Ω termination, this forms a matched 0–1.0 V standard CVBS level.
-2. **De-Emphasis Filter**: A **470 pF ceramic capacitor** placed in parallel across `VIDEO` and `GND` creates a 10–14 dB high-frequency de-emphasis low-pass filter, dramatically reducing triangular FM noise and snow.
-3. **BOOT Button**: The built-in BOOT button (GPIO 28) switches channels on short click and toggles the OSD menu on long press (≥ 600 ms).
-
----
-
-## Interactive Serial Console Hotkeys
-
-Connecting to the USB serial console (115200 baud) provides live telemetry and single-key controls:
-
-| Key | Action |
-|:---:|:---|
-| `c` / `C` | Cycle FPV channel / band (48 standard channels: RaceBand, Boscam A/B/E, FatShark, LowBand) |
-| `+` / `-` | Manual RF gain step (±2 index) |
-| `a` / `s` / `m` | Switch AGC mode: **Active** (auto-adapting) / **Shadow** (dry-run) / **Manual** (fixed) |
-| `b` | Cycle Bandwidth Gear: **Auto Gearbox** / Forced BW40 / Forced BW20 |
-| `f` | Cycle AFC Mode: **Auto Centering** (±1.5 MHz) / **Hold** / **Off** (0 kHz) |
-| `,` / `.` | Fine-tune carrier frequency offset in ±50 kHz steps |
-| `0` | Reset frequency offset to 0 kHz |
-| `e` | Toggle RX sample clock edge (POS / NEG) |
-| `d` | Print real-time reception diagnostics summary |
-
----
-
-## Build & Flash Guide
-
-### Prerequisites
-- **Option A (Docker - Recommended)**: Docker Desktop or Docker engine installed.
-- **Option B (Native ESP-IDF)**: [ESP-IDF v6.0.x](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32c5/get-started/) installed with Python 3.10+.
-
----
-
-### Step 1: Build the Firmware
-
-#### Option A: Build via Docker (Zero-Install Toolchain)
-No ESP-IDF installation required on your host machine. Run from the repository root:
-
-**Linux / macOS / Git Bash:**
 ```bash
 docker run --rm -v "${PWD}:/workspace" -w /workspace espressif/idf:v6.0.2 idf.py build
 ```
 
-**Windows PowerShell:**
-```powershell
-docker run --rm -v "${PWD}:/workspace" -w /workspace espressif/idf:v6.0.2 idf.py build
-```
+## Flash
 
-#### Option B: Build with Native ESP-IDF v6.0+
-If you have ESP-IDF installed locally:
+Docker on macOS can't reach USB devices, so flash from the host with esptool:
 
-**Linux / macOS:**
 ```bash
-. $IDF_PATH/export.sh
-idf.py build
+python3 -m pip install --user esptool
 ```
 
-**Windows (ESP-IDF PowerShell Environment):**
-```powershell
-export.ps1
-idf.py build
-```
-
-The build produces three critical binaries in `build/`:
-- `build/bootloader/bootloader.bin` (at flash offset `0x2000`)
-- `build/partition_table/partition-table.bin` (at flash offset `0x8000`)
-- `build/c5vrx3.bin` (at flash offset `0x10000`)
-
----
-
-### Step 2: Verify Architectural Constraints
-Before flashing, run the built-in validator to ensure zero DMA/BitScrambler constraint violations:
 ```bash
-python tools/validate_build.py
+cd build && python3 -m esptool --chip esp32c5 write-flash @flash_args
 ```
-*(All 31 architectural checks must pass.)*
 
----
+If esptool can't connect, hold BOOT while tapping RESET to enter download mode, flash, then tap RESET.
 
-### Step 3: Flash to ESP32-C5
+## View
 
-#### Option A: Zero-Friction Auto-Flash (Recommended)
-Run the auto-flash watcher:
+Open the viewer in Chrome or Edge (WebSerial is not in Firefox or Safari). Opening `viewer/index.html` directly works, or serve it:
+
 ```bash
-python tools/auto_flash.py
-```
-*Plug in or reset your Seeed Studio XIAO ESP32-C5 into download mode (hold BOOT while tapping RESET), and the watcher will detect the COM port, flash the firmware, and automatically trigger a watchdog reset into the application!*
-
-#### Option B: Direct Flash Script
-Specify your COM port (or omit to auto-detect):
-```bash
-python tools/flash.py COM10
+python3 -m http.server 8765 --directory viewer
 ```
 
-#### Option C: Native ESP-IDF Flasher
-```bash
-idf.py -p COM10 flash
-```
+Then open http://localhost:8765 and click Connect. Add `?demo` to the URL to see synthetic data without a board.
 
----
+The graph shows the mean in each pixel column as a line, the min/max range as a band, the peak as a dashed line, and clipping as red ticks along the bottom.
 
-### Step 4: Interactive Serial Monitor & Diagnostics
-Launch the dedicated low-latency serial monitor:
-```bash
-python tools/monitor.py COM10
-```
-Use the interactive hotkeys (`c` to cycle channels, `+`/`-` for manual gain, `b` for bandwidth gearbox, `a` for active AGC, `d` for hardware diagnostics).
+## Serial protocol
 
----
+Each line from the board is one record:
 
-## Repository Structure
+- `S <t_us> <pwr_x100> <clip>` is one reading. `pwr_x100` is 100 × mean(I² + Q²) over 4096 samples, so dB = 10·log10(pwr_x100 / 100). `clip` counts samples where I or Q hit the 4-bit limit.
+- `I <freq_mhz> <gain> <bw40> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
+- `E <command>: <error>` reports a rejected command.
+- Anything else is ESP-IDF log output.
 
-```text
-├── CMakeLists.txt             # Production top-level ESP-IDF project
-├── sdkconfig.defaults         # Production build configuration (ESP32-C5 @ 240MHz)
-├── partitions.csv             # Custom minimal partition table
-├── main/                      # Standalone C5VRX-3 production firmware
-│   ├── CMakeLists.txt         # Component manifest & BitScrambler registration
-│   ├── main.c                 # Application entry point
-│   ├── rf.c / rf.h            # Wi-Fi PHY RX-only frontend & frequency tuning
-│   ├── video.c / video.h      # Realtime PARLIO RX/TX, Zero-EOF GDMA & AGC engine
-│   ├── fm.bsasm               # Phase5 BitScrambler demodulator program
-│   └── osd_font.h             # 8x8 font tables for OSD
-├── tools/                     # Production validation & flashing utilities
-│   ├── validate_build.py      # Architectural constraint validator (31 checks)
-│   ├── auto_flash.py          # Auto-detecting flashing watcher
-│   ├── flash.py               # One-click direct flasher
-│   ├── monitor.py             # Low-latency interactive serial console
-│   └── live_logger.py         # Real-time CSV telemetry logger
-├── docs/                      # Architectural specs & mathematical proofs
-└── legacy/
-    ├── c5vrx1/                # Original proof-of-concept repository snapshot
-    └── c5vrx2/                # Complete historical C5VRX-2 firmware, research & tools
-```
+Commands to the board are one line each:
 
----
+- `f<mhz>` tunes, for example `f5917` for R8.
+- `g<n>` sets the fixed receive gain, 0 to 62. Higher is more sensitive. It starts at 40.
+- `b0` or `b1` selects the BW20 (±10 MHz) or BW40 (±20 MHz) analog filter. BW20 rejects neighboring channels better.
+- `?` requests an `I` line.
 
-## License
+## What to test first
 
-C5VRX is open-source software licensed under the **GNU General Public License v3.0 only** (`GPL-3.0-only`).
+1. R8 tunes at all. Tune `f5917` with a VTX on R8 and confirm the reading rises when you bring it close. 5917 MHz is above every Wi-Fi channel, so this is untested.
+2. A walk-past gives a clean peak. Try a few gains: too high and the noise floor sits near the top with clipping on every pass, too low and passes at a distance disappear.
+3. A neighbor on the adjacent Raceband channel doesn't raise the reading much, in BW40 and BW20.
+4. The viewer reports close to 1000 samples/s.
 
-See [LICENSE](LICENSE) for full licensing terms.
+## Limits
+
+- Readings are relative dB, not dBm. At a fixed gain the 4-bit samples cover roughly 20 to 25 dB between the noise floor and clipping. That is enough to spot a close pass but not to measure distance.
+- Retune time is unmeasured; the viewer shows it as "Last retune". Readings taken during a retune are meaningless.
+- Everything below Wi-Fi driver level uses undocumented Espressif functions and register addresses tied to ESP-IDF 6.0.
