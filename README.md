@@ -46,7 +46,7 @@ The live chart always draws a second trace computed from only the top 4 bits of 
 Docker is the only requirement. From the repository root:
 
 ```bash
-docker run --rm -v "${PWD}:/workspace" -w /workspace espressif/idf:v6.0.2 idf.py build
+docker run --rm -v "${PWD}:/workspace" -w /workspace espressif/idf:v6.1 idf.py build
 ```
 
 ## Flash
@@ -107,4 +107,4 @@ Commands to the board are one line each:
 
 - Readings are relative dB, not dBm.
 - Retune time is unmeasured; the viewer shows it as "Last retune". Readings taken during a retune are meaningless.
-- Everything below Wi-Fi driver level uses undocumented Espressif functions and register addresses tied to ESP-IDF 6.0.
+- Everything below Wi-Fi driver level uses undocumented Espressif functions and register addresses tied to the ESP-IDF version. They were first found on 6.0 and link unchanged on 6.1, but behavior on 6.1 is untested.
