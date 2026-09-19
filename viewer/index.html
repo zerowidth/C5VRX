@@ -93,6 +93,7 @@ label { color: var(--muted); }
     <input id="gain" type="range" min="0" max="62" step="1">
     <b id="gainval">-</b>
     <button id="bw">BW40</button>
+    <button id="ant" title="Antenna: on-board chip antenna or U.FL connector">On-board antenna</button>
     <label for="window">Window</label>
     <select id="window">
       <option value="2">2 s</option>
@@ -139,6 +140,7 @@ const state = {
   freq: null,
   gain: null,
   bw40: true,
+  externalAntenna: false,
 };
 let writer = null;
 
@@ -167,11 +169,13 @@ function handleLine(line) {
     return;
   }
   case 'I': {
-    const [freq, gain, bw, retune] = parts.slice(1).map(Number);
+    const [freq, gain, bw, ant, retune] = parts.slice(1).map(Number);
     if (freq !== state.freq) state.peak = -Infinity;
     state.freq = freq;
     state.gain = gain;
     state.bw40 = bw === 1;
+    state.externalAntenna = ant === 1;
+    $('ant').textContent = state.externalAntenna ? 'U.FL antenna' : 'On-board antenna';
     $('curfreq').textContent = `${freq} MHz`;
     $('retune').textContent = retune ? `${(retune / 1000).toFixed(2)} ms` : '-';
     if (document.activeElement !== $('gain')) $('gain').value = gain;
@@ -358,8 +362,8 @@ function downloadCsv(rows) {
 /* Synthetic device for trying the page without hardware: noise plus a drone
  * pass every 4 s whose strength depends on how far the tuned channel is from R3. */
 function makeDemo() {
-  let freq = RACEBAND[2], gain = 40, bw40 = true, t0 = performance.now();
-  const status = () => handleLine(`I ${freq} ${gain} ${bw40 ? 1 : 0} 0`);
+  let freq = RACEBAND[2], gain = 40, bw40 = true, ant = 0, t0 = performance.now();
+  const status = () => handleLine(`I ${freq} ${gain} ${bw40 ? 1 : 0} ${ant} 0`);
   setInterval(() => {
     const now = performance.now();
     for (let k = 0; k < 16; k++) {
@@ -381,6 +385,7 @@ function makeDemo() {
       if (cmd[0] === 'f') freq = arg;
       if (cmd[0] === 'g') gain = arg;
       if (cmd[0] === 'b') bw40 = arg !== 0;
+      if (cmd[0] === 'a') ant = arg;
       status();
     },
   };
@@ -399,6 +404,7 @@ $('freq').addEventListener('keydown', e => { if (e.key === 'Enter') send(`f${$('
 $('gain').addEventListener('input', () => { $('gainval').textContent = $('gain').value; });
 $('gain').addEventListener('change', () => send(`g${$('gain').value}`));
 $('bw').addEventListener('click', () => send(`b${state.bw40 ? 0 : 1}`));
+$('ant').addEventListener('click', () => send(`a${state.externalAntenna ? 0 : 1}`));
 $('resetpeak').addEventListener('click', () => { state.peak = -Infinity; });
 $('pause').addEventListener('click', () => {
   state.paused = !state.paused;

@@ -44,6 +44,9 @@
 #define SELECTOR_MASK   0x01fe0000u
 #define HP_SRAM_USAGE   0x60095004u
 
+/* Waveshare ESP32-C5-Zero: low selects the on-board antenna, high the U.FL. */
+#define ANTENNA_SEL_GPIO GPIO_NUM_26
+
 /* Must match the PARLIO RX data_gpio_nums order in main.c. */
 static const gpio_num_t s_iq_pins[8] = {
     GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_7,   /* Q[9:6] */
@@ -66,6 +69,7 @@ static const char *TAG = "rf";
 static uint16_t s_freq_mhz = 5865u;
 static uint8_t s_gain = 40u;
 static bool s_bw40 = true;
+static bool s_external_antenna = false;
 
 typedef struct {
     uint8_t channel;
@@ -177,6 +181,10 @@ static void apply_rx_settings(void)
 
 esp_err_t rf_start(void)
 {
+    gpio_reset_pin(ANTENNA_SEL_GPIO);
+    gpio_set_direction(ANTENNA_SEL_GPIO, GPIO_MODE_OUTPUT);
+    rf_set_external_antenna(s_external_antenna);
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         if ((err = nvs_flash_erase()) == ESP_OK) err = nvs_flash_init();
@@ -264,4 +272,15 @@ void rf_set_bw40(bool bw40)
 bool rf_get_bw40(void)
 {
     return s_bw40;
+}
+
+void rf_set_external_antenna(bool external)
+{
+    s_external_antenna = external;
+    gpio_set_level(ANTENNA_SEL_GPIO, external ? 1 : 0);
+}
+
+bool rf_get_external_antenna(void)
+{
+    return s_external_antenna;
 }

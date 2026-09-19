@@ -1,6 +1,6 @@
 # C5 RSSI
 
-Firmware that turns a Seeed XIAO ESP32-C5 into a 1 kHz signal-strength meter for one analog 5.8 GHz FPV channel, as a cheaper stand-in for an RX5808 in a lap timer. It reuses the C5VRX trick of streaming the Wi-Fi PHY's raw I/Q samples out through GPIO, but only measures power: there is no demodulator, DAC, or video output. The board needs nothing but an antenna and USB.
+Firmware that turns a Waveshare ESP32-C5-Zero into a 1 kHz signal-strength meter for one analog 5.8 GHz FPV channel, as a cheaper stand-in for an RX5808 in a lap timer. It reuses the C5VRX trick of streaming the Wi-Fi PHY's raw I/Q samples out through GPIO, but only measures power: there is no demodulator, DAC, or video output. The board needs nothing but USB; it has an on-board antenna and a U.FL connector.
 
 A WebSerial page in [viewer/](viewer/index.html) graphs the readings and changes channel, gain, and bandwidth.
 
@@ -41,7 +41,7 @@ python3 -m pip install --user esptool
 cd build && python3 -m esptool --chip esp32c5 write-flash @flash_args
 ```
 
-If esptool can't connect, hold BOOT while tapping RESET to enter download mode, flash, then tap RESET.
+If esptool can't connect, hold B (boot) while tapping R (reset) to enter download mode, flash, then tap RESET.
 
 ## View
 
@@ -60,7 +60,7 @@ The graph shows the mean in each pixel column as a line, the min/max range as a 
 Each line from the board is one record:
 
 - `S <t_us> <pwr_x100> <clip>` is one reading. `pwr_x100` is 100 × mean(I² + Q²) over 4096 samples, so dB = 10·log10(pwr_x100 / 100). `clip` counts samples where I or Q hit the 4-bit limit.
-- `I <freq_mhz> <gain> <bw40> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
+- `I <freq_mhz> <gain> <bw40> <external_antenna> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
 - `E <command>: <error>` reports a rejected command.
 - Anything else is ESP-IDF log output.
 
@@ -69,6 +69,7 @@ Commands to the board are one line each:
 - `f<mhz>` tunes, for example `f5917` for R8.
 - `g<n>` sets the fixed receive gain, 0 to 62. Higher is more sensitive. It starts at 40.
 - `b0` or `b1` selects the BW20 (±10 MHz) or BW40 (±20 MHz) analog filter. BW20 rejects neighboring channels better.
+- `a0` or `a1` selects the on-board antenna or the U.FL connector (GPIO26). It starts on the on-board antenna.
 - `?` requests an `I` line.
 
 ## What to test first

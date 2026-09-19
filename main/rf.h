@@ -15,6 +15,10 @@ uint16_t rf_get_freq(void);
 void rf_set_gain(uint8_t gain);
 uint8_t rf_get_gain(void);
 
+/* Waveshare ESP32-C5-Zero antenna switch: on-board chip antenna or U.FL. */
+void rf_set_external_antenna(bool external);
+bool rf_get_external_antenna(void);
+
 /* Analog baseband filter: BW40 (+-20 MHz) or BW20 (+-10 MHz). */
 void rf_set_bw40(bool bw40);
 bool rf_get_bw40(void);

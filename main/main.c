@@ -117,9 +117,9 @@ static void out(const char *buf, size_t len)
 static void print_status(void)
 {
     char line[64];
-    int n = snprintf(line, sizeof(line), "I %u %u %u %lu\n",
+    int n = snprintf(line, sizeof(line), "I %u %u %u %u %lu\n",
                      rf_get_freq(), rf_get_gain(), rf_get_bw40() ? 1u : 0u,
-                     (unsigned long)s_retune_us);
+                     rf_get_external_antenna() ? 1u : 0u, (unsigned long)s_retune_us);
     out(line, n);
 }
 
@@ -172,6 +172,9 @@ static void handle_command(char *line)
         break;
     case 'b':
         rf_set_bw40(arg != 0);
+        break;
+    case 'a':
+        rf_set_external_antenna(arg != 0);
         break;
     case '?':
         break;
