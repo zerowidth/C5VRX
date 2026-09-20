@@ -161,7 +161,7 @@ td:first-child, th:first-child { text-align: left; }
   </section>
 
   <section class="panel">
-    <div class="legend"><span><i style="background: var(--trace)"></i>Full resolution</span><span><i style="background: var(--trace4)"></i>Top 4 bits only</span><span><i style="background: var(--envelope)"></i>100 ms peak</span><span><i style="background: var(--rx)"></i>RX5808, scaled to match</span></div>
+    <div class="legend"><span><i style="background: var(--trace)"></i>Full resolution</span><span><i style="background: var(--trace4)"></i>Top 4 bits only</span><span><i style="background: var(--envelope)"></i>255 ms median, used for detection</span><span><i style="background: var(--envelope); opacity: 0.4"></i>100 ms peak</span><span><i style="background: var(--rx)"></i>RX5808, scaled to match</span></div>
     <canvas id="chart"></canvas>
   </section>
 
@@ -182,6 +182,11 @@ td:first-child, th:first-child { text-align: left; }
 const RACEBAND = [5658, 5695, 5732, 5769, 5806, 5843, 5880, 5917];
 const CAPACITY = 120000;
 const SAMPLES_PER_READING = 4096;
+/* RotorHazard's node filters RSSI with a 255-sample median at 1 kHz and dates
+ * the result to the middle of that window, so a filtered peak still lands at
+ * the time the drone actually passed. Matching it keeps the comparison fair. */
+const MEDIAN_SAMPLES = 255;
+const MEDIAN_EVERY = 10;
 const Y_MIN = -12, Y_MAX = 48;
 const LAYOUTS = ['I+Q 4-bit', 'Q 8-bit', 'I 8-bit'];
 /* Bit n of each captured byte, per layout: [signal, GPIO]. */
@@ -212,7 +217,10 @@ const state = {
   externalAntenna: false,
   layout: 0,
   dump: [],
-  env: [],          /* {t, db} per 100 ms window peak */
+  env: [],          /* {t, db} per 100 ms window peak, from the board */
+  med: [],          /* {t, db} rolling median, centre-timestamped */
+  medBuf: [],
+  medCount: 0,
   passes: [],       /* {start, end, peak} */
   inPass: null,
   baseline: null,
@@ -246,6 +254,16 @@ function handleLine(line) {
     state.head = (state.head + 1) % CAPACITY;
     state.count = Math.min(state.count + 1, CAPACITY);
     state.peak = Math.max(state.peak, db);
+
+    state.medBuf.push(db);
+    if (state.medBuf.length > MEDIAN_SAMPLES) state.medBuf.shift();
+    if (state.medBuf.length === MEDIAN_SAMPLES && ++state.medCount % MEDIAN_EVERY === 0) {
+      const sorted = [...state.medBuf].sort((a, b) => a - b);
+      const tMid = t - MEDIAN_SAMPLES / 2000;
+      state.med.push({ t: tMid, db: sorted[MEDIAN_SAMPLES >> 1] });
+      if (state.med.length > 6000) state.med.splice(0, state.med.length - 6000);
+      detectPass(tMid, sorted[MEDIAN_SAMPLES >> 1]);
+    }
     return;
   }
   case 'I': {
@@ -272,7 +290,6 @@ function handleLine(line) {
     if (!Number.isFinite(t) || !Number.isFinite(db) || state.paused) return;
     state.env.push({ t, db });
     if (state.env.length > 3000) state.env.splice(0, state.env.length - 3000);
-    detectPass(t, db);
     return;
   }
   case 'D': {
@@ -289,17 +306,31 @@ function handleLine(line) {
 
 /* The quiet 20th percentile of the last 30 s stands in for "no drone nearby",
  * so thresholds follow the room instead of needing absolute levels. */
+let baselineTick = 0;
 function detectPass(t, db) {
-  const recent = state.env.filter(e => e.t > t - 30).map(e => e.db).sort((a, b) => a - b);
-  if (recent.length >= 20) state.baseline = recent[Math.floor(recent.length * 0.2)];
+  if (++baselineTick % 10 === 0) {
+    const recent = [];
+    for (let i = state.med.length - 1; i >= 0 && state.med[i].t > t - 30; i -= 2) recent.push(state.med[i].db);
+    if (recent.length >= 20) {
+      recent.sort((a, b) => a - b);
+      state.baseline = recent[Math.floor(recent.length * 0.2)];
+    }
+  }
   if (state.baseline === null) return;
 
   const enter = state.baseline + Number($('enter').value);
   const exit = state.baseline + Number($('exit').value);
   if (!state.inPass && db >= enter) {
-    state.inPass = { start: t, end: t, peak: db };
+    state.inPass = { start: t, end: t, peak: db, peakFirst: t, peakLast: t };
   } else if (state.inPass) {
-    state.inPass.peak = Math.max(state.inPass.peak, db);
+    /* The lap time is the middle of the peak, so a flat top does not bias it. */
+    if (db > state.inPass.peak) {
+      state.inPass.peak = db;
+      state.inPass.peakFirst = t;
+      state.inPass.peakLast = t;
+    } else if (db === state.inPass.peak) {
+      state.inPass.peakLast = t;
+    }
     if (db >= exit) {
       state.inPass.end = t;
     } else {
@@ -468,17 +499,23 @@ function draw() {
     if (x1 > left && x0 < right) ctx.fillRect(x0, top, Math.max(2, x1 - x0), bottom - top);
   }
 
-  ctx.strokeStyle = cssVar('--envelope');
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  let envStarted = false;
-  for (const e of state.env) {
-    const x = tAt(e.t);
-    if (x < left) continue;
-    if (envStarted) ctx.lineTo(x, y(e.db)); else ctx.moveTo(x, y(e.db));
-    envStarted = true;
-  }
-  ctx.stroke();
+  const series = (points, color, alpha, width) => {
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    let started = false;
+    for (const e of points) {
+      const x = tAt(e.t);
+      if (x < left) continue;
+      if (started) ctx.lineTo(x, y(e.db)); else ctx.moveTo(x, y(e.db));
+      started = true;
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  };
+  series(state.env, cssVar('--envelope'), 0.4, 1);
+  series(state.med, cssVar('--envelope'), 1, 2);
 
   if (state.baseline !== null) {
     ctx.strokeStyle = cssVar('--envelope');
@@ -531,8 +568,9 @@ function updateStats() {
     : 'Waiting for an RX5808 on GP6.';
   $('passes').textContent = state.passes.length + (state.inPass ? 1 : 0);
   const last = state.passes[state.passes.length - 1];
+  const latestMed = state.med.length ? state.med[state.med.length - 1].t : 0;
   $('passinfo').textContent = last
-    ? `Last pass: peak ${last.peak.toFixed(1)} dB, ${Math.round((last.end - last.start) * 1000)} ms long, ${(state.env.length ? state.env[state.env.length - 1].t - last.end : 0).toFixed(1)} s ago.`
+    ? `Last pass: peak ${last.peak.toFixed(1)} dB at ${((last.peakFirst + last.peakLast) / 2 - latestMed).toFixed(2)} s, over ${Math.round((last.end - last.start) * 1000)} ms.`
     : 'No passes yet.';
 }
 

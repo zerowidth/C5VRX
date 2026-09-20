@@ -86,7 +86,9 @@ Then open http://localhost:8765 and click Connect. Add `?demo` to the URL to see
 
 The graph shows the mean in each pixel column as a line, the min/max range as a band, the peak as a dashed line, and clipping as red ticks along the bottom. A green line traces the 100 ms peaks, and detected passes are shaded.
 
-Pass detection tracks a baseline, the 20th percentile of the last 30 s, and counts a pass when the 100 ms peak rises a set number of dB above it and ends when it falls back. Both thresholds are relative to the baseline, so they follow the room rather than needing absolute levels.
+Pass detection follows RotorHazard's node firmware: a 255-sample median at 1 kHz, dated to the middle of its window so a filtered peak still lands at the moment the drone passed. A median beats an average here because multipath fades are brief downward spikes it ignores, and it beats a peak because a peak latches onto whichever single millisecond was luckiest.
+
+A pass starts when that median rises a set number of dB above the baseline, the 20th percentile of the last 30 s, and ends when it falls back. Both thresholds are relative to the baseline, so they follow the room instead of needing absolute levels. The pass time is the middle of the peak, which avoids bias when the peak is flat. The board's own 100 ms peaks stay on the chart as a fainter line.
 
 ## Serial protocol
 
