@@ -47,9 +47,13 @@
 /* Waveshare ESP32-C5-Zero: low selects the on-board antenna, high the U.FL. */
 #define ANTENNA_SEL_GPIO GPIO_NUM_26
 
+/* Nothing is wired to these: each pad loops its own output back to its input.
+ * They sit on the back pads and the left edge so the whole lower right edge
+ * stays free for an RX5808 module, whose analog RSSI output needs a pin away
+ * from lines switching at tens of MHz. */
 const gpio_num_t rf_iq_pins[RF_IQ_LANES] = {
-    GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_7,
-    GPIO_NUM_10, GPIO_NUM_5, GPIO_NUM_3, GPIO_NUM_4,
+    GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_23,
+    GPIO_NUM_24, GPIO_NUM_5, GPIO_NUM_3, GPIO_NUM_4,
 };
 
 /* Only DIAG 6-9 = Q[9:6] and 16-19 = I[9:6] are hardware-verified. The 8-bit
