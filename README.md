@@ -118,7 +118,7 @@ The module's RSSI pin is a log detector, so its voltage should be a straight lin
 - It quotes our readings in the module's millivolts, for dropping into code that expects RX5808 numbers.
 - It rescales the module's trace onto our dB axis, so both appear on the same chart and any disagreement is visible directly.
 
-Wiring notes: the RSSI line is analog, so keep it short and add roughly 1 kΩ in series with 10 nF to ground at the pin. Check whether your module wants 5 V or 3.3 V. Modules usually need their SPI mod done before the tuning lines do anything.
+Wiring notes: power the module from the 5V pin with a shared ground, since its SPI inputs are 3.3 V logic either way. Keep the analog RSSI wire short. The firmware averages 4 ADC reads per millisecond in place of an RC filter on that line; a capacitor of 10 nF or more to ground, with about 1 kΩ in series, helps further but is not needed. Most modules need their SPI mod done before the tuning lines do anything.
 
 ## What to test first
 

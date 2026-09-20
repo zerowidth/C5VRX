@@ -21,6 +21,7 @@
 #define REG_SYNTH_B 0x1u
 #define IF_MHZ      479u   /* Module's intermediate frequency. */
 #define BIT_US      1u
+#define RSSI_OVERSAMPLE 4
 
 static const char *TAG = "rx5808";
 static adc_oneshot_unit_handle_t s_adc;
@@ -78,11 +79,18 @@ void rx5808_set_freq(uint16_t mhz)
     ESP_LOGW(TAG, "tuned %u MHz (N=%lu A=%lu)", mhz, (unsigned long)n, (unsigned long)a);
 }
 
+/* Averaging several reads stands in for the RC filter the RSSI line would
+ * otherwise want; the module's output only moves over a few kHz anyway. */
 int rx5808_read_mv(void)
 {
     if (!s_adc) return 0;
-    int raw = 0;
-    if (adc_oneshot_read(s_adc, RSSI_ADC_CHANNEL, &raw) != ESP_OK) return 0;
+    int sum = 0;
+    for (int i = 0; i < RSSI_OVERSAMPLE; ++i) {
+        int raw = 0;
+        if (adc_oneshot_read(s_adc, RSSI_ADC_CHANNEL, &raw) != ESP_OK) return 0;
+        sum += raw;
+    }
+    int raw = sum / RSSI_OVERSAMPLE;
     /* Raw counts scaled by the nominal full-scale of this attenuation; good
      * enough for comparing against our own readings, which are also relative. */
     return raw * 3100 / 4095;
