@@ -27,6 +27,7 @@
 #include "soc/parl_io_struct.h"
 
 #include "rf.h"
+#include "rx5808.h"
 
 #define IQ_RATE_HZ    40000000u
 #define RING_BYTES    16384u
@@ -164,8 +165,8 @@ static void measure_task(void *arg)
     char batch[512];
     size_t used = 0;
     uint32_t ticks = 0;
-    uint32_t peak = 0, window_n = 0;
-    uint64_t window_sum = 0;
+    uint32_t peak = 0, window_n = 0, rx_peak = 0;
+    uint64_t window_sum = 0, rx_sum = 0;
     TickType_t wake = xTaskGetTickCount();
 
     for (;;) {
@@ -183,20 +184,26 @@ static void measure_task(void *arg)
         uint32_t pwr_x100 = (uint32_t)((uint64_t)sum * 100u / SAMPLES_PER_READING);
         uint32_t pwr4_x100 = (uint32_t)((uint64_t)sum4 * 25600u / SAMPLES_PER_READING);
 
-        used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu %lu\n",
+        int rx_mv = rx5808_read_mv();
+
+        used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu %lu %d\n",
                          (unsigned long long)esp_timer_get_time(),
                          (unsigned long)pwr_x100, (unsigned long)pwr4_x100,
-                         (unsigned long)clip);
+                         (unsigned long)clip, rx_mv);
         if (pwr_x100 > peak) peak = pwr_x100;
+        if ((uint32_t)rx_mv > rx_peak) rx_peak = (uint32_t)rx_mv;
         window_sum += pwr_x100;
+        rx_sum += (uint32_t)rx_mv;
         if (++window_n == PEAK_WINDOW_MS) {
-            used += snprintf(batch + used, sizeof(batch) - used, "P %llu %u %lu %lu\n",
+            used += snprintf(batch + used, sizeof(batch) - used, "P %llu %u %lu %lu %lu %lu\n",
                              (unsigned long long)esp_timer_get_time(), (unsigned)PEAK_WINDOW_MS,
-                             (unsigned long)peak,
-                             (unsigned long)(window_sum / window_n));
+                             (unsigned long)peak, (unsigned long)(window_sum / window_n),
+                             (unsigned long)rx_peak, (unsigned long)(rx_sum / window_n));
             peak = 0;
+            rx_peak = 0;
             window_n = 0;
             window_sum = 0;
+            rx_sum = 0;
         }
 
         if (used > sizeof(batch) - 128) {
@@ -218,6 +225,7 @@ static void handle_command(char *line)
         int64_t t0 = esp_timer_get_time();
         err = rf_set_freq((uint16_t)arg);
         s_retune_us = (uint32_t)(esp_timer_get_time() - t0);
+        if (err == ESP_OK) rx5808_set_freq((uint16_t)arg);
         break;
     }
     case 'g':
@@ -279,9 +287,11 @@ void app_main(void)
     usb_serial_jtag_vfs_use_driver();
 
     build_power_lut();
+    ESP_ERROR_CHECK(rx5808_init());
     ESP_ERROR_CHECK(rf_start());
     ESP_ERROR_CHECK(start_capture());
     ESP_ERROR_CHECK(rf_set_freq(5658));
+    rx5808_set_freq(5658);
     ESP_LOGW(TAG, "capturing");
 
     xTaskCreate(measure_task, "measure", 4096, NULL, 5, NULL);

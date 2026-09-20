@@ -21,6 +21,17 @@ flowchart LR
 - [main/rf.c](main/rf.c) starts Wi-Fi receive-only, disables the vendor AGC, forces continuous sampling, and routes I/Q to GPIO. It tunes any frequency from 5180 to 5950 MHz by landing on the nearest Wi-Fi channel and then calling the undocumented `phy_set_freq()`.
 - [main/main.c](main/main.c) captures the I/Q into a DMA ring that refills itself with no CPU involvement. Once per millisecond it averages signal power over every 4th byte of the ring (about 410 µs of signal) and prints the result.
 
+## Pins
+
+Nothing is wired to the I/Q pins: each one loops its own output back to its own input, so they sit on the back pads and the left edge. That keeps the lower right edge free, including a gap at GP7, for an RX5808 module to compare against.
+
+| Function | Pins |
+|---|---|
+| I/Q capture (bits 0-7 of each byte) | GP1, GP0, GP25, GP23, GP24, GP5, GP3, GP4 |
+| Antenna switch: low on-board, high U.FL | GP26 |
+| RX5808 reference module: RSSI, DATA, LE, CLK | GP6, GP8, GP9, GP10 |
+| Free | GP2, GP7, GP11, GP12 |
+
 ## Capture layouts
 
 The ADC produces 10-bit I and Q, and MODEM_DIAG exposes them on 20 lines. PARLIO RX on the C5 captures at most 8 lines, so the firmware picks 8 of them, switchable at runtime:
@@ -81,9 +92,9 @@ Pass detection tracks a baseline, the 20th percentile of the last 30 s, and coun
 
 Each line from the board is one record:
 
-- `S <t_us> <pwr_x100> <pwr4_x100> <clip>` is one reading. `pwr_x100` is 100 × the mean power over 4096 samples in units of 8-bit LSB², so dB = 10·log10(pwr_x100 / 100). `pwr4_x100` is the same using only the top 4 bits of each component, on the same scale. `clip` counts samples at the layout's limit.
+- `S <t_us> <pwr_x100> <pwr4_x100> <clip> <rx5808_mv>` is one reading. `pwr_x100` is 100 × the mean power over 4096 samples in units of 8-bit LSB², so dB = 10·log10(pwr_x100 / 100). `pwr4_x100` is the same using only the top 4 bits of each component, on the same scale. `clip` counts samples at the layout's limit. `rx5808_mv` is the reference module's RSSI pin, or near 0 with no module fitted.
 - `I <freq_mhz> <gain> <bw40> <external_antenna> <layout> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
-- `P <t_us> <window_ms> <peak_x100> <mean_x100>` summarizes each 100 ms window. Multipath fading swings single readings by 20 dB while the drone barely moves, so the window peak tracks the envelope far better than any average.
+- `P <t_us> <window_ms> <peak_x100> <mean_x100> <rx_peak_mv> <rx_mean_mv>` summarizes each 100 ms window. Multipath fading swings single readings by 20 dB while the drone barely moves, so the window peak tracks the envelope far better than any average.
 - `D <layout> <chunk> <chunks> <hex>` carries part of a raw capture: 1024 consecutive bytes split over 8 lines.
 - `E <command>: <error>` reports a rejected command.
 - Anything else is ESP-IDF log output.
@@ -97,6 +108,17 @@ Commands to the board are one line each:
 - `m0`, `m1` or `m2` selects the capture layout. It starts at `m0`.
 - `d` sends a raw capture as `D` lines.
 - `?` requests an `I` line.
+
+## RX5808 comparison
+
+An RX5808 module wired to GP6, GP8, GP9 and GP10 gives a known-good reference. `f` tunes both receivers together, and every reading carries the module's RSSI voltage alongside ours.
+
+The module's RSSI pin is a log detector, so its voltage should be a straight line against our dB. The viewer fits that line continuously and reports it as `mV = a + b x dB` with an r². An r² near 1 means the two receivers agree; the slope is millivolts per dB. The fit does two things:
+
+- It quotes our readings in the module's millivolts, for dropping into code that expects RX5808 numbers.
+- It rescales the module's trace onto our dB axis, so both appear on the same chart and any disagreement is visible directly.
+
+Wiring notes: the RSSI line is analog, so keep it short and add roughly 1 kΩ in series with 10 nF to ground at the pin. Check whether your module wants 5 V or 3.3 V. Modules usually need their SPI mod done before the tuning lines do anything.
 
 ## What to test first
 
