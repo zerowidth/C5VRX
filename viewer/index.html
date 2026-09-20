@@ -19,6 +19,8 @@
   --grid: #e8e8e2;
   --peak: #bf8700;
   --trace4: #cf222e;
+  --envelope: #1a7f37;
+  --pass: rgba(26, 127, 55, 0.14);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -35,6 +37,8 @@
     --grid: #25262a;
     --peak: #e3b341;
     --trace4: #ff8182;
+    --envelope: #3fb950;
+    --pass: rgba(63, 185, 80, 0.18);
   }
 }
 * { box-sizing: border-box; }
@@ -104,7 +108,6 @@ td:first-child, th:first-child { text-align: left; }
     <input id="gain" type="range" min="0" max="62" step="1">
     <b id="gainval">-</b>
     <button id="bw">BW40</button>
-    <button id="ant" title="Antenna: on-board chip antenna or U.FL connector">On-board antenna</button>
     <label for="layout">Capture</label>
     <select id="layout">
       <option value="0">I+Q 4-bit</option>
@@ -124,10 +127,20 @@ td:first-child, th:first-child { text-align: left; }
     <button id="record">Record CSV</button>
   </section>
 
+  <section class="panel row" aria-label="Pass detection">
+    <label for="enter">Pass starts at baseline +</label>
+    <input id="enter" type="number" min="1" max="40" step="1" value="8"> dB
+    <label for="exit">ends at +</label>
+    <input id="exit" type="number" min="0" max="40" step="1" value="4"> dB
+    <span id="passinfo" class="muted">No passes yet.</span>
+  </section>
+
   <section class="panel stats" aria-label="Readings">
     <div class="stat"><span>Now (dB)</span><b id="now">-</b></div>
     <div class="stat"><span>Top 4 bits (dB)</span><b id="now4">-</b></div>
     <div class="stat"><span>Peak (dB)</span><b id="peak">-</b></div>
+    <div class="stat"><span>Baseline (dB)</span><b id="baseline">-</b></div>
+    <div class="stat"><span>Passes</span><b id="passes">0</b></div>
     <div class="stat"><span>Clipped</span><b id="clip">-</b></div>
     <div class="stat"><span>Frequency</span><b id="curfreq">-</b></div>
     <div class="stat"><span>Samples/s</span><b id="rate">-</b></div>
@@ -135,7 +148,7 @@ td:first-child, th:first-child { text-align: left; }
   </section>
 
   <section class="panel">
-    <div class="legend"><span><i style="background: var(--trace)"></i>Full resolution</span><span><i style="background: var(--trace4)"></i>Top 4 bits only</span></div>
+    <div class="legend"><span><i style="background: var(--trace)"></i>Full resolution</span><span><i style="background: var(--trace4)"></i>Top 4 bits only</span><span><i style="background: var(--envelope)"></i>100 ms peak</span></div>
     <canvas id="chart"></canvas>
   </section>
 
@@ -185,6 +198,10 @@ const state = {
   externalAntenna: false,
   layout: 0,
   dump: [],
+  env: [],          /* {t, db} per 100 ms window peak */
+  passes: [],       /* {start, end, peak} */
+  inPass: null,
+  baseline: null,
 };
 let writer = null;
 
@@ -224,7 +241,6 @@ function handleLine(line) {
     state.gain = gain;
     state.bw40 = bw === 1;
     state.externalAntenna = ant === 1;
-    $('ant').textContent = state.externalAntenna ? 'U.FL antenna' : 'On-board antenna';
     $('curfreq').textContent = `${freq} MHz`;
     $('retune').textContent = retune ? `${(retune / 1000).toFixed(2)} ms` : '-';
     if (document.activeElement !== $('gain')) $('gain').value = gain;
@@ -232,6 +248,14 @@ function handleLine(line) {
     $('bw').textContent = state.bw40 ? 'BW40' : 'BW20';
     $('bw').classList.toggle('on', !state.bw40);
     for (const b of $('channels').children) b.classList.toggle('on', Number(b.dataset.mhz) === freq);
+    return;
+  }
+  case 'P': {
+    const t = Number(parts[1]) / 1e6, db = toDb(Number(parts[3]));
+    if (!Number.isFinite(t) || !Number.isFinite(db) || state.paused) return;
+    state.env.push({ t, db });
+    if (state.env.length > 3000) state.env.splice(0, state.env.length - 3000);
+    detectPass(t, db);
     return;
   }
   case 'D': {
@@ -243,6 +267,29 @@ function handleLine(line) {
   }
   default:
     if (line.trim()) log(line);
+  }
+}
+
+/* The quiet 20th percentile of the last 30 s stands in for "no drone nearby",
+ * so thresholds follow the room instead of needing absolute levels. */
+function detectPass(t, db) {
+  const recent = state.env.filter(e => e.t > t - 30).map(e => e.db).sort((a, b) => a - b);
+  if (recent.length >= 20) state.baseline = recent[Math.floor(recent.length * 0.2)];
+  if (state.baseline === null) return;
+
+  const enter = state.baseline + Number($('enter').value);
+  const exit = state.baseline + Number($('exit').value);
+  if (!state.inPass && db >= enter) {
+    state.inPass = { start: t, end: t, peak: db };
+  } else if (state.inPass) {
+    state.inPass.peak = Math.max(state.inPass.peak, db);
+    if (db >= exit) {
+      state.inPass.end = t;
+    } else {
+      state.passes.push(state.inPass);
+      if (state.passes.length > 50) state.passes.shift();
+      state.inPass = null;
+    }
   }
 }
 
@@ -378,6 +425,38 @@ function draw() {
   line(sum4, cssVar('--trace4'));
   line(sum, cssVar('--trace'));
 
+  const tAt = time => right - (latest - time) / windowS * (right - left);
+  ctx.fillStyle = cssVar('--pass');
+  for (const p of [...state.passes, state.inPass].filter(Boolean)) {
+    const x0 = Math.max(left, tAt(p.start)), x1 = Math.min(right, tAt(p.end));
+    if (x1 > left && x0 < right) ctx.fillRect(x0, top, Math.max(2, x1 - x0), bottom - top);
+  }
+
+  ctx.strokeStyle = cssVar('--envelope');
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let envStarted = false;
+  for (const e of state.env) {
+    const x = tAt(e.t);
+    if (x < left) continue;
+    if (envStarted) ctx.lineTo(x, y(e.db)); else ctx.moveTo(x, y(e.db));
+    envStarted = true;
+  }
+  ctx.stroke();
+
+  if (state.baseline !== null) {
+    ctx.strokeStyle = cssVar('--envelope');
+    ctx.setLineDash([2, 5]);
+    ctx.lineWidth = 1;
+    for (const off of [Number($('enter').value), Number($('exit').value)]) {
+      ctx.beginPath();
+      ctx.moveTo(left, y(state.baseline + off) + 0.5);
+      ctx.lineTo(right, y(state.baseline + off) + 0.5);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
   if (Number.isFinite(state.peak)) {
     ctx.strokeStyle = cssVar('--peak');
     ctx.setLineDash([4, 4]);
@@ -405,6 +484,12 @@ function updateStats() {
     $('clip').textContent = `${(state.clip[i] * 100).toFixed(1)}%`;
   }
   $('peak').textContent = Number.isFinite(state.peak) ? state.peak.toFixed(1) : '-';
+  $('baseline').textContent = state.baseline === null ? '-' : state.baseline.toFixed(1);
+  $('passes').textContent = state.passes.length + (state.inPass ? 1 : 0);
+  const last = state.passes[state.passes.length - 1];
+  $('passinfo').textContent = last
+    ? `Last pass: peak ${last.peak.toFixed(1)} dB, ${Math.round((last.end - last.start) * 1000)} ms long, ${(state.env.length ? state.env[state.env.length - 1].t - last.end : 0).toFixed(1)} s ago.`
+    : 'No passes yet.';
 }
 
 function setupCanvas(canvas) {
@@ -535,6 +620,7 @@ function downloadCsv(rows) {
 function makeDemo() {
   let freq = RACEBAND[2], gain = 40, bw40 = true, ant = 0, layout = 0, t0 = performance.now();
   const status = () => handleLine(`I ${freq} ${gain} ${bw40 ? 1 : 0} ${ant} ${layout} 0`);
+  let winPeak = 0, winSum = 0, winN = 0;
   const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
   const dump = () => {
     const bytes = [];
@@ -558,10 +644,18 @@ function makeDemo() {
       const near = 40 / (1 + d * d);
       const off = Math.abs(freq - RACEBAND[2]);
       const sig = near * Math.pow(10, -off / (bw40 ? 30 : 15)) * Math.pow(10, (gain - 40) / 20);
-      const pwr = Math.min(3276800, 1000 + sig * 25600 * (1 + 0.3 * (Math.random() - 0.5)));
+      const fade = Math.pow(10, -Math.abs(gauss()) * 0.35);
+      const pwr = Math.min(3276800, 1000 + sig * 25600 * fade);
       const pwr4 = Math.max(0, pwr - 3000) * 0.9;
       const clip = Math.round(Math.max(0, pwr - 1500000) / 1000);
-      handleLine(`S ${Math.round(t * 1e6)} ${Math.round(layout === 0 ? pwr4 : pwr)} ${Math.round(pwr4)} ${clip}`);
+      const shown = Math.round(layout === 0 ? pwr4 : pwr);
+      handleLine(`S ${Math.round(t * 1e6)} ${shown} ${Math.round(pwr4)} ${clip}`);
+      winPeak = Math.max(winPeak, shown);
+      winSum += shown;
+      if (++winN === 100) {
+        handleLine(`P ${Math.round(t * 1e6)} 100 ${winPeak} ${Math.round(winSum / winN)}`);
+        winPeak = 0; winSum = 0; winN = 0;
+      }
     }
   }, 16);
   setInterval(status, 1000);
@@ -593,7 +687,6 @@ $('freq').addEventListener('keydown', e => { if (e.key === 'Enter') send(`f${$('
 $('gain').addEventListener('input', () => { $('gainval').textContent = $('gain').value; });
 $('gain').addEventListener('change', () => send(`g${$('gain').value}`));
 $('bw').addEventListener('click', () => send(`b${state.bw40 ? 0 : 1}`));
-$('ant').addEventListener('click', () => send(`a${state.externalAntenna ? 0 : 1}`));
 $('layout').addEventListener('change', () => send(`m${$('layout').value}`));
 $('capture').addEventListener('click', () => send('d'));
 $('resetpeak').addEventListener('click', () => { state.peak = -Infinity; });
