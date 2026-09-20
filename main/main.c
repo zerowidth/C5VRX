@@ -43,9 +43,8 @@ static const char *TAG = "rssi";
 
 static DMA_ATTR __attribute__((aligned(64))) uint8_t s_ring[RING_BYTES];
 
-/* Indexed by one captured byte, in units of 8-bit LSB^2. Bits 0-15: power at
- * the layout's full resolution. Bits 16-23: power using only the top 4 bits
- * of each component, divided by 256. Bit 24: clipped. */
+/* Indexed by one captured byte, in units of 8-bit LSB^2. Bits 0-15: power.
+ * Bit 16: clipped. */
 static uint32_t s_power_luts[RF_LAYOUT_COUNT][256];
 
 static volatile uint32_t s_retune_us;
@@ -55,15 +54,13 @@ static void build_power_lut(void)
     for (int b = 0; b < 256; ++b) {
         int q4 = (int8_t)((b & 0x0f) << 4) >> 4;
         int i4 = (int8_t)(b & 0xf0) >> 4;
-        uint32_t p4 = (uint32_t)(i4 * i4 + q4 * q4);
         bool clip4 = i4 == -8 || i4 == 7 || q4 == -8 || q4 == 7;
-        s_power_luts[RF_LAYOUT_IQ4][b] = (p4 * 256u) | (p4 << 16) | (clip4 ? 1u << 24 : 0u);
+        s_power_luts[RF_LAYOUT_IQ4][b] =
+            (uint32_t)(i4 * i4 + q4 * q4) * 256u | (clip4 ? 1u << 16 : 0u);
 
         int v = (int8_t)b;
-        int v4 = v >> 4;
         bool clip8 = v == -128 || v == 127;
-        uint32_t p8 = (uint32_t)(2 * v * v);
-        s_power_luts[RF_LAYOUT_Q8][b] = p8 | ((uint32_t)(2 * v4 * v4) << 16) | (clip8 ? 1u << 24 : 0u);
+        s_power_luts[RF_LAYOUT_Q8][b] = (uint32_t)(2 * v * v) | (clip8 ? 1u << 16 : 0u);
         s_power_luts[RF_LAYOUT_I8][b] = s_power_luts[RF_LAYOUT_Q8][b];
     }
 }
@@ -174,22 +171,19 @@ static void measure_task(void *arg)
 
         (void)esp_cache_msync(s_ring, sizeof(s_ring), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         const uint32_t *lut = s_power_luts[rf_get_layout()];
-        uint32_t sum = 0, sum4 = 0, clip = 0;
+        uint32_t sum = 0, clip = 0;
         for (uint32_t i = 0; i < RING_BYTES; i += SAMPLE_STRIDE) {
             uint32_t v = lut[s_ring[i]];
             sum += v & 0xffffu;
-            sum4 += (v >> 16) & 0xffu;
-            clip += v >> 24;
+            clip += v >> 16;
         }
         uint32_t pwr_x100 = (uint32_t)((uint64_t)sum * 100u / SAMPLES_PER_READING);
-        uint32_t pwr4_x100 = (uint32_t)((uint64_t)sum4 * 25600u / SAMPLES_PER_READING);
 
         int rx_mv = rx5808_read_mv();
 
-        used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu %lu %d\n",
+        used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu %d\n",
                          (unsigned long long)esp_timer_get_time(),
-                         (unsigned long)pwr_x100, (unsigned long)pwr4_x100,
-                         (unsigned long)clip, rx_mv);
+                         (unsigned long)pwr_x100, (unsigned long)clip, rx_mv);
         if (pwr_x100 > peak) peak = pwr_x100;
         if ((uint32_t)rx_mv > rx_peak) rx_peak = (uint32_t)rx_mv;
         window_sum += pwr_x100;

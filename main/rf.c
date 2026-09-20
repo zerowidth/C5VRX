@@ -63,7 +63,7 @@ static const uint8_t s_layout_diag[RF_LAYOUT_COUNT][RF_IQ_LANES] = {
     [RF_LAYOUT_Q8]  = { 2, 3, 4, 5, 6, 7, 8, 9 },
     [RF_LAYOUT_I8]  = { 12, 13, 14, 15, 16, 17, 18, 19 },
 };
-static rf_layout_t s_layout = RF_LAYOUT_IQ4;
+static rf_layout_t s_layout = RF_LAYOUT_I8;
 
 extern int lmac_stop_hw_txq(void);
 extern void phy_disable_agc(void);
@@ -75,7 +75,7 @@ extern void phy_set_freq(uint16_t freq_mhz, int offset);
 static const char *TAG = "rf";
 
 static uint16_t s_freq_mhz = 5865u;
-static uint8_t s_gain = 40u;
+static uint8_t s_gain = 36u;
 static bool s_bw40 = true;
 static bool s_external_antenna = false;
 
