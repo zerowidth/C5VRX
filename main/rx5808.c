@@ -12,6 +12,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
 
 #define PIN_DATA GPIO_NUM_8
 #define PIN_LE   GPIO_NUM_9
@@ -22,9 +23,11 @@
 #define IF_MHZ      479u   /* Module's intermediate frequency. */
 #define BIT_US      1u
 #define RSSI_OVERSAMPLE 4
+#define TUNE_SETTLE_US 35000 /* RotorHazard waits this long after tuning too. */
 
 static const char *TAG = "rx5808";
 static adc_oneshot_unit_handle_t s_adc;
+static int64_t s_settled_at_us;
 
 static void clock_bit(bool value)
 {
@@ -76,6 +79,7 @@ void rx5808_set_freq(uint16_t mhz)
     uint32_t steps = (mhz - IF_MHZ) / 2u;
     uint32_t n = steps / 32u, a = steps % 32u;
     write_register(REG_SYNTH_B, (n << 7) | a);
+    s_settled_at_us = esp_timer_get_time() + TUNE_SETTLE_US;
     ESP_LOGW(TAG, "tuned %u MHz (N=%lu A=%lu)", mhz, (unsigned long)n, (unsigned long)a);
 }
 
@@ -83,7 +87,7 @@ void rx5808_set_freq(uint16_t mhz)
  * otherwise want; the module's output only moves over a few kHz anyway. */
 int rx5808_read_mv(void)
 {
-    if (!s_adc) return 0;
+    if (!s_adc || esp_timer_get_time() < s_settled_at_us) return 0;
     int sum = 0;
     for (int i = 0; i < RSSI_OVERSAMPLE; ++i) {
         int raw = 0;
