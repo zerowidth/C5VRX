@@ -36,6 +36,7 @@
 #define DUMP_CHUNK    128u
 #define PARLIO_PERI_ID 9
 #define STATUS_PERIOD_MS 1000u
+#define PEAK_WINDOW_MS 100u
 
 static const char *TAG = "rssi";
 
@@ -155,11 +156,16 @@ static void print_status(void)
     out(line, n);
 }
 
+/* Fading makes single readings swing by 20 dB while the drone's distance
+ * barely changes, so the peak of each window tracks the envelope better than
+ * any average of it. */
 static void measure_task(void *arg)
 {
     char batch[512];
     size_t used = 0;
     uint32_t ticks = 0;
+    uint32_t peak = 0, window_n = 0;
+    uint64_t window_sum = 0;
     TickType_t wake = xTaskGetTickCount();
 
     for (;;) {
@@ -181,7 +187,19 @@ static void measure_task(void *arg)
                          (unsigned long long)esp_timer_get_time(),
                          (unsigned long)pwr_x100, (unsigned long)pwr4_x100,
                          (unsigned long)clip);
-        if (used > sizeof(batch) - 64) {
+        if (pwr_x100 > peak) peak = pwr_x100;
+        window_sum += pwr_x100;
+        if (++window_n == PEAK_WINDOW_MS) {
+            used += snprintf(batch + used, sizeof(batch) - used, "P %llu %u %lu %lu\n",
+                             (unsigned long long)esp_timer_get_time(), (unsigned)PEAK_WINDOW_MS,
+                             (unsigned long)peak,
+                             (unsigned long)(window_sum / window_n));
+            peak = 0;
+            window_n = 0;
+            window_sum = 0;
+        }
+
+        if (used > sizeof(batch) - 128) {
             out(batch, used);
             used = 0;
         }

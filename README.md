@@ -73,7 +73,9 @@ python3 -m http.server 8765 --directory viewer
 
 Then open http://localhost:8765 and click Connect. Add `?demo` to the URL to see synthetic data without a board.
 
-The graph shows the mean in each pixel column as a line, the min/max range as a band, the peak as a dashed line, and clipping as red ticks along the bottom.
+The graph shows the mean in each pixel column as a line, the min/max range as a band, the peak as a dashed line, and clipping as red ticks along the bottom. A green line traces the 100 ms peaks, and detected passes are shaded.
+
+Pass detection tracks a baseline, the 20th percentile of the last 30 s, and counts a pass when the 100 ms peak rises a set number of dB above it and ends when it falls back. Both thresholds are relative to the baseline, so they follow the room rather than needing absolute levels.
 
 ## Serial protocol
 
@@ -81,6 +83,7 @@ Each line from the board is one record:
 
 - `S <t_us> <pwr_x100> <pwr4_x100> <clip>` is one reading. `pwr_x100` is 100 × the mean power over 4096 samples in units of 8-bit LSB², so dB = 10·log10(pwr_x100 / 100). `pwr4_x100` is the same using only the top 4 bits of each component, on the same scale. `clip` counts samples at the layout's limit.
 - `I <freq_mhz> <gain> <bw40> <external_antenna> <layout> <retune_us>` is the current settings, sent once a second and after every command. `retune_us` is how long the last frequency change took.
+- `P <t_us> <window_ms> <peak_x100> <mean_x100>` summarizes each 100 ms window. Multipath fading swings single readings by 20 dB while the drone barely moves, so the window peak tracks the envelope far better than any average.
 - `D <layout> <chunk> <chunks> <hex>` carries part of a raw capture: 1024 consecutive bytes split over 8 lines.
 - `E <command>: <error>` reports a rejected command.
 - Anything else is ESP-IDF log output.
