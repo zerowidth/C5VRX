@@ -355,7 +355,7 @@ async function connect() {
     $('conn').textContent = 'Disconnected';
     $('connect').disabled = false;
   });
-  await send('?');
+  await send('s');
 
   const reader = port.readable.pipeThrough(new TextDecoderStream()).getReader();
   let buf = '';
