@@ -355,7 +355,11 @@ async function connect() {
     $('conn').textContent = 'Disconnected';
     $('connect').disabled = false;
   });
-  await send('s');
+  /* The board stays silent until it hears a command, and opening the port
+   * resets it, so the first request can land mid-boot. Ask until it answers. */
+  let heard = false;
+  const wake = setInterval(() => { if (heard) clearInterval(wake); else send('s'); }, 500);
+  send('s');
 
   const reader = port.readable.pipeThrough(new TextDecoderStream()).getReader();
   let buf = '';
@@ -363,6 +367,7 @@ async function connect() {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      if (value.includes('\nI ') || value.startsWith('I ')) heard = true;
       buf += value;
       const lines = buf.split('\n');
       buf = lines.pop();

@@ -57,6 +57,11 @@ static volatile uint32_t s_retune_us;
 static volatile uint32_t s_loop_max_us;
 static volatile uint32_t s_rx_bytes;
 
+/* Silent until the first text command. Opening the port resets the board, and
+ * a RotorHazard server probes within microseconds of flushing, so any text
+ * already streaming would bury its first replies. */
+static volatile bool s_streaming;
+
 static void build_power_lut(void)
 {
     for (int b = 0; b < 256; ++b) {
@@ -131,7 +136,7 @@ static esp_err_t start_capture(void)
 static void out(const char *buf, size_t len)
 {
     /* A RotorHazard server owns the port once it starts talking to us. */
-    if (!rhnode_active() && usb_serial_jtag_is_connected())
+    if (s_streaming && !rhnode_active() && usb_serial_jtag_is_connected())
         usb_serial_jtag_write_bytes(buf, len, 0);
 }
 
@@ -239,6 +244,7 @@ static void handle_command(char *line)
     char cmd = line[0];
     long arg = strtol(line + 1, NULL, 10);
     esp_err_t err = ESP_OK;
+    s_streaming = true;
 
     switch (cmd) {
     case 'f': {

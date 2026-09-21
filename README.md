@@ -123,6 +123,8 @@ Each line from the board is one record:
 - `E <command>: <error>` reports a rejected command.
 - Anything else is ESP-IDF log output.
 
+The board sends nothing until it receives its first text command; the viewer sends `s` on connect, repeating until it hears back. Opening the port resets the board, and a RotorHazard server probes within microseconds of flushing its input, so text already streaming would bury its first replies.
+
 A RotorHazard server's first command byte switches the board to [node mode](#running-it-as-a-rotorhazard-node) until it is reset; none of the text commands collide with its command codes.
 
 Commands to the board are one line each:
