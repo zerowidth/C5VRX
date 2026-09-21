@@ -108,9 +108,9 @@ The scales are:
 - Node 1, the C5: 4 counts per dB, so its 0-255 covers about 64 dB.
 - Node 2, the RX5808: 2.5 V of its RSSI pin mapped to 0-255, the same as RotorHazard's own node firmware.
 
-What works: laps, crossings, pass peaks and node peaks or nadirs. What doesn't: extremum history, so RotorHazard's RSSI graphs stay empty. Laps and their times do not depend on it.
+Laps, crossings, peaks and RotorHazard's per-node RSSI graphs all work. The graphs come from extremum history: the node queues the filtered signal's turning points, peaks and nadirs with when they started and how long they held, and the server stitches them back into a trace. Unlike upstream, a turning point is only declared on a real change of direction, so a staircase ramp gives one peak rather than one per step.
 
-[test/run.sh](test/run.sh) exercises the protocol and lap detection on the host, with no board attached: it checks framing and checksums, multi-node addressing, per-node tuning, and that a simulated pass yields exactly one lap timed at the peak rather than 128 ms late.
+[test/run.sh](test/run.sh) exercises the protocol and lap detection on the host, with no board attached: it checks framing and checksums, multi-node addressing, per-node tuning, that each simulated pass yields exactly one lap timed at the peak rather than 128 ms late, and that two passes come back as history of exactly peak, nadir, peak, oldest first.
 
 ## Serial protocol
 

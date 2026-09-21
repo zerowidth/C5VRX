@@ -75,8 +75,40 @@ int main(void)
     int lap_time = (int)ms - since;
     CHECK(lap_time > 3300 && lap_time < 3700, "lap time %d ms should be near the 3500 ms peak", lap_time);
 
+    /* A second pass peaking at 8500 ms. The dip between the two only becomes
+     * a nadir once the signal rises again. */
+    for (; ms < 8500; ms++) rhnode_feed(0, 60 + (ms - 7000) * 140 / 1500, ms);
+    for (; ms < 10000; ms++) rhnode_feed(0, 200 - (ms - 8500) * 140 / 1500, ms);
+    for (; ms < 12000; ms++) rhnode_feed(0, 60 + (ms % 3), ms);
+    read_cmd(0x0d, r, 8);
+    CHECK(r[0] == 2, "expected 2 laps after the second pass, got %d", r[0]);
+
+    /* Drain the history, oldest first: peak, nadir between the passes, peak. */
+    int peaks = 0, nadirs = 0, best_peak = 0, best_peak_ms = 0, last_ms = -1, ordered = 1;
+    for (int i = 0; i < 25; i++) {
+        read_cmd(0x0e, r, 8);
+        CHECK((r[0] & 1) == 0, "should not still be crossing");
+        int since = (r[4] << 8) | r[5];
+        if (r[3] == 0 && since == 0) break;
+        int at = (int)ms - since;
+        printf("  %s rssi=%d at=%d ms held=%d ms\n", (r[0] & 2) ? "peak " : "nadir", r[3], at, (r[6] << 8) | r[7]);
+        if (at < last_ms) ordered = 0;
+        CHECK(at != last_ms, "duplicate history entry at %d ms", at);
+        last_ms = at;
+        CHECK(r[3] < 250, "history entry of %d looks like a placeholder, not a reading", r[3]);
+        if (r[0] & 2) {
+            peaks++;
+            if (r[3] > best_peak) { best_peak = r[3]; best_peak_ms = at; }
+        } else {
+            nadirs++;
+        }
+    }
+    CHECK(peaks == 2 && nadirs == 1, "two passes should give 2 peaks and 1 nadir, got %d and %d", peaks, nadirs);
+    CHECK(ordered, "history not oldest-first");
+    CHECK(best_peak > 180, "history peak %d should be near 200", best_peak);
+    CHECK(best_peak_ms > 3300 && best_peak_ms < 3700, "history peak at %d ms, want near 3500", best_peak_ms);
     read_cmd(0x0e, r, 8);
-    CHECK((r[0] & 1) == 0, "should not still be crossing");
+    CHECK(r[3] == 0 && r[4] == 0 && r[5] == 0, "history should be empty once drained");
 
     printf(fails ? "%d checks FAILED\n" : "all checks passed\n", fails);
     return fails != 0;
