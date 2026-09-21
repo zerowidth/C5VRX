@@ -25,5 +25,8 @@ bool rhnode_rx_byte(uint8_t b);
 
 bool rhnode_active(void);
 
+/* Worst-case measurement pass, reported to the server as the node loop time. */
+void rhnode_set_loop_us(uint32_t us);
+
 /* True if this byte can only be a RotorHazard command, never our own text. */
 bool rhnode_is_command_byte(uint8_t b);

@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "driver/usb_serial_jtag.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
 #include "rf.h"
@@ -80,6 +81,7 @@ static node_t s_nodes[RHNODE_COUNT];
 static uint8_t s_cur_node;
 static bool s_active;
 static uint32_t s_now_ms;
+static uint16_t s_loop_us = 1000;
 
 /* Command in progress, while its payload and checksum arrive. */
 static uint8_t s_cmd;
@@ -158,6 +160,11 @@ bool rhnode_active(void)
     return s_active;
 }
 
+void rhnode_set_loop_us(uint32_t us)
+{
+    s_loop_us = us > 0xffff ? 0xffff : (uint16_t)us;
+}
+
 bool rhnode_is_command_byte(uint8_t b)
 {
     switch (b) {
@@ -231,8 +238,8 @@ static void fill_pass_stats(node_t *n, uint8_t *b)
     b[3] = n->rssi;
     b[4] = n->node_peak;
     b[5] = n->lap_peak;
-    b[6] = 0; /* loop time, microseconds: we are paced by a 1 ms tick */
-    b[7] = 250;
+    b[6] = (uint8_t)(s_loop_us >> 8);
+    b[7] = (uint8_t)s_loop_us;
 }
 
 /* No extremum history is kept, so the trailing fields stay zero. */
@@ -311,6 +318,8 @@ bool rhnode_rx_byte(uint8_t b)
 {
     if (!s_active) {
         for (int i = 0; i < RHNODE_COUNT; ++i) node_init(&s_nodes[i]);
+        /* Log lines would land in the middle of binary replies. */
+        esp_log_level_set("*", ESP_LOG_NONE);
         s_active = true;
     }
 

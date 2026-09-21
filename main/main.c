@@ -50,6 +50,12 @@ static DMA_ATTR __attribute__((aligned(64))) uint8_t s_ring[RING_BYTES];
 static uint32_t s_power_luts[RF_LAYOUT_COUNT][256];
 
 static volatile uint32_t s_retune_us;
+/* Diagnostics in the status line: the slowest measurement pass in the last
+ * second, and every byte the command task has received. If the first nears
+ * 1000 us the command task can starve; if the second never moves, nothing is
+ * arriving over USB. */
+static volatile uint32_t s_loop_max_us;
+static volatile uint32_t s_rx_bytes;
 
 static void build_power_lut(void)
 {
@@ -149,11 +155,12 @@ static void dump_samples(void)
 
 static void print_status(void)
 {
-    char line[64];
-    int n = snprintf(line, sizeof(line), "I %u %u %u %u %u %lu\n",
+    char line[96];
+    int n = snprintf(line, sizeof(line), "I %u %u %u %u %u %lu %lu %lu\n",
                      rf_get_freq(), rf_get_gain(), rf_get_bw40() ? 1u : 0u,
                      rf_get_external_antenna() ? 1u : 0u, (unsigned)rf_get_layout(),
-                     (unsigned long)s_retune_us);
+                     (unsigned long)s_retune_us, (unsigned long)s_loop_max_us,
+                     (unsigned long)s_rx_bytes);
     out(line, n);
 }
 
@@ -167,10 +174,12 @@ static void measure_task(void *arg)
     uint32_t ticks = 0;
     uint32_t peak = 0, window_n = 0, rx_peak = 0;
     uint64_t window_sum = 0, rx_sum = 0;
+    uint32_t loop_max = 0;
     TickType_t wake = xTaskGetTickCount();
 
     for (;;) {
         vTaskDelayUntil(&wake, 1);
+        int64_t loop_start = esp_timer_get_time();
 
         (void)esp_cache_msync(s_ring, sizeof(s_ring), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         const uint32_t *lut = s_power_luts[rf_get_layout()];
@@ -214,7 +223,14 @@ static void measure_task(void *arg)
             out(batch, used);
             used = 0;
         }
-        if (++ticks % STATUS_PERIOD_MS == 0) print_status();
+        uint32_t loop_us = (uint32_t)(esp_timer_get_time() - loop_start);
+        if (loop_us > loop_max) loop_max = loop_us;
+        if (++ticks % STATUS_PERIOD_MS == 0) {
+            s_loop_max_us = loop_max;
+            rhnode_set_loop_us(loop_max);
+            loop_max = 0;
+            print_status();
+        }
     }
 }
 
@@ -270,6 +286,7 @@ static void command_task(void *arg)
     for (;;) {
         char c;
         if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) != 1) continue;
+        s_rx_bytes++;
         if (rhnode_active() || rhnode_is_command_byte((uint8_t)c)) {
             rhnode_rx_byte((uint8_t)c);
             continue;
@@ -302,6 +319,8 @@ void app_main(void)
     rx5808_set_freq(5658);
     ESP_LOGW(TAG, "capturing");
 
+    /* Commands outrank measurement: a RotorHazard server gives up after 250 ms,
+     * and this task spends nearly all its time blocked on USB anyway. */
     xTaskCreate(measure_task, "measure", 4096, NULL, 5, NULL);
-    xTaskCreate(command_task, "command", 4096, NULL, 4, NULL);
+    xTaskCreate(command_task, "command", 4096, NULL, 6, NULL);
 }
