@@ -90,6 +90,28 @@ Pass detection follows RotorHazard's node firmware: a 255-sample median at 1 kHz
 
 A pass starts when that median rises a set number of dB above the baseline, the 20th percentile of the last 30 s, and ends when it falls back. Both thresholds are relative to the baseline, so they follow the room instead of needing absolute levels. The pass time is the middle of the peak, which avoids bias when the peak is flat. The board's own 100 ms peaks stay on the chart as a fainter line.
 
+## Running it as a RotorHazard node
+
+The surest way to know whether any of this works is to let RotorHazard judge it. The board can present itself as two timing nodes on one USB connection: node 1 is the C5's own receiver, node 2 is the RX5808. Both watch the same passes, so its race log compares them directly.
+
+It speaks RotorHazard's node API level 36. The switch is automatic: the first command byte from a server puts the board into node mode, where the text protocol and the viewer go quiet until the board is reset.
+
+Setup:
+
+1. Connect the board by USB to the machine running RotorHazard.
+2. Add the port to `SERIAL_PORTS` in its `config.json`, for example `"SERIAL_PORTS": ["/dev/ttyACM0"]`, and restart the server. It should find two nodes.
+3. Set both nodes to the channel your VTX uses. Each node tunes its own receiver.
+4. Calibrate enter and exit levels per node, since the two report on different scales.
+
+The scales are:
+
+- Node 1, the C5: 4 counts per dB, so its 0-255 covers about 64 dB.
+- Node 2, the RX5808: 2.5 V of its RSSI pin mapped to 0-255, the same as RotorHazard's own node firmware.
+
+What works: laps, crossings, pass peaks and node peaks or nadirs. What doesn't: extremum history, so RotorHazard's RSSI graphs stay empty. Laps and their times do not depend on it.
+
+[test/run.sh](test/run.sh) exercises the protocol and lap detection on the host, with no board attached: it checks framing and checksums, multi-node addressing, per-node tuning, and that a simulated pass yields exactly one lap timed at the peak rather than 128 ms late.
+
 ## Serial protocol
 
 Each line from the board is one record:
@@ -101,6 +123,8 @@ Each line from the board is one record:
 - `E <command>: <error>` reports a rejected command.
 - Anything else is ESP-IDF log output.
 
+A RotorHazard server's first command byte switches the board to [node mode](#running-it-as-a-rotorhazard-node) until it is reset; none of the text commands collide with its command codes.
+
 Commands to the board are one line each:
 
 - `f<mhz>` tunes, for example `f5917` for R8.
@@ -109,7 +133,7 @@ Commands to the board are one line each:
 - `a0` or `a1` selects the on-board antenna or the U.FL connector (GPIO26). It starts on the on-board antenna.
 - `m0`, `m1` or `m2` selects the capture layout. It starts at `m2`, 8-bit I.
 - `d` sends a raw capture as `D` lines.
-- `?` requests an `I` line.
+- `s` requests an `I` line.
 
 ## RX5808 comparison
 

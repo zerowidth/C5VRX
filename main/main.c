@@ -9,6 +9,7 @@
  * for the line protocol.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,7 @@
 #include "soc/parl_io_struct.h"
 
 #include "rf.h"
+#include "rhnode.h"
 #include "rx5808.h"
 
 #define IQ_RATE_HZ    40000000u
@@ -122,7 +124,8 @@ static esp_err_t start_capture(void)
 
 static void out(const char *buf, size_t len)
 {
-    if (usb_serial_jtag_is_connected())
+    /* A RotorHazard server owns the port once it starts talking to us. */
+    if (!rhnode_active() && usb_serial_jtag_is_connected())
         usb_serial_jtag_write_bytes(buf, len, 0);
 }
 
@@ -180,6 +183,13 @@ static void measure_task(void *arg)
         uint32_t pwr_x100 = (uint32_t)((uint64_t)sum * 100u / SAMPLES_PER_READING);
 
         int rx_mv = rx5808_read_mv();
+
+        /* RotorHazard works in 0-255. Ours is 4 counts per dB; the module's
+         * matches its node firmware, which treats 2.5 V as full scale. */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        int db4x = (int)(40.0f * log10f(fmaxf((float)pwr_x100, 1.0f) / 100.0f));
+        rhnode_feed(RHNODE_C5, (uint8_t)(db4x < 0 ? 0 : (db4x > 255 ? 255 : db4x)), now_ms);
+        rhnode_feed(RHNODE_RX5808, (uint8_t)(rx_mv > 2500 ? 255 : rx_mv * 255 / 2500), now_ms);
 
         used += snprintf(batch + used, sizeof(batch) - used, "S %llu %lu %lu %d\n",
                          (unsigned long long)esp_timer_get_time(),
@@ -239,7 +249,7 @@ static void handle_command(char *line)
     case 'd':
         dump_samples();
         break;
-    case '?':
+    case 's':
         break;
     default:
         err = ESP_ERR_NOT_SUPPORTED;
@@ -260,6 +270,10 @@ static void command_task(void *arg)
     for (;;) {
         char c;
         if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) != 1) continue;
+        if (rhnode_active() || rhnode_is_command_byte((uint8_t)c)) {
+            rhnode_rx_byte((uint8_t)c);
+            continue;
+        }
         if (c == '\r' || c == '\n') {
             if (len == 0) continue;
             line[len] = '\0';
