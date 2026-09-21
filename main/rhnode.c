@@ -23,6 +23,7 @@
 
 #define READ_ADDRESS         0x00
 #define READ_FREQUENCY       0x03
+#define TEST_RX_REGISTER     0x04
 #define READ_LAP_STATS       0x05
 #define READ_LAP_PASS_STATS  0x0D
 #define READ_LAP_EXTREMUMS   0x0E
@@ -91,6 +92,7 @@ typedef struct {
     uint8_t lap_peak, lap_nadir;
 
     uint16_t freq_mhz;
+    bool tune_ok;
 
     uint8_t last_rssi;
     int8_t direction; /* sign of the last nonzero change; 0 before any */
@@ -117,6 +119,7 @@ static uint8_t s_payload_len, s_payload_want;
 static void node_init(node_t *n, uint8_t index)
 {
     n->freq_mhz = index == RHNODE_C5 ? rf_get_freq() : rx5808_get_freq();
+    n->tune_ok = true;
     n->enter_at = 96;
     n->exit_at = 80;
     n->node_nadir = 255;
@@ -255,7 +258,7 @@ void rhnode_set_loop_us(uint32_t us)
 bool rhnode_is_command_byte(uint8_t b)
 {
     switch (b) {
-    case READ_ADDRESS: case READ_FREQUENCY: case READ_LAP_STATS:
+    case READ_ADDRESS: case READ_FREQUENCY: case TEST_RX_REGISTER: case READ_LAP_STATS:
     case READ_LAP_PASS_STATS: case READ_LAP_EXTREMUMS: case READ_RHFEAT_FLAGS:
     case READ_REVISION_CODE: case READ_NODE_RSSI_PEAK: case READ_NODE_RSSI_NADIR:
     case READ_ENTER_AT_LEVEL: case READ_EXIT_AT_LEVEL: case READ_TIME_MILLIS:
@@ -369,6 +372,11 @@ static void handle_read(uint8_t cmd)
     switch (cmd) {
     case READ_ADDRESS: reply8(0); break;
     case READ_FREQUENCY: reply16(n->freq_mhz); break;
+    /* The server checks this after every tune. The RX5808 is asked for its
+     * register back; the C5 only has its driver's word. */
+    case TEST_RX_REGISTER:
+        reply8(s_cur_node == RHNODE_RX5808 ? rx5808_verify_tuning() : n->tune_ok);
+        break;
     case READ_LAP_STATS:
         fill_pass_stats(n, buf);
         fill_extremums(n, buf + 8);
@@ -409,7 +417,7 @@ static void handle_write(uint8_t cmd, const uint8_t *p)
         uint16_t mhz = (uint16_t)((p[0] << 8) | p[1]);
         n->freq_mhz = mhz;
         if (mhz >= 5000u) {
-            if (s_cur_node == RHNODE_C5) rf_set_freq(mhz);
+            if (s_cur_node == RHNODE_C5) n->tune_ok = rf_set_freq(mhz) == ESP_OK;
             else rx5808_set_freq(mhz);
         }
         break;

@@ -22,6 +22,7 @@
 #define REG_SYNTH_B 0x1u
 #define IF_MHZ      479u   /* Module's intermediate frequency. */
 #define BIT_US      1u
+#define READ_BIT_US 5u /* the module drives the line on reads; give it time */
 #define RSSI_OVERSAMPLE 4
 #define TUNE_SETTLE_US 35000 /* RotorHazard waits this long after tuning too. */
 
@@ -39,6 +40,13 @@ static void clock_bit(bool value)
     esp_rom_delay_us(BIT_US);
     gpio_set_level(PIN_CLK, 0);
     esp_rom_delay_us(BIT_US);
+}
+
+static uint32_t synth_value(uint16_t mhz)
+{
+    /* The datasheet's tuning equation: f = 2 * (N * 32 + A) + IF. */
+    uint32_t steps = (mhz - IF_MHZ) / 2u;
+    return ((steps / 32u) << 7) | (steps % 32u);
 }
 
 static void write_register(uint8_t addr, uint32_t data20)
@@ -76,18 +84,49 @@ esp_err_t rx5808_init(void)
 
 void rx5808_set_freq(uint16_t mhz)
 {
-    /* The datasheet's tuning equation: f = 2 * (N * 32 + A) + IF. */
-    uint32_t steps = (mhz - IF_MHZ) / 2u;
-    uint32_t n = steps / 32u, a = steps % 32u;
-    write_register(REG_SYNTH_B, (n << 7) | a);
+    uint32_t value = synth_value(mhz);
+    write_register(REG_SYNTH_B, value);
     s_settled_at_us = esp_timer_get_time() + TUNE_SETTLE_US;
     s_freq_mhz = mhz;
-    ESP_LOGW(TAG, "tuned %u MHz (N=%lu A=%lu)", mhz, (unsigned long)n, (unsigned long)a);
+    ESP_LOGW(TAG, "tuned %u MHz (register 0x%05lx)", mhz, (unsigned long)value);
 }
 
 uint16_t rx5808_get_freq(void)
 {
     return s_freq_mhz;
+}
+
+/* Same frame as a write with the read bit clear, then the module shifts the
+ * register out on the data line while we clock. */
+static uint32_t read_register(uint8_t addr)
+{
+    gpio_set_level(PIN_LE, 0);
+    esp_rom_delay_us(BIT_US);
+    for (int b = 0; b < 4; ++b) clock_bit((addr >> b) & 1u);
+    clock_bit(false); /* read */
+
+    gpio_set_direction(PIN_DATA, GPIO_MODE_INPUT);
+    gpio_pullup_en(PIN_DATA);
+    uint32_t value = 0;
+    for (int b = 0; b < 20; ++b) {
+        esp_rom_delay_us(READ_BIT_US);
+        if (gpio_get_level(PIN_DATA)) value |= 1u << b;
+        gpio_set_level(PIN_CLK, 1);
+        esp_rom_delay_us(READ_BIT_US);
+        gpio_set_level(PIN_CLK, 0);
+    }
+    gpio_pullup_dis(PIN_DATA);
+    gpio_set_direction(PIN_DATA, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(PIN_LE, 1);
+    esp_rom_delay_us(BIT_US);
+    return value;
+}
+
+bool rx5808_verify_tuning(void)
+{
+    /* Only the low 16 bits carry N and A; the rest read back as zero. */
+    return (read_register(REG_SYNTH_B) & 0xffffu) == synth_value(s_freq_mhz);
 }
 
 /* Averaging several reads stands in for the RC filter the RSSI line would

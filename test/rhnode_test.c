@@ -5,7 +5,8 @@
 unsigned char tx_buf[512];
 int tx_len;
 static unsigned tuned_c5, tuned_rx;
-void rf_set_freq(uint16_t mhz) { tuned_c5 = mhz; }
+int rf_set_freq(uint16_t mhz) { tuned_c5 = mhz; return mhz <= 5950 ? 0 : 1; }
+bool rx5808_verify_tuning(void) { return tuned_rx != 0; }
 void rx5808_set_freq(uint16_t mhz) { tuned_rx = mhz; }
 uint16_t rf_get_freq(void) { return 5658; }
 uint16_t rx5808_get_freq(void) { return 5695; }
@@ -62,6 +63,19 @@ int main(void)
     write_cmd(0x51, freq2, 2);
     CHECK(tuned_c5 == 5732, "C5 tuned to %u", tuned_c5);
     CHECK(tuned_rx == 5917, "RX5808 tuned to %u", tuned_rx);
+
+    /* The server validates every tune with TEST_RX_REGISTER. */
+    read_cmd(0x04, r, 1);
+    CHECK(r[0] == 1, "node 1 tune check returned %d", r[0]);
+    idx = 0;
+    write_cmd(0x7a, &idx, 1);
+    read_cmd(0x04, r, 1);
+    CHECK(r[0] == 1, "node 0 tune check returned %d", r[0]);
+    unsigned char bad[2] = { 6100 >> 8, 6100 & 0xff };
+    write_cmd(0x51, bad, 2);
+    read_cmd(0x04, r, 1);
+    CHECK(r[0] == 0, "node 0 should fail its tune check at 6100 MHz, got %d", r[0]);
+    write_cmd(0x51, freq, 2);
     idx = 0;
     write_cmd(0x7a, &idx, 1);
 

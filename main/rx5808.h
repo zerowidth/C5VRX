@@ -14,5 +14,9 @@ void rx5808_set_freq(uint16_t mhz);
 
 uint16_t rx5808_get_freq(void);
 
+/* Read the synthesizer register back and compare it with what the last tune
+ * wrote. True means the module really is listening where we asked. */
+bool rx5808_verify_tuning(void);
+
 /* Latest RSSI in millivolts. Reads about 0 when no module is connected. */
 int rx5808_read_mv(void);
