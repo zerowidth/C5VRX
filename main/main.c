@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/dma_types.h"
+#include "hal/usb_serial_jtag_ll.h"
 #include "soc/ahb_dma_struct.h"
 #include "soc/parl_io_struct.h"
 
@@ -322,6 +323,11 @@ void app_main(void)
     /* Startup logging can still be arriving when a RotorHazard server,
      * which reset the board by opening the port, sends its first probe. */
     esp_log_level_set("*", ESP_LOG_NONE);
+    /* The peripheral holds a partial packet until something flushes it, and
+     * it survives the reset that opening the port causes. Send it now, while
+     * the server is still waiting out its 2 s, rather than glued to the front
+     * of our first reply. */
+    usb_serial_jtag_ll_txfifo_flush();
 
     build_power_lut();
     ESP_ERROR_CHECK(rx5808_init());
