@@ -28,6 +28,7 @@
 static const char *TAG = "rx5808";
 static adc_oneshot_unit_handle_t s_adc;
 static int64_t s_settled_at_us;
+static uint16_t s_freq_mhz;
 
 static void clock_bit(bool value)
 {
@@ -80,7 +81,13 @@ void rx5808_set_freq(uint16_t mhz)
     uint32_t n = steps / 32u, a = steps % 32u;
     write_register(REG_SYNTH_B, (n << 7) | a);
     s_settled_at_us = esp_timer_get_time() + TUNE_SETTLE_US;
+    s_freq_mhz = mhz;
     ESP_LOGW(TAG, "tuned %u MHz (N=%lu A=%lu)", mhz, (unsigned long)n, (unsigned long)a);
+}
+
+uint16_t rx5808_get_freq(void)
+{
+    return s_freq_mhz;
 }
 
 /* Averaging several reads stands in for the RC filter the RSSI line would

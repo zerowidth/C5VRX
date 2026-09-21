@@ -244,7 +244,10 @@ static void handle_command(char *line)
     char cmd = line[0];
     long arg = strtol(line + 1, NULL, 10);
     esp_err_t err = ESP_OK;
-    s_streaming = true;
+    if (!s_streaming) {
+        s_streaming = true;
+        esp_log_level_set("*", ESP_LOG_WARN);
+    }
 
     switch (cmd) {
     case 'f': {
@@ -316,6 +319,9 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
     usb_serial_jtag_vfs_use_driver();
+    /* Startup logging can still be arriving when a RotorHazard server,
+     * which reset the board by opening the port, sends its first probe. */
+    esp_log_level_set("*", ESP_LOG_NONE);
 
     build_power_lut();
     ESP_ERROR_CHECK(rx5808_init());

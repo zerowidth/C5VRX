@@ -12,5 +12,7 @@ esp_err_t rx5808_init(void);
  * used; FPV channels are all even MHz. */
 void rx5808_set_freq(uint16_t mhz);
 
+uint16_t rx5808_get_freq(void);
+
 /* Latest RSSI in millivolts. Reads about 0 when no module is connected. */
 int rx5808_read_mv(void);

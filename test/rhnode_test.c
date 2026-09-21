@@ -7,6 +7,8 @@ int tx_len;
 static unsigned tuned_c5, tuned_rx;
 void rf_set_freq(uint16_t mhz) { tuned_c5 = mhz; }
 void rx5808_set_freq(uint16_t mhz) { tuned_rx = mhz; }
+uint16_t rf_get_freq(void) { return 5658; }
+uint16_t rx5808_get_freq(void) { return 5695; }
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
@@ -39,6 +41,15 @@ int main(void)
     CHECK(r[0] == 0x25 && r[1] == 36, "revision code %02x %02x", r[0], r[1]);
     read_cmd(0x39, r, 1);
     CHECK(r[0] == 2, "multinode count %d", r[0]);
+
+    /* The server reads frequencies before writing any, and rejects zero. */
+    read_cmd(0x03, r, 2);
+    CHECK(((r[0] << 8) | r[1]) == 5658, "node 0 frequency before any write: %d", (r[0] << 8) | r[1]);
+    unsigned char one = 1, zero = 0;
+    write_cmd(0x7a, &one, 1);
+    read_cmd(0x03, r, 2);
+    CHECK(((r[0] << 8) | r[1]) == 5695, "node 1 frequency before any write: %d", (r[0] << 8) | r[1]);
+    write_cmd(0x7a, &zero, 1);
 
     /* Tune each node through the server's own command. */
     unsigned char freq[2] = { 5732 >> 8, 5732 & 0xff };

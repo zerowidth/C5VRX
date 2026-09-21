@@ -112,8 +112,11 @@ static uint8_t s_cmd;
 static uint8_t s_payload[8];
 static uint8_t s_payload_len, s_payload_want;
 
-static void node_init(node_t *n)
+/* The server reads each node's frequency before it writes one, and rejects
+ * zero, so start from what the receivers are already tuned to. */
+static void node_init(node_t *n, uint8_t index)
 {
+    n->freq_mhz = index == RHNODE_C5 ? rf_get_freq() : rx5808_get_freq();
     n->enter_at = 96;
     n->exit_at = 80;
     n->node_nadir = 255;
@@ -424,7 +427,7 @@ static void handle_write(uint8_t cmd, const uint8_t *p)
 bool rhnode_rx_byte(uint8_t b)
 {
     if (!s_active) {
-        for (int i = 0; i < RHNODE_COUNT; ++i) node_init(&s_nodes[i]);
+        for (int i = 0; i < RHNODE_COUNT; ++i) node_init(&s_nodes[i], (uint8_t)i);
         /* Log lines would land in the middle of binary replies. */
         esp_log_level_set("*", ESP_LOG_NONE);
         s_active = true;
