@@ -1,7 +1,7 @@
 """Decode a capture of the C5VRX DAC bus into grayscale NTSC video.
 
 Input is a Logic 2 binary export directory (digital_0.bin .. digital_5.bin, channel N on
-DAC bit N) or a raw file of 20 MS/s codes, one byte each, as written by --codes.
+DAC bit N, captured at 50 MS/s, the Logic 8's ceiling with six channels) or a raw file of 20 MS/s codes, one byte each, as written by --codes.
 """
 
 import argparse
