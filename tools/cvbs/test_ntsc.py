@@ -37,3 +37,12 @@ def test_tolerates_a_lost_sync_pulse():
     damaged = ntsc.find_fields(codes)
     assert damaged[0].missing == 1
     assert np.abs(damaged[0].edges - fields[0].edges).max() < 1
+
+
+def test_finds_syncs_when_a_frequency_offset_lowers_blanking():
+    codes = synth.frames(2, ramp).astype(np.int16)
+    # Measured on a live capture: sync near 1, blanking near 11.
+    shifted = np.clip(np.rint(codes * 0.55) + 1, 0, 63).astype(np.uint8)
+    fields = ntsc.find_fields(shifted)
+    assert [f.parity for f in fields] == [0, 1, 0, 1]
+    assert all(f.missing == 0 for f in fields)

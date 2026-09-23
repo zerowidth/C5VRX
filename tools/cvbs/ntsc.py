@@ -9,7 +9,6 @@ LINE = RATE / (4.5e6 / 286)  # 1271.1 samples
 SYNC_CODE = 0
 BLANK_CODE = 20
 WHITE_CODE = 62
-SYNC_THRESHOLD = 10
 
 ACTIVE_LINES = 240
 # Lines 21 and 284 are each field's first full picture line, both 17 lines after the first broad pulse.
@@ -36,9 +35,19 @@ class Pulses:
     width: np.ndarray
 
 
+def sync_threshold(smooth):
+    """Halfway between sync tip and blanking; a VTX frequency offset shifts both."""
+    tip = np.percentile(smooth, 1)
+    counts, edges = np.histogram(smooth, bins=np.arange(tip + 3, tip + 40, 0.5))
+    blank = edges[np.argmax(counts)] + 0.25
+    return (tip + blank) / 2
+
+
 def find_pulses(codes):
-    smooth = np.convolve(codes.astype(np.float32), np.ones(5) / 5, mode="same")
-    below = smooth < SYNC_THRESHOLD
+    # 1.5 MHz removes the color burst, which otherwise dips below threshold right after sync.
+    smooth = lowpass(codes.astype(np.float32), 1.5e6)
+    threshold = sync_threshold(smooth)
+    below = smooth < threshold
     change = np.diff(below.astype(np.int8))
     falls = np.flatnonzero(change == 1) + 1
     rises = np.flatnonzero(change == -1) + 1
@@ -46,9 +55,8 @@ def find_pulses(codes):
         return Pulses(np.array([]), np.array([]))
     rises = rises[rises > falls[0]]
     falls = falls[: len(rises)]
-    # Interpolate the threshold crossing between the last sample above and the first below.
     before, after = smooth[falls - 1], smooth[falls]
-    start = falls - 1 + (before - SYNC_THRESHOLD) / (before - after)
+    start = falls - 1 + (before - threshold) / (before - after)
     return Pulses(start, (rises - falls).astype(float))
 
 
@@ -106,12 +114,15 @@ def find_fields(codes):
 
         found = np.searchsorted(after, predicted)
         edges = predicted.copy()
+        missing = 0
         for i, (guess, index) in enumerate(zip(predicted, found)):
             near = after[max(index - 1, 0): index + 1]
             near = near[np.abs(near - guess) < us(0.5)]
             if len(near):
                 edges[i] = near[0]
-        fields.append(Field(vsync, parity, edges, int(np.sum(edges == predicted))))
+            else:
+                missing += 1
+        fields.append(Field(vsync, parity, edges, missing))
     return fields
 
 
