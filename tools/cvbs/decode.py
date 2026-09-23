@@ -21,6 +21,7 @@ def load(source):
         codes, grid = saleae.recover_codes(saleae.read_bus(source))
         print(f"symbols {grid.count}, C5 clock {grid.ppm:+.1f} ppm vs analyzer, "
               f"edge phase residual {grid.residual_ns:.2f} ns rms")
+        print("per-bit sampling offset (ns): " + " ".join(f"{ns:+.0f}" for ns in grid.offsets_ns))
         return codes
     return np.fromfile(source, np.uint8)
 

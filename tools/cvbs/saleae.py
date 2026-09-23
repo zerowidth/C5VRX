@@ -51,6 +51,7 @@ class Grid:
     period: float
     count: int
     residual_ns: float
+    offsets_ns: list = None
 
     @property
     def ppm(self):
@@ -101,14 +102,28 @@ def symbol_grid(bus, block=50e-6):
     return Grid(first_center, period, count, float(np.std(residual) / (2 * np.pi) * period * 1e9))
 
 
-def sample_bus(bus, times):
+def edge_lag(channel, grid):
+    """How far this channel's edges trail the symbol grid, as a sampling offset.
+
+    Pins switch at different speeds (GPIO11 lags the others by about 12 ns
+    on the Waveshare board), so one shared sampling point can land mid-edge.
+    """
+    edge = grid.first_center - grid.period / 2
+    angle = np.angle(np.mean(np.exp(2j * np.pi * (channel.transitions - edge) / grid.period)))
+    return angle / (2 * np.pi) * grid.period
+
+
+def sample_bus(bus, times, offsets=None):
+    offsets = offsets if offsets is not None else [0.0] * len(bus)
     codes = np.zeros(len(times), np.uint8)
-    for bit, channel in enumerate(bus):
-        flips = np.searchsorted(channel.transitions, times, side="right")
+    for bit, (channel, offset) in enumerate(zip(bus, offsets)):
+        flips = np.searchsorted(channel.transitions, times + offset, side="right")
         codes |= (((channel.initial_state + flips) & 1) << bit).astype(np.uint8)
     return codes
 
 
 def recover_codes(bus):
     grid = symbol_grid(bus)
-    return sample_bus(bus, grid.centers()), grid
+    grid.offsets_ns = [edge_lag(channel, grid) * 1e9 for channel in bus]
+    offsets = [ns * 1e-9 for ns in grid.offsets_ns]
+    return sample_bus(bus, grid.centers(), offsets), grid
