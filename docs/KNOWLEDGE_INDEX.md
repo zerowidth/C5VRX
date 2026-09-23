@@ -39,6 +39,7 @@ Modern C5VRX
 | Proven RF writer, SRAM visibility, MODEM_DIAG mapping, rates | [continuous-iq-findings.md](continuous-iq-findings.md) |
 | Realtime contracts and source abstraction | [realtime-iq-plan.md](realtime-iq-plan.md) |
 | Current image-quality path and proof gates | [image-quality.md](image-quality.md) |
+| Logic-analyzer capture of the DAC bus, host-side NTSC decode, Waveshare pin map | [saleae-capture-decoder.md](saleae-capture-decoder.md) |
 | Corrected issue #6 winding/static measurements | [issue-6-static-analysis.md](issue-6-static-analysis.md) |
 | Static root causes, digital filtering limits, analog capacitor de-emphasis | [static-reduction-and-filtering.md](static-reduction-and-filtering.md) |
 | Issue #11 20 MS/s digital CVBS stream measurement and timing proof | [issue-11-cvbs-analysis.md](issue-11-cvbs-analysis.md) |
