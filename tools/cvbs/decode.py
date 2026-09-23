@@ -34,7 +34,8 @@ def main():
     parser.add_argument("--mp4", help="write an H.264 video here (needs ffmpeg)")
     parser.add_argument("--weave", action="store_true", help="pair fields into frames instead of line-doubling each")
     parser.add_argument("--white", type=float, default=ntsc.WHITE_CODE, help="DAC code that maps to white")
-    parser.add_argument("--luma-cutoff", type=float, default=3e6, help="low-pass before sampling, in Hz, to hide chroma")
+    parser.add_argument("--gray", action="store_true", help="skip color decoding")
+    parser.add_argument("--saturation", type=float, default=1.0, help="scale decoded color")
     args = parser.parse_args()
 
     codes = load(args.source)
@@ -47,10 +48,18 @@ def main():
     print(f"{len(fields)} fields")
     if not fields:
         return
-    signal = ntsc.lowpass(codes.astype(np.float32), args.luma_cutoff)
+    signal = codes.astype(np.float32)
+    if args.gray:
+        luma = ntsc.lowpass(signal, 3e6)
+    else:
+        z, oscillator = ntsc.chroma_baseband(signal)
+        luma = ntsc.lowpass(ntsc.remove_chroma(signal, z, oscillator), 4.2e6)
     images = []
     for field in fields:
-        image, blank = ntsc.field_image(signal, field, args.white)
+        if args.gray:
+            image, blank = ntsc.field_image(luma, field, args.white)
+        else:
+            image, blank = ntsc.field_color(luma, z, field, args.white, args.saturation)
         images.append((field, image))
         print(f"  field at {field.vsync / ntsc.RATE * 1e3:8.3f} ms, parity {field.parity}, "
               f"blank {blank:5.1f}, {field.missing} missing syncs")
@@ -68,9 +77,9 @@ def main():
             Image.fromarray(frame).save(out / f"frame_{i:04d}.png")
     if args.mp4:
         rate = "30000/1001" if args.weave else "60000/1001"
-        height, width = frames[0].shape
+        height, width = frames[0].shape[:2]
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "gray",
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "gray" if args.gray else "rgb24",
              "-s", f"{width}x{height}", "-r", rate, "-i", "-",
              "-vf", "setsar=10/11", "-c:v", "libx264", "-pix_fmt", "yuv420p", args.mp4],
             input=b"".join(frame.tobytes() for frame in frames), check=True,

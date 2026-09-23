@@ -17,6 +17,9 @@ PIXELS = 720
 PIXEL_RATE = 13.5e6
 ACTIVE_START_US = 8.8
 BACK_PORCH_US = (5.6, 8.4)
+BURST_US = (5.6, 7.6)
+FSC = 315e6 / 88
+BURST_IRE = 20
 
 
 def us(value):
@@ -126,16 +129,59 @@ def find_fields(codes):
     return fields
 
 
-def field_image(signal, field, white=WHITE_CODE):
-    """Resample each line from its own sync edge, which corrects line-to-line timing jitter."""
+def chroma_baseband(signal, cutoff_hz=1.3e6):
+    """Mix the subcarrier to DC with a free-running oscillator: z = (V - jU) / 2."""
+    oscillator = np.exp(-2j * np.pi * FSC / RATE * np.arange(len(signal)))
+    mixed = signal * oscillator
+    z = lowpass(mixed.real, cutoff_hz, taps=63) + 1j * lowpass(mixed.imag, cutoff_hz, taps=63)
+    return z, oscillator
+
+
+def remove_chroma(signal, z, oscillator):
+    return signal - 2 * np.real(z * np.conj(oscillator))
+
+
+def _rows(signal, field):
+    x = us(ACTIVE_START_US) + np.arange(PIXELS) * RATE / PIXEL_RATE
+    return np.interp(field.edges[:, None] + x[None, :], np.arange(len(signal)), signal)
+
+
+def _blank(signal, field):
     porch = np.concatenate([
         signal[int(edge + us(BACK_PORCH_US[0])): int(edge + us(BACK_PORCH_US[1]))]
         for edge in field.edges
     ])
-    blank = float(np.median(porch))
-    x = us(ACTIVE_START_US) + np.arange(PIXELS) * RATE / PIXEL_RATE
-    rows = np.interp(field.edges[:, None] + x[None, :], np.arange(len(signal)), signal)
+    return float(np.median(porch))
+
+
+def field_image(signal, field, white=WHITE_CODE):
+    """Resample each line from its own sync edge, which corrects line-to-line timing jitter."""
+    blank = _blank(signal, field)
+    rows = _rows(signal, field)
     return np.clip((rows - blank) / (white - BLANK_CODE) * 255, 0, 255).astype(np.uint8), blank
+
+
+def field_color(luma, z, field, white=WHITE_CODE, saturation=1.0):
+    """Decode one field to RGB, using each line's color burst as the hue and saturation reference."""
+    blank = _blank(luma, field)
+    y = (_rows(luma, field) - blank) / (white - BLANK_CODE) * 100
+
+    burst = np.array([
+        z[int(edge + us(BURST_US[0])): int(edge + us(BURST_US[1]))].mean() for edge in field.edges
+    ])
+    # The subcarrier runs continuously, so neighboring lines' bursts agree in the oscillator's frame.
+    burst = np.convolve(burst, np.ones(5) / 5, mode="same")
+    power = np.maximum(np.abs(burst) ** 2, 1e-9)
+    chroma = _rows(z.real, field) + 1j * _rows(z.imag, field)
+    # Rotate the burst onto -U and scale it to 20 IRE: U + jV in IRE.
+    uv = -BURST_IRE * saturation * chroma * (np.conj(burst) / power)[:, None]
+    u, v = uv.real, uv.imag
+
+    r = y + v / 0.877
+    b = y + u / 0.492
+    g = (y - 0.299 * r - 0.114 * b) / 0.587
+    rgb = np.stack([r, g, b], axis=-1) * 2.55
+    return np.clip(rgb, 0, 255).astype(np.uint8), blank
 
 
 def bob(image, parity):
@@ -143,7 +189,7 @@ def bob(image, parity):
     rows = image.astype(np.float32)
     below = np.vstack([rows[1:], rows[-1:]])
     above = np.vstack([rows[:1], rows[:-1]])
-    frame = np.empty((2 * len(rows), rows.shape[1]), np.float32)
+    frame = np.empty((2 * len(rows),) + rows.shape[1:], np.float32)
     if parity == 0:
         frame[0::2], frame[1::2] = rows, (rows + below) / 2
     else:
@@ -152,6 +198,6 @@ def bob(image, parity):
 
 
 def weave(first, second):
-    frame = np.empty((2 * len(first), first.shape[1]), np.uint8)
+    frame = np.empty((2 * len(first),) + first.shape[1:], np.uint8)
     frame[0::2], frame[1::2] = first, second
     return frame
