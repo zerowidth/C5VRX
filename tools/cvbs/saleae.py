@@ -41,7 +41,7 @@ def write_channel(path, channel):
 
 
 def read_bus(directory, bits=DAC_BITS):
-    """Channel N of the analyzer must be DAC bit N (GPIO 23, 24, 11, 12, 8, 9)."""
+    """Channel N of the analyzer must be DAC bit N (GPIO 6, 8, 9, 10, 12, 11)."""
     return [read_channel(Path(directory) / f"digital_{bit}.bin") for bit in range(bits)]
 
 
