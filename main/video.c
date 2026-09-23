@@ -4864,6 +4864,8 @@ esp_err_t video_start(void)
 
     settings_load();
     apply_rx_profile(s_rx_profile);
+    /* Bench testing: ignore the saved channel and start on R3. */
+    (void)rf_set_channel(FPV_BAND_R * 8u + 2u);
 
     /* Zero the ring before starting. Flush to DMA-visible SRAM. */
     memset(s_raw_ring, 0, sizeof(s_raw_ring));
