@@ -33,7 +33,7 @@ def frames(count, picture):
             if h % 2 or width != HSYNC:
                 continue
             line = h // 2 + 1
-            field, first = (0, 21) if line <= 263 else (1, 283)
+            field, first = (0, 21) if line <= 263 else (1, 284)
             row = line - first
             if 0 <= row < ntsc.ACTIVE_LINES:
                 level = picture(frame, field, row)

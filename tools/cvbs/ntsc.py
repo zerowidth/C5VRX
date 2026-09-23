@@ -12,8 +12,8 @@ WHITE_CODE = 62
 SYNC_THRESHOLD = 10
 
 ACTIVE_LINES = 240
-# Field-local line 21 is the first full picture line; slots count lines from the first broad pulse.
-FIRST_SLOT = {0: 17, 1: 16}
+# Lines 21 and 284 are each field's first full picture line, both 17 lines after the first broad pulse.
+FIRST_SLOT = 17
 PIXELS = 720
 PIXEL_RATE = 13.5e6
 ACTIVE_START_US = 8.8
@@ -86,7 +86,7 @@ def find_fields(codes):
             groups.append([start])
     vsyncs = [group[0] for group in groups if len(group) >= 3]
 
-    last_slot = max(FIRST_SLOT.values()) + ACTIVE_LINES
+    last_slot = FIRST_SLOT + ACTIVE_LINES
     fields = []
     for vsync in vsyncs:
         if vsync + (last_slot + 1) * period > len(codes):
@@ -98,7 +98,7 @@ def find_fields(codes):
         parity = int(np.median(np.abs(offsets - 0.5)) < 0.25)
         base = vsync + 0.5 * period * parity
 
-        slots = FIRST_SLOT[parity] + np.arange(ACTIVE_LINES)
+        slots = FIRST_SLOT + np.arange(ACTIVE_LINES)
         slot_of = np.rint((after - base) / period)
         on_grid = np.abs(after - base - slot_of * period) < us(1)
         fit = np.polyfit(slot_of[on_grid], after[on_grid], 1)
