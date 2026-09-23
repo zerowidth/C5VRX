@@ -58,13 +58,34 @@ def test_decodes_hue_and_saturation_against_the_burst():
     rng = np.random.default_rng(4)
     noisy = np.clip(codes + rng.integers(-1, 2, len(codes)), 0, 63).astype(np.float32)
 
-    z, oscillator = ntsc.chroma_baseband(noisy)
-    luma = ntsc.lowpass(ntsc.remove_chroma(noisy, z, oscillator), 4.2e6)
+    z = ntsc.chroma_baseband(noisy)
+    wide = ntsc.lowpass(noisy, 4.2e6)
     for field in ntsc.find_fields(noisy.astype(np.uint8)):
-        rgb, _ = ntsc.field_color(luma, z, field)
+        rgb, _ = ntsc.field_color(wide, z, field)
         r, g, b = rgb[20:220, 100:620].reshape(-1, 3).mean(axis=0)
         y = 50
         expected = (y + orange[1] / 0.877, None, y + orange[0] / 0.492)
         assert abs(r / 2.55 - expected[0]) < 5
         assert abs(b / 2.55 - expected[2]) < 5
         assert r > g > b
+
+
+def test_comb_keeps_fine_luma_detail_out_of_the_color():
+    # Vertical stripes near the subcarrier frequency, with no color at all.
+    x = np.arange(ntsc.PIXELS) / ntsc.PIXEL_RATE
+    stripes = 0.5 + 0.3 * np.sin(2 * np.pi * 3.4e6 * x)
+    def picture(frame, field, row):
+        return stripes
+    def no_color(frame, field, row):
+        return np.zeros(ntsc.PIXELS), np.zeros(ntsc.PIXELS)
+    codes = synth.frames(1, picture, no_color).astype(np.float32)
+    z = ntsc.chroma_baseband(codes)
+    wide = ntsc.lowpass(codes, 4.2e6)
+    field = ntsc.find_fields(codes.astype(np.uint8))[0]
+
+    def false_color(comb):
+        rgb, _ = ntsc.field_color(wide, z, field, comb=comb)
+        rgb = rgb[20:220, 100:620].astype(float)
+        return np.abs(rgb - rgb.mean(axis=-1, keepdims=True)).mean()
+
+    assert false_color(comb=True) < 0.2 * false_color(comb=False)

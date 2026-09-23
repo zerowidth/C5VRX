@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--white", type=float, default=ntsc.WHITE_CODE, help="DAC code that maps to white")
     parser.add_argument("--gray", action="store_true", help="skip color decoding")
     parser.add_argument("--saturation", type=float, default=1.0, help="scale decoded color")
+    parser.add_argument("--no-comb", action="store_true", help="separate chroma within each line only")
     args = parser.parse_args()
 
     codes = load(args.source)
@@ -52,14 +53,14 @@ def main():
     if args.gray:
         luma = ntsc.lowpass(signal, 3e6)
     else:
-        z, oscillator = ntsc.chroma_baseband(signal)
-        luma = ntsc.lowpass(ntsc.remove_chroma(signal, z, oscillator), 4.2e6)
+        z = ntsc.chroma_baseband(signal)
+        wide = ntsc.lowpass(signal, 4.2e6)
     images = []
     for field in fields:
         if args.gray:
             image, blank = ntsc.field_image(luma, field, args.white)
         else:
-            image, blank = ntsc.field_color(luma, z, field, args.white, args.saturation)
+            image, blank = ntsc.field_color(wide, z, field, args.white, args.saturation, not args.no_comb)
         images.append((field, image))
         print(f"  field at {field.vsync / ntsc.RATE * 1e3:8.3f} ms, parity {field.parity}, "
               f"blank {blank:5.1f}, {field.missing} missing syncs")

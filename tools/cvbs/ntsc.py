@@ -131,14 +131,8 @@ def find_fields(codes):
 
 def chroma_baseband(signal, cutoff_hz=1.3e6):
     """Mix the subcarrier to DC with a free-running oscillator: z = (V - jU) / 2."""
-    oscillator = np.exp(-2j * np.pi * FSC / RATE * np.arange(len(signal)))
-    mixed = signal * oscillator
-    z = lowpass(mixed.real, cutoff_hz, taps=63) + 1j * lowpass(mixed.imag, cutoff_hz, taps=63)
-    return z, oscillator
-
-
-def remove_chroma(signal, z, oscillator):
-    return signal - 2 * np.real(z * np.conj(oscillator))
+    mixed = signal * np.exp(-2j * np.pi * FSC / RATE * np.arange(len(signal)))
+    return lowpass(mixed.real, cutoff_hz, taps=63) + 1j * lowpass(mixed.imag, cutoff_hz, taps=63)
 
 
 def _rows(signal, field):
@@ -161,10 +155,24 @@ def field_image(signal, field, white=WHITE_CODE):
     return np.clip((rows - blank) / (white - BLANK_CODE) * 255, 0, 255).astype(np.uint8), blank
 
 
-def field_color(luma, z, field, white=WHITE_CODE, saturation=1.0):
-    """Decode one field to RGB, using each line's color burst as the hue and saturation reference."""
-    blank = _blank(luma, field)
-    y = (_rows(luma, field) - blank) / (white - BLANK_CODE) * 100
+def field_color(wide, z, field, white=WHITE_CODE, saturation=1.0, comb=True):
+    """Decode one field to RGB from 4.2 MHz composite and its chroma baseband.
+
+    Each line's color burst is the hue and saturation reference. With `comb`,
+    chroma is averaged over three lines: real chroma keeps its phase from line
+    to line in the free-running oscillator's frame, while luma detail near the
+    subcarrier flips sign every line and cancels.
+    """
+    blank = _blank(wide, field)
+    chroma = _rows(z.real, field) + 1j * _rows(z.imag, field)
+    if comb:
+        above = np.vstack([chroma[:1], chroma[:-1]])
+        below = np.vstack([chroma[1:], chroma[-1:]])
+        chroma = (above + 2 * chroma + below) / 4
+    x = us(ACTIVE_START_US) + np.arange(PIXELS) * RATE / PIXEL_RATE
+    oscillator = np.exp(-2j * np.pi * FSC / RATE * (field.edges[:, None] + x[None, :]))
+    luma = _rows(wide, field) - 2 * np.real(chroma * np.conj(oscillator))
+    y = (luma - blank) / (white - BLANK_CODE) * 100
 
     burst = np.array([
         z[int(edge + us(BURST_US[0])): int(edge + us(BURST_US[1]))].mean() for edge in field.edges
@@ -172,7 +180,6 @@ def field_color(luma, z, field, white=WHITE_CODE, saturation=1.0):
     # The subcarrier runs continuously, so neighboring lines' bursts agree in the oscillator's frame.
     burst = np.convolve(burst, np.ones(5) / 5, mode="same")
     power = np.maximum(np.abs(burst) ** 2, 1e-9)
-    chroma = _rows(z.real, field) + 1j * _rows(z.imag, field)
     # Rotate the burst onto -U and scale it to 20 IRE: U + jV in IRE.
     uv = -BURST_IRE * saturation * chroma * (np.conj(burst) / power)[:, None]
     u, v = uv.real, uv.imag
