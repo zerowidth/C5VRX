@@ -153,7 +153,7 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 - Use 28 AWG, or two 30 AWG in parallel, for the 5V wire.
 - The C5-Zero has one GND pad. Its second ground point is the USB-C shell, which the schematic ties to GND; that gives each bundle its own return, with the black wire running alongside the white clock on the Q side. More grounds between the P4's GND pins and the C5's GND pad help if the link test shows errors. A ground connected at one end only carries no return current and does nothing useful.
 - Keep each bundle together with its ground alongside. What matters is the loop area between each signal and its return.
-- Firmware sets low drive strength on the C5 data and clock pins to slow the edges. If the link still shows errors, add 22-33 Ω series resistors at the C5 end.
+- Firmware sets low drive strength on the C5 data and clock pins to slow the edges. Slow edges also shrink the roughly 12.5 ns window in which each sample is valid (see [P4 firmware](#p4)), so pick the setting from the edge check rather than defaulting to the lowest. If the link still shows errors, add 22-33 Ω series resistors at the C5 end.
 
 ### USB and panel connector
 
@@ -207,7 +207,7 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 
 ### C5
 
-- Route the top 7 live bits of each of Q and I from MODEM_DIAG to the 14 data pads, release GPIO 13 and 14 from USB, and output a 40 MHz sample clock.
+- Route the top 7 live bits of each of Q and I from MODEM_DIAG to the 14 data pads, release GPIO 13 and 14 from USB, and output a 40 MHz sample clock divided from the same PLL as the modem, so the rate can't drift. The MODEM_DIAG bus itself changes at about 80 MS/s and the 40 MHz clock keeps every second sample, as the C5's own PARLIO RX does today.
 - Set low drive strength on the data and clock pads.
 - Add a text command set on the USB console first, then the same parser on the UART to the P4: band, channel, frequency, status.
 - Status includes the existing `strength` score, wideband RSSI (`phy_get_rssi`), noise floor, and current gain, all already in `C5VRX_LAB_ROW`.
@@ -216,7 +216,8 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 
 ### P4
 
-- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode, choosing the clock edge that samples mid-bit. PARLIO data lines 1-7 carry I1-I7 and lines 9-15 carry Q1-Q7, so each 16-bit word holds I in the low byte and Q in the high byte, MSB-aligned. Tie lines 0 and 8 to the GPIO matrix's constant-1 input: each sample then reads 2v+1, the midpoint of the dropped bit, which removes the half-step truncation offset and keeps I and Q symmetric around zero.
+- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode, clocked by the C5's clock on pin 24, so the P4 takes exactly one sample per C5 clock with no drift, slips or repeats. PARLIO data lines 1-7 carry I1-I7 and lines 9-15 carry Q1-Q7, so each 16-bit word holds I in the low byte and Q in the high byte, MSB-aligned. Tie lines 0 and 8 to the GPIO matrix's constant-1 input: each sample then reads 2v+1, the midpoint of the dropped bit, which removes the half-step truncation offset and keeps I and Q symmetric around zero.
+- Because the bus changes at 80 MS/s, each kept sample is valid for only about 12.5 ns, and the P4's sampling edge must land inside it after both GPIO matrices and the wires. At boot, capture a block on each clock edge and keep the one with smaller sample-to-sample jumps, since an edge that lands on a transition produces bit errors. The phase between the modem bus and the C5's clock divider may differ from boot to boot, so the check runs every boot until hardware shows it's fixed.
 - At boot, run the walking-ones self-test against the planned pin map. On a mismatch, name the wire on the console, OLED and `status` (for example, "Q5: C5 3 seen on P4 31, expected 30"), then remap in firmware so the build still runs.
 - Demodulate FM from I/Q with a 16 KB phase table: index it with the 14 I/Q bits to get an 8-bit phase, then subtract the previous sample's phase, where uint8 wraparound handles the 360° wrap. That is a shift-or, a load and a subtract per sample, within the roughly 20 cycles per sample per core at 400 MHz. The table should stay in L1 data cache. The fixed LSB lines make the raw 16-bit PARLIO word usable as an index with no shift-or, but only a quarter of that 64K-entry table is reachable and it touches twice the cache, so the compact 14-bit index is the default. If 8-bit phase proves limiting, 16-bit entries (32 KB) keep the full precision of the 7-bit input.
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
@@ -252,12 +253,13 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 - Does the camera capture 60 images per second, or 30 split across fields? Capture a moving scene and compare the two fields of one frame.
 - Can the P4 demodulate 7+7-bit I/Q at 40 MS/s with time left for decoding and encoding?
 - What is the maximum PARLIO RX external clock on the P4 through the GPIO matrix, and which clock edge gives margin?
+- Each kept sample is valid for about 12.5 ns. How much of that window is left after the C5 and P4 GPIO matrices, wire skew and the low drive strength, and is the modem-to-divider phase the same on every boot? If the margin is thin, can the C5 output an 80 MHz clock so the P4 can choose which half-cycle to keep?
 - Are C5 GPIO 11/12 the ROM bootloader's UART0 pins?
 
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
 2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video.
-3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, and compare samples with a host-side decode offline.
+3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline.
 4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside.
 5. Optional: microSD recording.
