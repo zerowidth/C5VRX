@@ -176,7 +176,7 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 
 ### P4
 
-- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode, choosing the clock edge that samples mid-bit. PARLIO data lines 1-7 carry I1-I7 and lines 9-15 carry Q1-Q7, with lines 0 and 8 unused, so each 16-bit word holds I in the low byte and Q in the high byte, MSB-aligned.
+- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode, choosing the clock edge that samples mid-bit. PARLIO data lines 1-7 carry I1-I7 and lines 9-15 carry Q1-Q7, so each 16-bit word holds I in the low byte and Q in the high byte, MSB-aligned. Tie lines 0 and 8 to the GPIO matrix's constant-1 input: each sample then reads 2v+1, the midpoint of the dropped bit, which removes the half-step truncation offset and keeps I and Q symmetric around zero.
 - At boot, run the walking-ones self-test against the planned pin map. On a mismatch, name the wire on the console, OLED and `status` (for example, "Q5: C5 3 seen on P4 31, expected 30"), then remap in firmware so the build still runs.
 - Demodulate FM from I/Q. With 7+7 bits, a lookup table is too large, so use a cross-product discriminator on the CPU (SIMD). That leaves roughly 20 cycles per sample per core at 400 MHz, which is tight.
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
