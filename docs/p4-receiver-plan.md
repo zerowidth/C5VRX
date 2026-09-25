@@ -15,7 +15,7 @@ flowchart LR
         c5 -- "14 I/Q lanes + 40 MHz clock" --> p4["ESP32-P4-Pico<br/>demod, NTSC decode, JPEG"]
         p4 -- "UART: tuning, status" --> c5
         p4 -- "EN, BOOT" --> c5
-        oled["SPI OLED"] --- p4
+        oled["I2C OLED"] --- p4
         buttons["Buttons"] --- p4
         sd["microSD"] --- p4
     end
@@ -25,7 +25,7 @@ flowchart LR
 ## Roles
 
 - The C5 tunes the 5.8 GHz front end and drives its MODEM_DIAG I/Q bits onto pads, with a sample clock. It answers tuning and status commands on a UART. Its DAC and PARLIO loopback are not used in this build.
-- The P4 samples the I/Q bus with PARLIO RX, demodulates FM, decodes NTSC fields, encodes JPEG, and serves UVC. It owns all settings (band, channel) and pushes them to the C5 at boot. It runs the OLED, buttons, and optional SD recording.
+- The P4 samples the I/Q bus with PARLIO RX, demodulates FM, decodes NTSC fields, encodes JPEG, and serves UVC. It owns all settings (band, channel) and pushes them to the C5 at boot. It runs the OLED, buttons, and optional SD recording (see [Controls and display](#controls-and-display)).
 - The computer receives a webcam stream and a serial port. A browser page (Web Serial) controls the receiver and shows signal strength.
 
 ## Power
@@ -94,9 +94,9 @@ All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs
 | UART RX from C5 TX (GPIO11) | 32 | |
 | UART TX to C5 RX (GPIO12) | 27 | |
 | C5 EN | 26 | Open-drain |
-| OLED SPI: SCLK, MOSI, CS, DC, RST | 15, 16, 17, 18, 19 | |
-| Buttons | 5, 6, 7, 14 | 7 is the codec's I2C SDA with a 2.2k pull-up, which suits an active-low button |
-| Spare | 4, 20, 21, 22, 23, 54, and back pad 31 | |
+| OLED I2C: SDA, SCL | 15, 16 | 0.91" 128×32 SSD1306 modules are I2C only |
+| Buttons: BAND, CH−, CH+ | 5, 6, 7 | Active-low to GND. 7 is the codec's I2C SDA with a 2.2k pull-up, which suits an active-low button |
+| Spare | 4, 14, 17, 18, 19, 20, 21, 22, 23, 54, and back pad 31 | 14 is kept for a fourth button |
 
 Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-P4-Pico/ESP32-P4-Pico-datasheet.pdf):
 
@@ -113,7 +113,7 @@ Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-
 - Keep the last 2-3 cm around the antenna free of wires, screws and metal.
 - The P4's switching regulator sits at its USB-C end, which is the rear, away from the antenna.
 - If the external dipole is used, mount an SMA bulkhead at the tip with a short U.FL pigtail.
-- The OLED and buttons can go anywhere along the stick.
+- The OLED and buttons sit in a row along the stick, screen first: `[OLED] o o o`. See [Controls and display](#controls-and-display).
 - Hold the boards with printed standoffs and clips or double-sided tape, and anchor the wire bundles so flexing doesn't land on solder joints.
 
 ### Wire list
@@ -163,6 +163,46 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 - A USB-C receptacle needs 5.1 kΩ from each CC pin to GND, or a USB-C to USB-C cable will not supply power.
 - The P4's own USB-C stays reachable at the rear for flashing, so the rear has two ports: video and power, and programming.
 
+## Controls and display
+
+The serial port is the main control path, but the receiver also works on its own: it boots on its last channel, and three buttons and a small OLED cover band, channel and finding a signal. The layout borrows the direct buttons of an RX5808-style receiver rather than the menu-driven up/down/select of the AKK Diversity RX, and remembering the last channel replaces the AKK's saved channels.
+
+### Hardware
+
+- The display is a 0.91" 128×32 SSD1306 on I2C at 400 kHz. A full frame is 512 bytes, about 13 ms. The module PCB is about 38 × 12 mm with an active area of about 22 × 5.6 mm, so it fits a 25 mm wide enclosure.
+- Three 6 mm tactile switches sit in a row after the screen, left to right BAND, CH−, CH+. GPIO 14 is reserved for a fourth button.
+- Buttons are active-low with internal pull-ups, debounced in firmware.
+
+### Screen
+
+- The left third shows band and channel ("R3") in 28 px glyphs (5×7 scaled by 4), about 5 mm tall.
+- The top row on the right shows the frequency, `VID` or `NO VID` from the P4's sync detector, and the 0–99 strength score.
+- The rest of the right side is a scrolling strength graph of the last 8 s, one column per 100 ms, with a dotted line at the level where sync locks.
+- Short messages (`LOCKED`, `STOP`, `NO VID`) replace the top row for about a second.
+- During seek, the big channel follows each step and the top row shows `SEEK>` or `<SEEK`.
+- The band scanner replaces the main screen with a 48-bar spectrum of every channel in frequency order, a dotted cursor column, and the cursor's channel, frequency and strength on the top row.
+- A boot self-test failure (for example "Q5 on P4 31") shows on the screen until a button is pressed.
+
+### Buttons
+
+| Button | Tap | Hold 0.6 s |
+|---|---|---|
+| BAND | Next band (A, B, E, F, R, L), keeping the channel number | Open the band scanner |
+| CH− | Previous channel in the band, wrapping | Seek down through all 48 channels to the next one with video |
+| CH+ | Next channel in the band, wrapping | Seek up through all 48 channels to the next one with video |
+
+In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the cursor, and a BAND hold leaves without tuning. Any tap stops a seek on the current channel. A seek that finds nothing in a full lap returns to where it started and shows `NO VID`.
+
+### Behavior
+
+- Every press retunes at once, with no confirm step, so the video follows as channels are stepped through.
+- The band and channel are written to NVS 2 s after the last change, and only when they differ from the stored value. Stepping through channels costs no flash writes, and the next boot restores the last channel.
+- Buttons and serial commands go through the same handler. A button change emits an `event tune` line with `src=button`, and a serial change updates the screen.
+- The host can lock the buttons with `lock 1`. A locked press shows `LOCKED` and does nothing. Holding CH− and CH+ together for 3 s overrides the lock locally.
+- Seek and scan hold each frequency for about 50–80 ms to measure strength and sync, so a full sweep takes about 3 s.
+- To limit burn-in on the static channel glyphs, the screen drops contrast after 60 s without a press and shifts by a pixel every few minutes. A press while dimmed acts normally as well as restoring contrast.
+- A stored setting flips the screen 180° for mounting the stick either way round.
+
 ## Firmware
 
 ### C5
@@ -183,7 +223,7 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 - Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, Espressif's `usb_device_uvc`).
 - Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
 - Offer 720×480 at 60 fps (one frame per field, deinterlaced) and at 30 fps (fields woven). 60 is the default for FPV. 720×480 at 60 fps is about 20 megapixels per second, within the JPEG encoder's limit.
-- Drive the OLED (128×64 SSD1306 or SH1106: band, channel, frequency, strength bar) and the buttons (band and channel).
+- Drive the OLED and buttons as described in [Controls and display](#controls-and-display).
 - Control the C5's EN and BOOT pins for reset and reflashing it over UART0 (esp-serial-flasher).
 - Optional standalone recording of MJPEG to microSD (roughly 3-4 MB/s).
 
@@ -195,8 +235,11 @@ Plain text lines over the USB serial port, so they can be typed by hand, parsed 
 > band R
 > ch 3            (or: freq 5732)
 < ok band=R ch=3 freq=5732
+< event tune band=F ch=4 freq=5800 src=button   (also src=seek, scan, serial)
+> lock 1          (buttons ignored until: lock 0)
+< ok lock=1
 > status
-< status band=R ch=3 freq=5732 strength=87 rssi=-48 gain=34 sync=1 fields=59.9
+< status band=R ch=3 freq=5732 strength=87 rssi=-48 gain=34 sync=1 lock=0 fields=59.9
 < event status ...          (pushed a few times a second when subscribed)
 ```
 
