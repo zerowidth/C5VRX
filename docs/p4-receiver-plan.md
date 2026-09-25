@@ -54,9 +54,9 @@ Physical order, both boards viewed from the component side with the USB-C at the
 
 ## Layout
 
-The boards sit in line: antenna at the front, then the C5 with its USB-C end facing back, then the P4 with its JST end facing the C5, and the P4's USB-C at the rear. The gap between the boards is about 8 mm, enough for the JST plug and its lead to turn back under the P4.
+Both boards sit face-up in line: antenna at the front, then the C5 with its USB-C end facing back, then the P4 with its JST end facing the C5, and the P4's USB-C at the rear. The gap between the boards is about 8 mm, enough for the JST plug and its lead to turn back under the P4.
 
-With the C5 turned to face the P4, its left edge (5V, GND, 0-5 and the back pads) lines up with the P4's right header, and its right edge (11-14, 6-10) lines up with the P4's left header. Every wire stays on its own side, and the fast signals use the P4 pins within about 8 mm of the JST end.
+Both USB-C ends point the same way, so the C5's left edge (5V, GND, 0-5 and its back pads) lines up with the P4's left header and back pads 49-52, and its right edge (11-14, 6-10) lines up with the P4's right header and back pads 28-31. Every wire stays on its own side, back-pad wires on both boards run underneath together, and the fast signals use the P4 pins within about 20 mm of the JST end.
 
 ## C5-Zero pin plan
 
@@ -86,16 +86,16 @@ All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs
 
 | Function | P4 pins | Notes |
 |---|---|---|
-| Q data (7) | Q7 on 29, Q6 on 48, Q5 on 30, Q4 on 31, Q3 on 33, Q2 on 46, Q1 on 28 | Right side. 28-31 are back pads |
-| I data (7) | I7 on 52, I6 on 51, I5 on 25, I4 on 50, I3 on 49, I2 on 2, I1 on 24 | Left side. 49-52 are back pads. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the CH343 on the USB-C instead, and JTAG debugging over these pins isn't available |
-| Sample clock | 47 | Between 48 and the row-18 GND |
-| C5 BOOT | 32 | Open-drain |
-| UART RX from C5 TX (GPIO11) | 3 | |
-| UART TX to C5 RX (GPIO12) | 4 | |
-| C5 EN | 5 | Open-drain |
+| Q data (7) | Q7 on 25, Q6 on 50, Q5 on 51, Q4 on 52, Q3 on 3, Q2 on 2, Q1 on 49 | Left side. 49-52 are back pads |
+| Sample clock | 24 | Next to the left row-18 GND. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the CH343 on the USB-C instead, and JTAG debugging over these pins isn't available |
+| C5 BOOT | 8 | Open-drain. 8 is the codec's I2C SCL with a 2.2k pull-up, which only strengthens BOOT's pull-up; the codec is unused |
+| I data (7) | I7 on 30, I6 on 29, I5 on 48, I4 on 28, I3 on 47, I2 on 33, I1 on 46 | Right side. 28-30 are back pads |
+| UART RX from C5 TX (GPIO11) | 32 | |
+| UART TX to C5 RX (GPIO12) | 27 | |
+| C5 EN | 26 | Open-drain |
 | OLED SPI: SCLK, MOSI, CS, DC, RST | 15, 16, 17, 18, 19 | |
-| Buttons | 6, 7, 8, 14 | 7/8 are I2C to the codec with 2.2k pull-ups, which suits active-low buttons |
-| Spare | 20, 21, 22, 23, 26, 27, 54 | |
+| Buttons | 5, 6, 7, 14 | 7 is the codec's I2C SDA with a 2.2k pull-up, which suits an active-low button |
+| Spare | 4, 20, 21, 22, 23, 54, and back pad 31 | |
 
 Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-P4-Pico/ESP32-P4-Pico-datasheet.pdf):
 
@@ -117,33 +117,33 @@ Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-
 
 ### Wire list
 
-Lengths are estimates for the 8 mm gap, including about 6 mm of slack for dressing and strain relief. Cut each to fit; every wire is 4.5 cm or less. Wires to the P4's back pads run under the P4; the C5's castellated edge pads take a wire from either face.
+Lengths are estimates for the 8 mm gap, including about 6 mm of slack for dressing and strain relief. Cut each to fit; every wire is 4.5 cm or less. Wires to the back pads run underneath both boards. The C5's castellated edge pads and the P4's header holes take a wire from either face, so a wire can run from a back pad on one board to an edge pad on the other.
 
-Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I data, and yellow is control. Wires within a color look alike, so solder each one pin-to-pin from the list and check it off; the boot self-test catches mistakes. The four yellow wires are distinguishable by position: BOOT is the only yellow on the Q side, and on the I side, EN goes to the button pad while TX and RX go to adjacent header pads. The P4 can swap its UART pins in firmware if TX and RX are crossed.
+Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I data, and yellow is control. Wires within a color look alike, so solder each one pin-to-pin from the list and check it off; the boot self-test catches mistakes. The four yellow wires are distinguishable by position: BOOT is the only yellow on the Q side, and on the I side, EN goes to the RESET button pad while TX and RX go to adjacent header pads. The P4 can swap its UART pins in firmware if TX and RX are crossed.
 
 | Signal | C5 pin | P4 pin | Color | Length |
 |---|---|---|---|---|
-| Clock | 0 | 47 | White | 3 cm |
-| GND (clock return) | GND | GND, right row 18 | Black | 3 cm |
-| Q7 | 1 | 29 (back) | Green | 3.5 cm |
-| Q6 | 2 | 48 | Green | 3.5 cm |
-| Q5 | 3 | 30 (back) | Green | 3.5 cm |
-| Q4 | 4 | 31 (back) | Green | 4 cm |
-| Q3 | 23 (back) | 33 | Green | 4 cm |
-| Q2 | 24 (back) | 46 | Green | 4 cm |
-| Q1 | 25 (back) | 28 (back) | Green | 3.5 cm |
-| BOOT | 28 (back) | 32 | Yellow | 4.5 cm |
-| I7 | 6 | 52 (back) | Blue | 4 cm |
-| I6 | 7 | 51 (back) | Blue | 4 cm |
-| I5 | 8 | 25 | Blue | 3.5 cm |
-| I4 | 9 | 50 (back) | Blue | 3.5 cm |
-| I3 | 10 | 49 (back) | Blue | 3.5 cm |
-| I2 | 13 | 2 | Blue | 4 cm |
-| I1 | 14 | 24 | Blue | 3 cm |
-| UART C5 TX to P4 RX | 11 | 3 | Yellow | 3.5 cm |
-| UART C5 RX from P4 TX | 12 | 4 | Yellow | 4.5 cm |
-| EN | RESET button pad | 5 | Yellow | 4.5 cm |
-| GND (I-side return) | USB-C shell | GND, left row 18 | Black | 3 cm |
+| Clock | 0 | 24 | White | 3 cm |
+| GND (clock return) | GND | GND, left row 18 | Black | 3 cm |
+| Q7 | 1 | 25 | Green | 3 cm |
+| Q6 | 2 | 50 (back) | Green | 3 cm |
+| Q5 | 3 | 51 (back) | Green | 3.5 cm |
+| Q4 | 4 | 52 (back) | Green | 3.5 cm |
+| Q3 | 23 (back) | 3 | Green | 4.5 cm |
+| Q2 | 24 (back) | 2 | Green | 4 cm |
+| Q1 | 25 (back) | 49 (back) | Green | 3 cm |
+| BOOT | 28 (back) | 8 | Yellow | 4.5 cm |
+| I7 | 6 | 30 (back) | Blue | 4 cm |
+| I6 | 7 | 29 (back) | Blue | 4 cm |
+| I5 | 8 | 48 | Blue | 3.5 cm |
+| I4 | 9 | 28 (back) | Blue | 3.5 cm |
+| I3 | 10 | 47 | Blue | 3.5 cm |
+| I2 | 13 | 33 | Blue | 3.5 cm |
+| I1 | 14 | 46 | Blue | 3.5 cm |
+| UART C5 TX to P4 RX | 11 | 32 | Yellow | 3.5 cm |
+| UART C5 RX from P4 TX | 12 | 27 | Yellow | 4 cm |
+| EN | RESET button pad | 26 | Yellow | 4 cm |
+| GND (I-side return) | USB-C shell | GND, right row 18 | Black | 3 cm |
 | 5V | 5V | JST lead branch | Red | 2-3 cm |
 | GND | GND | JST lead branch | Black | 2-3 cm |
 
