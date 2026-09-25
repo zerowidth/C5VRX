@@ -124,6 +124,7 @@ The enclosure is a long stick: antenna at the front, then the C5, then the P4, w
 - Demodulate FM from I/Q. With 6+6 bits, a lookup table is too large, so use a cross-product discriminator on the CPU (SIMD). That leaves roughly 20 cycles per sample per core at 400 MHz, which is tight.
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
 - Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, Espressif's `usb_device_uvc`).
+- Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
 - Offer 720×480 at 60 fps (one frame per field, deinterlaced) and at 30 fps (fields woven). 60 is the default for FPV. 720×480 at 60 fps is about 20 megapixels per second, within the JPEG encoder's limit.
 - Drive the OLED (128×64 SSD1306 or SH1106: band, channel, frequency, strength bar) and the buttons (band and channel).
 - Control the C5's EN and BOOT pins for reset and reflashing it over UART0 (esp-serial-flasher).
