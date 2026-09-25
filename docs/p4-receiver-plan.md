@@ -31,8 +31,9 @@ flowchart LR
 ## Power
 
 - The P4-Pico is powered through its high-speed USB connector (the bottom 4-pin MX1.25 JST), which feeds its VCC_5V rail directly. The top USB-C also powers it, through a power-path FET, so both can be plugged in at once.
-- The C5 takes 5V and GND from a branch of the JST lead, at the plug end. JST pin 1 is VCC_5V, the same net as the header's VSYS, but VSYS is at the far end of the board and the branch is only a couple of centimeters from the C5's 5V and GND pads. Do not use VBUS, which is the USB-C input before the power-path FET.
-- Do not power the C5 from its own USB while it is also fed from the JST lead, unless the C5-Zero schematic shows a diode on its VBUS.
+- The C5 takes 5V from the P4's VSYS pin (right header, row 2), which is the same VCC_5V net as JST pin 1. VSYS is at the far end of the P4, so this is one 7.5 cm wire, routed under the P4 alongside the USB lead. Neither board has a 5V pad near the JST, and splicing into the crimped JST lead is fragile. Do not use VBUS, which is the USB-C input before the power-path FET.
+- The C5's ground return is the clock-return wire from the P4's left row-18 GND to the C5's GND pad, plus the USB-C shell wire on the I side. At about 150 mA, 30 AWG over 3 cm drops under 2 mV, so no separate power ground is needed.
+- Do not power the C5 from its own USB while it is also fed from VSYS, unless the C5-Zero schematic shows a diode on its VBUS.
 - Budget: roughly 100-150 mA for the C5, 200-400 mA for the P4, and about 20 mA for the OLED. This fits the 500 mA of a USB 2.0 port.
 
 ## Board pinouts
@@ -64,7 +65,7 @@ Each data wire carries one fixed bit, so the build can be handed to someone else
 
 | Function | C5 pins | Notes |
 |---|---|---|
-| 5V, GND | 5V, GND (left, rows 1-2) | From the JST lead branch |
+| 5V, GND | 5V, GND (left, rows 1-2) | 5V from the P4's VSYS; GND is the clock-return wire |
 | UART to P4 | 11 (TX), 12 (RX) | UART0, so the ROM bootloader can be reached and the P4 can reflash the C5. TX has a 499 Ω series resistor on the board |
 | BOOT | 28 (back pad) | Driven by the P4, open-drain. The board's BOOT button is unreliable, so this is also the manual fallback: ground 28 while resetting |
 | Reset | EN, via the RESET button pad | Driven by the P4, open-drain. EN (CHIP_PU) is not on the edge pads; it has a 10k pull-up and 1 µF to GND, so reset release is slow |
@@ -117,14 +118,14 @@ Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-
 
 ### Wire list
 
-Lengths are estimates for the 8 mm gap, including about 6 mm of slack for dressing and strain relief. Cut each to fit; every wire is 4.5 cm or less. Wires to the back pads run underneath both boards. The C5's castellated edge pads and the P4's header holes take a wire from either face, so a wire can run from a back pad on one board to an edge pad on the other.
+Lengths are estimates for the 8 mm gap, including about 6 mm of slack for dressing and strain relief. Cut each to fit; every signal wire is 4.5 cm or less. Wires to the back pads run underneath both boards. The C5's castellated edge pads and the P4's header holes take a wire from either face, so a wire can run from a back pad on one board to an edge pad on the other.
 
 Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I data, and yellow is control. Wires within a color look alike, so solder each one pin-to-pin from the list and check it off; the boot self-test catches mistakes. The four yellow wires are distinguishable by position: BOOT is the only yellow on the Q side, and on the I side, EN goes to the RESET button pad while TX and RX go to adjacent header pads. The P4 can swap its UART pins in firmware if TX and RX are crossed.
 
 | Signal | C5 pin | P4 pin | Color | Length |
 |---|---|---|---|---|
 | Clock | 0 | 24 | White | 3 cm |
-| GND (clock return) | GND | GND, left row 18 | Black | 3 cm |
+| GND (clock return and power) | GND | GND, left row 18 | Black | 3 cm |
 | Q7 | 1 | 25 | Green | 3 cm |
 | Q6 | 2 | 50 (back) | Green | 3 cm |
 | Q5 | 3 | 51 (back) | Green | 3.5 cm |
@@ -144,13 +145,12 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 | UART C5 RX from P4 TX | 12 | 27 | Yellow | 4 cm |
 | EN | RESET button pad | 26 | Yellow | 4 cm |
 | GND (I-side return) | USB-C shell | GND, right row 18 | Black | 3 cm |
-| 5V | 5V | JST lead branch | Red | 2-3 cm |
-| GND | GND | JST lead branch | Black | 2-3 cm |
+| 5V | 5V | VSYS, right row 2 | Red | 7.5 cm |
 
 ### Wiring practice
 
 - Use 30 AWG (Kynar wire-wrap wire works well) for signals. At these lengths the wires behave as plain wires, and length matching doesn't matter (2 cm is about 0.1 ns against a 25 ns sample period).
-- Use 28 AWG, or two 30 AWG in parallel, for 5V and GND.
+- Use 28 AWG, or two 30 AWG in parallel, for the 5V wire.
 - The C5-Zero has one GND pad. Its second ground point is the USB-C shell, which the schematic ties to GND; that gives each bundle its own return, with the black wire running alongside the white clock on the Q side. More grounds between the P4's GND pins and the C5's GND pad help if the link test shows errors. A ground connected at one end only carries no return current and does nothing useful.
 - Keep each bundle together with its ground alongside. What matters is the loop area between each signal and its return.
 - Firmware sets low drive strength on the C5 data and clock pins to slow the edges. If the link still shows errors, add 22-33 Ω series resistors at the C5 end.
@@ -159,7 +159,7 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 
 - Crimp an MX1.25 4-pin lead for the P4's JST and wire it to a panel-mount USB port at the rear of the enclosure. The lead runs back under the P4, so it is about 8-10 cm long.
 - High-speed USB is fine over that length if D+ and D- are twisted together all the way, with 5V and GND alongside. Route it away from the IQ bundles, crossing them at right angles where it passes the gap.
-- Branch 5V (red) and GND (black) from the lead at the JST plug to the C5's 5V and GND pads.
+- The C5's 5V wire from VSYS runs back with this lead under the P4 and leaves it at the gap to reach the C5's 5V pad, the corner nearest the P4.
 - A USB-C receptacle needs 5.1 kΩ from each CC pin to GND, or a USB-C to USB-C cable will not supply power.
 - The P4's own USB-C stays reachable at the rear for flashing, so the rear has two ports: video and power, and programming.
 
