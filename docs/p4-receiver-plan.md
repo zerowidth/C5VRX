@@ -60,7 +60,7 @@ With the C5 turned to face the P4, its left edge (5V, GND, 0-5 and the back pads
 
 ## C5-Zero pin plan
 
-The C5 can route any MODEM_DIAG lane to any pad, and the P4 can read any lane from any GPIO, so the lane order doesn't matter when soldering. A walking-ones pattern from the C5 lets firmware discover the order (see [Firmware](#firmware)).
+Each data wire carries one fixed bit, so the build can be handed to someone else as a pin-to-pin list. Q7 and I7 are the most significant bits. The C5 and P4 could route any lane to any pad in firmware, but a fixed assignment makes a miswired build visible instead of silently remapped. A walking-ones self-test at boot names any wire that doesn't land where the plan says (see [Firmware](#firmware)).
 
 | Function | C5 pins | Notes |
 |---|---|---|
@@ -69,8 +69,8 @@ The C5 can route any MODEM_DIAG lane to any pad, and the P4 can read any lane fr
 | BOOT | 28 (back pad) | Driven by the P4, open-drain. The board's BOOT button is unreliable, so this is also the manual fallback: ground 28 while resetting |
 | Reset | EN, via the RESET button pad | Driven by the P4, open-drain. EN (CHIP_PU) is not on the edge pads; it has a 10k pull-up and 1 µF to GND, so reset release is slow |
 | Sample clock out | 0 | Two rows from the GND pad |
-| Q data (7 lanes) | 1, 2, 3, 4, 23, 24, 25 | Left side. The top 7 of Q's 8 live bits |
-| I data (7 lanes) | 6, 7, 8, 9, 10, 13, 14 | Right side. The top 7 of I's 8 live bits |
+| Q data (7 lanes) | Q7 on 1, Q6 on 2, Q5 on 3, Q4 on 4, Q3 on 23, Q2 on 24, Q1 on 25 | Left side. The top 7 of Q's 8 live bits |
+| I data (7 lanes) | I7 on 6, I6 on 7, I5 on 8, I4 on 9, I3 on 10, I2 on 13, I1 on 14 | Right side. The top 7 of I's 8 live bits |
 | Spare | 5 | Farthest pad from the P4 |
 | Antenna select | 26 | Internal to the board |
 
@@ -86,8 +86,8 @@ All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs
 
 | Function | P4 pins | Notes |
 |---|---|---|
-| Q data (7) | 28, 29, 30, 31 (back pads), 48, 46, 33 | Right side |
-| I data (7) | 49, 50, 51, 52 (back pads), 25, 24, 2 | Left side. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the CH343 on the USB-C instead, and JTAG debugging over these pins isn't available |
+| Q data (7) | Q7 on 29, Q6 on 48, Q5 on 30, Q4 on 31, Q3 on 33, Q2 on 46, Q1 on 28 | Right side. 28-31 are back pads |
+| I data (7) | I7 on 52, I6 on 51, I5 on 25, I4 on 50, I3 on 49, I2 on 2, I1 on 24 | Left side. 49-52 are back pads. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the CH343 on the USB-C instead, and JTAG debugging over these pins isn't available |
 | Sample clock | 47 | Between 48 and the row-18 GND |
 | C5 BOOT | 32 | Open-drain |
 | UART RX from C5 TX (GPIO11) | 3 | |
@@ -119,27 +119,27 @@ Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-
 
 Lengths are estimates for the 8 mm gap, including about 6 mm of slack for dressing and strain relief. Cut each to fit; every wire is 4.5 cm or less. Wires to the P4's back pads run under the P4; the C5's castellated edge pads take a wire from either face.
 
-Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I data, and yellow is control. Lanes within a color don't need telling apart, because firmware maps them. The four yellow wires are distinguishable by position: BOOT is the only yellow on the Q side, and on the I side, EN goes to the button pad while TX and RX go to adjacent header pads. The P4 can swap its UART pins in firmware if TX and RX are crossed.
+Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I data, and yellow is control. Wires within a color look alike, so solder each one pin-to-pin from the list and check it off; the boot self-test catches mistakes. The four yellow wires are distinguishable by position: BOOT is the only yellow on the Q side, and on the I side, EN goes to the button pad while TX and RX go to adjacent header pads. The P4 can swap its UART pins in firmware if TX and RX are crossed.
 
 | Signal | C5 pin | P4 pin | Color | Length |
 |---|---|---|---|---|
 | Clock | 0 | 47 | White | 3 cm |
 | GND (clock return) | GND | GND, right row 18 | Black | 3 cm |
-| Q | 1 | 29 (back) | Green | 3.5 cm |
-| Q | 2 | 48 | Green | 3.5 cm |
-| Q | 3 | 30 (back) | Green | 3.5 cm |
-| Q | 4 | 31 (back) | Green | 4 cm |
-| Q | 23 (back) | 33 | Green | 4 cm |
-| Q | 24 (back) | 46 | Green | 4 cm |
-| Q | 25 (back) | 28 (back) | Green | 3.5 cm |
+| Q7 | 1 | 29 (back) | Green | 3.5 cm |
+| Q6 | 2 | 48 | Green | 3.5 cm |
+| Q5 | 3 | 30 (back) | Green | 3.5 cm |
+| Q4 | 4 | 31 (back) | Green | 4 cm |
+| Q3 | 23 (back) | 33 | Green | 4 cm |
+| Q2 | 24 (back) | 46 | Green | 4 cm |
+| Q1 | 25 (back) | 28 (back) | Green | 3.5 cm |
 | BOOT | 28 (back) | 32 | Yellow | 4.5 cm |
-| I | 6 | 52 (back) | Blue | 4 cm |
-| I | 7 | 51 (back) | Blue | 4 cm |
-| I | 8 | 25 | Blue | 3.5 cm |
-| I | 9 | 50 (back) | Blue | 3.5 cm |
-| I | 10 | 49 (back) | Blue | 3.5 cm |
-| I | 13 | 2 | Blue | 4 cm |
-| I | 14 | 24 | Blue | 3 cm |
+| I7 | 6 | 52 (back) | Blue | 4 cm |
+| I6 | 7 | 51 (back) | Blue | 4 cm |
+| I5 | 8 | 25 | Blue | 3.5 cm |
+| I4 | 9 | 50 (back) | Blue | 3.5 cm |
+| I3 | 10 | 49 (back) | Blue | 3.5 cm |
+| I2 | 13 | 2 | Blue | 4 cm |
+| I1 | 14 | 24 | Blue | 3 cm |
 | UART C5 TX to P4 RX | 11 | 3 | Yellow | 3.5 cm |
 | UART C5 RX from P4 TX | 12 | 4 | Yellow | 4.5 cm |
 | EN | RESET button pad | 5 | Yellow | 4.5 cm |
@@ -172,11 +172,12 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 - Add a text command set on the USB console first, then the same parser on the UART to the P4: band, channel, frequency, status.
 - Status includes the existing `strength` score, wideband RSSI (`phy_get_rssi`), noise floor, and current gain, all already in `C5VRX_LAB_ROW`.
 - Drop the bench-only commits (forced R3, U.FL antenna) once tuning is controllable.
-- A test mode that drives a counter pattern on the data lanes, for checking the link, and a walking-ones pattern (one lane high at a time) so the P4 can discover which C5 lane lands on which P4 pin.
+- A test mode that drives a counter pattern on the data lanes, for checking the link, and a walking-ones pattern (one lane high at a time) for the P4's boot self-test.
 
 ### P4
 
-- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode (two lines unused), choosing the clock edge that samples mid-bit.
+- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode, choosing the clock edge that samples mid-bit. PARLIO data lines 1-7 carry I1-I7 and lines 9-15 carry Q1-Q7, with lines 0 and 8 unused, so each 16-bit word holds I in the low byte and Q in the high byte, MSB-aligned.
+- At boot, run the walking-ones self-test against the planned pin map. On a mismatch, name the wire on the console, OLED and `status` (for example, "Q5: C5 3 seen on P4 31, expected 30"), then remap in firmware so the build still runs.
 - Demodulate FM from I/Q. With 7+7 bits, a lookup table is too large, so use a cross-product discriminator on the CPU (SIMD). That leaves roughly 20 cycles per sample per core at 400 MHz, which is tight.
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
 - Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, Espressif's `usb_device_uvc`).
