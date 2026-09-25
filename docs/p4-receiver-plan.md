@@ -12,7 +12,7 @@ Nothing here is built yet. The open questions at the end need answers before som
 flowchart LR
     subgraph stick["Receiver stick enclosure"]
         ant["5.8 GHz antenna"] --> c5["ESP32-C5-Zero<br/>tuner + I/Q export"]
-        c5 -- "12 I/Q lanes + 40 MHz clock" --> p4["ESP32-P4-Pico<br/>demod, NTSC decode, JPEG"]
+        c5 -- "14 I/Q lanes + 40 MHz clock" --> p4["ESP32-P4-Pico<br/>demod, NTSC decode, JPEG"]
         p4 -- "UART: tuning, status" --> c5
         p4 -- "EN, BOOT" --> c5
         oled["SPI OLED"] --- p4
@@ -41,18 +41,19 @@ The C5 can route any MODEM_DIAG lane to any pad, so lanes are assigned for easy 
 
 | Function | C5 pins | Notes |
 |---|---|---|
-| USB | 13, 14 | Kept for development flashing and console |
 | UART to P4 | 11 (TX), 12 (RX) | UART0, so the ROM bootloader can be reached and the P4 can reflash the C5 |
 | BOOT | 28 (back pad) | Driven by the P4, open-drain |
 | Reset | EN, via the RESET button pad | Driven by the P4, open-drain; EN is probably not on the header |
-| Sample clock out | One of 0-10, 23, 24, 25 | PARLIO TX clock output or equivalent |
-| I/Q data (12 lanes) | The remaining 12 of 0-10, 23, 24, 25 | Q[9:4] and I[9:4] |
-| Spare | One pad | Could make it 7+6 bits, but symmetric is simpler |
+| Sample clock out | One of 0-10, 13, 14, 23, 24, 25 | PARLIO TX clock output or equivalent |
+| I/Q data (14 lanes) | 14 of the remaining pads | The top 7 of the 8 live bits of each of Q and I |
+| Spare | One pad | |
 | Antenna select | 26 | Internal to the board |
 
 GPIO 2, 7 and 25 are strapping pins. They are safe as data outputs because the P4 inputs are high-impedance while the C5 reads its straps at reset.
 
-8+8 bits does not fit: it needs 16 lanes plus a clock, and only 13 pads remain after the UART and BOOT. Moving control to the C5's USB would free two more, still one short.
+GPIO 13 and 14 are the C5's USB pins. The finished build gives up the C5's USB console and uses them as data pads, so firmware must release them from the USB PHY before driving them. Standalone flashing over the C5's USB still works with BOOT held, because the ROM re-enables USB serial in download mode. Don't plug the C5's USB into anything while it is streaming.
+
+All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs 17 pads: 16 lanes plus the clock. That only fits if the C5's USB becomes the control and flashing link to a USB host on the P4, freeing the UART and BOOT pads. 7+7 keeps the simpler UART control and passthrough flashing.
 
 ## P4-Pico pin plan
 
@@ -60,7 +61,7 @@ The C5 sits past the P4's bottom end (the JST end), so the fast signals use the 
 
 | Function | P4 pins | Notes |
 |---|---|---|
-| I/Q data (12) | Left: 2, 3, 4, 5, 6, 14. Right: 27, 32, 33, 46, 47, 48 | Bottom half of both headers, with GNDs interleaved |
+| I/Q data (14) | Left: 2, 3, 4, 5, 6, 14. Right: 27, 32, 33, 46, 47, 48. Back pads: 28, 29 | Bottom half of both headers, with GNDs interleaved; the back pads sit at the bottom end, next to the C5 |
 | Sample clock | 26 | Next to a GND |
 | C5 EN | 20 | Open-drain |
 | C5 BOOT | 21 | Open-drain |
@@ -68,7 +69,7 @@ The C5 sits past the P4's bottom end (the JST end), so the fast signals use the 
 | UART RX from C5 TX (GPIO11) | 23 | |
 | OLED SPI: SCLK, MOSI, CS, DC, RST | 15, 16, 17, 18, 19 | |
 | Buttons | 7, 8, 24, 25 | 7/8 are I2C to the codec with 2.2k pull-ups; 24/25 are the unused full-speed USB pair |
-| Spare | 28-31, 49-52, 54 | |
+| Spare | 30, 31, 49-52, 54 | |
 | C5 power | VSYS, GND | |
 
 Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-P4-Pico/ESP32-P4-Pico-datasheet.pdf):
@@ -111,7 +112,7 @@ The enclosure is a long stick: antenna at the front, then the C5, then the P4, w
 
 ### C5
 
-- Route Q[9:4] and I[9:4] from MODEM_DIAG to the 12 data pads, and output a 40 MHz sample clock.
+- Route the top 7 live bits of each of Q and I from MODEM_DIAG to the 14 data pads, release GPIO 13 and 14 from USB, and output a 40 MHz sample clock.
 - Set low drive strength on the data and clock pads.
 - Add a text command set on the USB console first, then the same parser on the UART to the P4: band, channel, frequency, status.
 - Status includes the existing `strength` score, wideband RSSI (`phy_get_rssi`), noise floor, and current gain, all already in `C5VRX_LAB_ROW`.
@@ -120,8 +121,8 @@ The enclosure is a long stick: antenna at the front, then the C5, then the P4, w
 
 ### P4
 
-- Sample the 12 lanes plus clock with PARLIO RX, choosing the clock edge that samples mid-bit.
-- Demodulate FM from I/Q. With 6+6 bits, a lookup table is too large, so use a cross-product discriminator on the CPU (SIMD). That leaves roughly 20 cycles per sample per core at 400 MHz, which is tight.
+- Sample the 14 lanes plus clock with PARLIO RX in 16-bit mode (two lines unused), choosing the clock edge that samples mid-bit.
+- Demodulate FM from I/Q. With 7+7 bits, a lookup table is too large, so use a cross-product discriminator on the CPU (SIMD). That leaves roughly 20 cycles per sample per core at 400 MHz, which is tight.
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
 - Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, Espressif's `usb_device_uvc`).
 - Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
@@ -149,9 +150,8 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 
 ## Open questions
 
-- Are the lower diag bits (Q[5:4] and I[5:4]) live and clocked with the upper bits in continuous receive? The 10-bit layout is proven only for the dump path. Test on the C5 alone by routing them onto the current loopback pads and comparing decoded video.
 - Does the camera capture 60 images per second, or 30 split across fields? Capture a moving scene and compare the two fields of one frame.
-- Can the P4 demodulate 6+6-bit I/Q at 40 MS/s with time left for decoding and encoding?
+- Can the P4 demodulate 7+7-bit I/Q at 40 MS/s with time left for decoding and encoding?
 - What is the maximum PARLIO RX external clock on the P4, and which clock edge gives margin?
 - Are C5 GPIO 11/12 the ROM bootloader's UART0 pins?
 - Is the C5's EN reachable only at the RESET button pad? Is its USB-C shell grounded?
@@ -159,8 +159,7 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
-2. Lower diag bit test on the C5, to settle 6+6 against 4+4.
-3. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video.
-4. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, and compare samples with a host-side decode offline.
-5. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside.
-6. Optional: microSD recording.
+2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video.
+3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, and compare samples with a host-side decode offline.
+4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside.
+5. Optional: microSD recording.
