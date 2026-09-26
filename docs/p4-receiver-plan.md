@@ -32,7 +32,7 @@ flowchart LR
 
 - The P4-Pico is powered through its high-speed USB connector (the bottom 4-pin MX1.25 JST), which feeds its VCC_5V rail directly. The top USB-C also powers it, through a power-path FET, so both can be plugged in at once.
 - The C5 takes 5V from the P4's VSYS pin (right header, row 2), which is the same VCC_5V net as JST pin 1. VSYS is at the far end of the P4, so this is one 7.5 cm wire, routed under the P4 alongside the USB lead. Neither board has a 5V pad near the JST, and splicing into the crimped JST lead is fragile. Do not use VBUS, which is the USB-C input before the power-path FET.
-- The C5's ground return is the clock-return wire from the P4's left row-18 GND to the C5's GND pad, plus the USB-C shell wire on the I side. At about 150 mA, 30 AWG over 3 cm drops under 2 mV, so no separate power ground is needed.
+- The C5's ground return is the clock-return wire from the P4's left row-18 GND to the C5's GND pad, plus a wire from a USB-C shell tab on the I side. At about 150 mA, 30 AWG over 3 cm drops under 2 mV, so no separate power ground is needed.
 - Do not power the C5 from its own USB while it is also fed from VSYS, unless the C5-Zero schematic shows a diode on its VBUS.
 - Budget: roughly 100-150 mA for the C5, 200-400 mA for the P4, and about 20 mA for the OLED. This fits the 500 mA of a USB 2.0 port.
 
@@ -144,14 +144,14 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 | UART C5 TX to P4 RX | 11 | 32 | Yellow | 3.5 cm |
 | UART C5 RX from P4 TX | 12 | 27 | Yellow | 4 cm |
 | EN | RESET button pad | 26 | Yellow | 4 cm |
-| GND (I-side return) | USB-C shell | GND, right row 18 | Black | 3 cm |
+| GND (I-side return) | USB-C shell tab (back, I side, front tab) | GND, right row 18 | Black | 3 cm |
 | 5V | 5V | VSYS, right row 2 | Red | 7.5 cm |
 
 ### Wiring practice
 
 - Use 30 AWG (Kynar wire-wrap wire works well) for signals. At these lengths the wires behave as plain wires, and length matching doesn't matter (2 cm is about 0.1 ns against a 25 ns sample period).
 - Use 28 AWG, or two 30 AWG in parallel, for the 5V wire.
-- The C5-Zero has one GND pad. Its second ground point is the USB-C shell, which the schematic ties to GND; that gives each bundle its own return, with the black wire running alongside the white clock on the Q side. More grounds between the P4's GND pins and the C5's GND pad help if the link test shows errors. A ground connected at one end only carries no return current and does nothing useful.
+- The C5-Zero has one GND pad. Its second ground point is the USB-C shell: the connector's four mounting tabs come through as plated slots on the back, and the schematic ties them (MTB) straight to GND. Use the front tab on the I side (under GPIO 11/12, nearest the P4), which gives the shortest wire and stays clear of the back pads on the Q side. The tab is bonded to the ground plane, so it needs a hot iron and a moment to wet; soldering to the top of the shell instead risks melting the connector's plastic. The GND contacts inside the connector are too small to use. The two grounds give each bundle its own return, with the black wire running alongside the white clock on the Q side. More grounds between the P4's GND pins and the C5's GND pad help if the link test shows errors. A ground connected at one end only carries no return current and does nothing useful.
 - Keep each bundle together with its ground alongside. What matters is the loop area between each signal and its return.
 - Firmware sets low drive strength on the C5 data and clock pins to slow the edges. Slow edges also shrink the roughly 12.5 ns window in which each sample is valid (see [P4 firmware](#p4)), so pick the setting from the edge check rather than defaulting to the lowest. If the link still shows errors, add 22-33 Ω series resistors at the C5 end.
 
