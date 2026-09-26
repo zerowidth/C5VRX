@@ -7,10 +7,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "bridge.h"
 #include "console.h"
 #include "pins.h"
 
-#define C5_UART UART_NUM_1
 #define C5_BAUD 115200
 /* The C5's EN has 10k and 1 uF, so it takes about 10 ms to rise after release. */
 #define EN_LOW_MS 50
@@ -32,7 +32,9 @@ static void relay_task(void *arg)
     uint8_t buf[128];
     for (;;) {
         int n = uart_read_bytes(C5_UART, buf, sizeof buf, pdMS_TO_TICKS(20));
-        if (n > 0 && s_log) host_write(buf, n);
+        if (n <= 0) continue;
+        bridge_c5_bytes(buf, n);
+        if (s_log || bridge_active()) host_write(buf, n);
     }
 }
 

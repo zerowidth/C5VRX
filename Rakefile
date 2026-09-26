@@ -43,6 +43,13 @@ def local_idf(dir, *cmd)
      "bash", IDF_ACTIVATE, dir, *cmd
 end
 
+# esptool against the C5 through the p4usb bridge, which resets the C5 into
+# download mode when it sees esptool's SYNC and only forwards at 115200.
+def c5_via_p4(dir, *args)
+  local_idf dir, "esptool", "--chip", "esp32c5", "-p", serial_port, "-b", "115200",
+            "--before", "no-reset", "--after", "watchdog-reset", *args
+end
+
 namespace :p4usb do
   desc "Build the P4 firmware with the local ESP-IDF"
   task :build do
@@ -57,6 +64,11 @@ namespace :p4usb do
   desc "Open the P4 console (it also relays the C5's)"
   task :monitor do
     local_idf "p4usb", "idf.py", "-p", serial_port, "monitor"
+  end
+
+  desc "Read the C5's flash ID through the P4 bridge"
+  task :c5_flash_id do
+    c5_via_p4 ".", "flash-id"
   end
 
   desc "Print the P4's chip revision"

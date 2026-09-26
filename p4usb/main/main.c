@@ -1,5 +1,6 @@
 #include "driver/gpio.h"
 
+#include "bridge.h"
 #include "c5.h"
 #include "console.h"
 #include "pins.h"
@@ -18,6 +19,8 @@ void app_main(void)
     uint8_t buf[64];
     for (;;) {
         size_t n = host_read(buf, sizeof buf, 20);
+        bridge_poll();
+        if (bridge_host_bytes(buf, n)) continue;
         for (size_t i = 0; i < n; ++i) console_feed(buf[i]);
     }
 }
