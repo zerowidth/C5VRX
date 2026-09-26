@@ -50,7 +50,7 @@ Waveshare's diagrams, from the [ESP32-C5-Zero](https://docs.waveshare.com/ESP32-
 Physical order, both boards viewed from the component side with the USB-C at the top:
 
 - C5-Zero left edge: 5V, GND, 3V3, 0, 1, 2, 3, 4, 5. Right edge: 11, 12, 13, 14, 10, 9, 8, 7, 6. Back pads 23, 24, 25 and 28 sit in a column about 1.6 mm apart, inboard of the left edge, level with rows 4-6. The U.FL and antenna are at the bottom.
-- P4-Pico left header (rows 1-20): 54, 19, GND, 18, 17, 16, 15, GND, 14, 6, 5, 4, GND, 3, 2, 8, 7, GND, 24, 25. Right header: VBUS, VSYS, GND, EN, 3V3, 20, 21, GND, 22, 23, RUN, 26, GND, 27, 32, 33, 46, GND, 47, 48. The JST is at the bottom, below row 20.
+- P4-Pico left header (rows 1-20): 54, 19, GND, 18, 17, 16, 15, GND, 14, 6, 5, 4, GND, 3, 2, 8, 7, GND, 24, 25. Right header: VBUS, VSYS, GND, EN, 3V3, 20, 21, GND, 22, 23, RUN, 26, GND, 27, 32, 33, 46, GND, 47, 48. The JST is at the bottom, below row 20. The silkscreen labels GPIO 8 as SCL (row 16) and GPIO 7 as SDA (row 17), and GPIO 24/25 appear as DM/DP on Waveshare's pinout.
 - P4-Pico back pads, seen from the front: 28, 29, 30, 31, 34 run down the right side and 36, 49, 50, 51, 52 down the left, about 1.6 mm apart, in the last 8 mm before the JST end. 34 and 36 are strapping pins.
 
 ## Layout
@@ -89,13 +89,13 @@ All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs
 |---|---|---|
 | Q data (7) | Q7 on 25, Q6 on 50, Q5 on 51, Q4 on 52, Q3 on 3, Q2 on 2, Q1 on 49 | Left side. 49-52 are back pads |
 | Sample clock | 24 | Next to the left row-18 GND. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the CH343 on the USB-C instead, and JTAG debugging over these pins isn't available |
-| C5 BOOT | 8 | Open-drain. 8 is the codec's I2C SCL with a 2.2k pull-up, which only strengthens BOOT's pull-up; the codec is unused |
+| C5 BOOT | 8 (labeled SCL) | Open-drain. 8 is the codec's I2C SCL with a 2.2k pull-up, which only strengthens BOOT's pull-up; the codec is unused |
 | I data (7) | I7 on 30, I6 on 29, I5 on 48, I4 on 28, I3 on 47, I2 on 33, I1 on 46 | Right side. 28-30 are back pads |
 | UART RX from C5 TX (GPIO11) | 32 | |
 | UART TX to C5 RX (GPIO12) | 27 | |
 | C5 EN | 26 | Open-drain |
 | OLED I2C: SDA, SCL | 15, 16 | 0.91" 128×32 SSD1306 modules are I2C only |
-| Buttons: BAND, CH−, CH+ | 5, 6, 7 | Active-low to GND. 7 is the codec's I2C SDA with a 2.2k pull-up, which suits an active-low button |
+| Buttons: BAND, CH−, CH+ | 5, 6, 7 (labeled SDA) | Active-low to GND. 7 is the codec's I2C SDA with a 2.2k pull-up, which suits an active-low button |
 | Spare | 4, 14, 17, 18, 19, 20, 21, 22, 23, 54, and back pad 31 | 14 is kept for a fourth button |
 
 Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-P4-Pico/ESP32-P4-Pico-datasheet.pdf):
@@ -133,7 +133,7 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 | Q3 | 23 (back) | 3 | Green | 4.5 cm |
 | Q2 | 24 (back) | 2 | Green | 4 cm |
 | Q1 | 25 (back) | 49 (back) | Green | 3 cm |
-| BOOT | 28 (back) | 8 | Yellow | 4.5 cm |
+| BOOT | 28 (back) | 8 (SCL) | Yellow | 4.5 cm |
 | I7 | 6 | 30 (back) | Blue | 4 cm |
 | I6 | 7 | 29 (back) | Blue | 4 cm |
 | I5 | 8 | 48 | Blue | 3.5 cm |
