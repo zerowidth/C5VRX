@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
+#include "c5.h"
 #include "census.h"
 
 #define HOST_UART UART_NUM_0
@@ -34,6 +35,7 @@ static const command_t s_commands[] = {
     {"help", cmd_help, "list commands"},
     {"info", cmd_info, "chip revision and uptime"},
     {"census", census_run, "read every C5-facing pin with pull-down, then pull-up"},
+    {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART"},
 };
 
 static void cmd_help(int argc, char **argv)

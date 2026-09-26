@@ -1,2 +1,2 @@
-idf_component_register(SRCS "main.c" "console.c" "census.c"
+idf_component_register(SRCS "main.c" "console.c" "census.c" "c5.c"
                        PRIV_REQUIRES esp_driver_gpio esp_driver_uart esp_timer)
