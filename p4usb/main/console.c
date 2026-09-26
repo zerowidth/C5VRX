@@ -68,10 +68,20 @@ void say(const char *fmt, ...)
     if (n > 0) host_write(buf, n);
 }
 
+size_t uart_read_some(uart_port_t port, uint8_t *buf, size_t len, uint32_t timeout_ms)
+{
+    /* uart_read_bytes waits for all len bytes, so block for one and take what else is buffered. */
+    if (len == 0 || uart_read_bytes(port, buf, 1, pdMS_TO_TICKS(timeout_ms)) != 1) return 0;
+    size_t more = 0;
+    uart_get_buffered_data_len(port, &more);
+    if (more > len - 1) more = len - 1;
+    int n = more ? uart_read_bytes(port, buf + 1, more, 0) : 0;
+    return 1 + (n > 0 ? (size_t)n : 0);
+}
+
 size_t host_read(uint8_t *buf, size_t len, uint32_t timeout_ms)
 {
-    int n = uart_read_bytes(HOST_UART, buf, len, pdMS_TO_TICKS(timeout_ms));
-    return n > 0 ? (size_t)n : 0;
+    return uart_read_some(HOST_UART, buf, len, timeout_ms);
 }
 
 static void run_line(char *line)

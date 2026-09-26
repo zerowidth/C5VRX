@@ -28,11 +28,11 @@ static void open_drain_high(int pin)
     gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
 }
 
-static void split_lines(const uint8_t *buf, int n)
+static void split_lines(const uint8_t *buf, size_t n)
 {
     static char line[96];
     static size_t len;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         if (buf[i] == '\n' || buf[i] == '\r') {
             line[len] = '\0';
             if (len > 0) wires_line(line);
@@ -47,8 +47,8 @@ static void relay_task(void *arg)
 {
     uint8_t buf[128];
     for (;;) {
-        int n = uart_read_bytes(C5_UART, buf, sizeof buf, pdMS_TO_TICKS(20));
-        if (n <= 0) continue;
+        size_t n = uart_read_some(C5_UART, buf, sizeof buf, 20);
+        if (n == 0) continue;
         bridge_c5_bytes(buf, n);
         if (s_log || bridge_active()) host_write(buf, n);
         if (!bridge_active()) split_lines(buf, n);
