@@ -10,6 +10,7 @@
 #include "bridge.h"
 #include "console.h"
 #include "pins.h"
+#include "wires.h"
 
 #define C5_BAUD 115200
 /* The C5's EN has 10k and 1 uF, so it takes about 10 ms to rise after release. */
@@ -27,6 +28,21 @@ static void open_drain_high(int pin)
     gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
 }
 
+static void split_lines(const uint8_t *buf, int n)
+{
+    static char line[96];
+    static size_t len;
+    for (int i = 0; i < n; ++i) {
+        if (buf[i] == '\n' || buf[i] == '\r') {
+            line[len] = '\0';
+            if (len > 0) wires_line(line);
+            len = 0;
+        } else if (buf[i] >= 0x20 && buf[i] < 0x7f && len < sizeof line - 1) {
+            line[len++] = (char)buf[i];
+        }
+    }
+}
+
 static void relay_task(void *arg)
 {
     uint8_t buf[128];
@@ -35,6 +51,7 @@ static void relay_task(void *arg)
         if (n <= 0) continue;
         bridge_c5_bytes(buf, n);
         if (s_log || bridge_active()) host_write(buf, n);
+        if (!bridge_active()) split_lines(buf, n);
     }
 }
 

@@ -11,6 +11,7 @@
 
 #include "c5.h"
 #include "census.h"
+#include "wires.h"
 
 #define HOST_UART UART_NUM_0
 #define MAX_ARGS 8
@@ -35,6 +36,7 @@ static const command_t s_commands[] = {
     {"help", cmd_help, "list commands"},
     {"info", cmd_info, "chip revision and uptime"},
     {"census", census_run, "read every C5-facing pin with pull-down, then pull-up"},
+    {"wires", wires_run, "reset the C5 and check its walking-ones boot test lane by lane"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART"},
 };
 
