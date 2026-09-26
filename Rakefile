@@ -76,3 +76,15 @@ namespace :p4usb do
     local_idf "p4usb", "esptool", "--chip", "esp32p4", "-p", serial_port, "chip-id"
   end
 end
+
+namespace :c5rx do
+  desc "Build the C5 firmware for the P4 receiver with the local ESP-IDF"
+  task :build do
+    local_idf "c5rx", "idf.py", "build"
+  end
+
+  desc "Build, then flash the C5 through the P4 bridge"
+  task flash: :build do
+    c5_via_p4 "c5rx/build", "write-flash", "@flash_args"
+  end
+end
