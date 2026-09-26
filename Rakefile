@@ -6,8 +6,8 @@ BUILD_DIR = "build-#{PROJECT}"
 def serial_port
   return ENV["PORT"] if ENV["PORT"]
 
-  ports = Dir["/dev/cu.usbmodem*"]
-  abort "no /dev/cu.usbmodem* found; plug in the board or set PORT" if ports.empty?
+  ports = Dir["/dev/cu.usbmodem*", "/dev/cu.wchusbserial*"]
+  abort "no USB serial port found; plug in the board or set PORT" if ports.empty?
   abort "several ports found (#{ports.join(", ")}); set PORT" if ports.size > 1
   ports.first
 end
@@ -33,3 +33,34 @@ task :clean do
 end
 
 task default: :build
+
+IDF_ACTIVATE = File.expand_path("~/.espressif/tools/activate_idf_v6.1.sh")
+
+# Runs a command in dir under the local ESP-IDF v6.1, where idf.py is a shell
+# function. The activate script is sourced with no arguments so it can't misread ours.
+def local_idf(dir, *cmd)
+  sh "bash", "-c", 'args=("$@"); set --; . "${args[0]}" >/dev/null; cd "${args[1]}" && "${args[@]:2}"',
+     "bash", IDF_ACTIVATE, dir, *cmd
+end
+
+namespace :p4usb do
+  desc "Build the P4 firmware with the local ESP-IDF"
+  task :build do
+    local_idf "p4usb", "idf.py", "build"
+  end
+
+  desc "Build, then flash the P4 over its USB-C"
+  task flash: :build do
+    local_idf "p4usb", "idf.py", "-p", serial_port, "flash"
+  end
+
+  desc "Open the P4 console (it also relays the C5's)"
+  task :monitor do
+    local_idf "p4usb", "idf.py", "-p", serial_port, "monitor"
+  end
+
+  desc "Print the P4's chip revision"
+  task :chip_id do
+    local_idf "p4usb", "esptool", "--chip", "esp32p4", "-p", serial_port, "chip-id"
+  end
+end
