@@ -88,7 +88,7 @@ All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs
 | Function | P4 pins | Notes |
 |---|---|---|
 | Q data (7) | Q7 on 25, Q6 on 50, Q5 on 51, Q4 on 52, Q3 on 3, Q2 on 2, Q1 on 49 | Left side. 49-52 are back pads |
-| Sample clock | 24 | Next to the left row-18 GND. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the CH343 on the USB-C instead, and JTAG debugging over these pins isn't available |
+| Sample clock | 24 | Next to the left row-18 GND. 24/25 are the full-speed USB pair, so firmware must release them from the USB PHY, which gives up the P4's USB-Serial-JTAG. Flashing and the console use the high-speed port or the CH343 instead, and JTAG debugging over these pins isn't available |
 | C5 BOOT | 8 (labeled SCL) | Open-drain. 8 is the codec's I2C SCL with a 2.2k pull-up, which only strengthens BOOT's pull-up; the codec is unused |
 | I data (7) | I7 on 30, I6 on 29, I5 on 48, I4 on 28, I3 on 47, I2 on 33, I1 on 46 | Right side. 28-30 are back pads |
 | UART RX from C5 TX (GPIO11) | 32 | |
@@ -100,7 +100,7 @@ All 8 bits of both I and Q are live (confirmed on another branch), but 8+8 needs
 
 Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-P4-Pico/ESP32-P4-Pico-datasheet.pdf):
 
-- The top USB-C goes only to a CH343 USB-UART (P4 UART0 on GPIO 37/38, with auto-reset). It is for flashing and the console, not UVC. In this layout it is at the rear, reachable through the enclosure.
+- The top USB-C goes only to a CH343 USB-UART (P4 UART0 on GPIO 37/38, with auto-reset). It carries the boot and panic log and is a fallback for flashing and the console, not UVC. In this layout it is at the rear, reachable through the enclosure.
 - High-speed USB goes only to the bottom MX1.25 connector (V, D-, D+, G).
 - The header pin labeled EN is the 3.3 V regulator enable, and RUN resets the P4. Neither is used here.
 - The audio codec (I2S on GPIO 9-13), speaker amp (GPIO 53), SD card (GPIO 39-45) and flash are on pins not used by this plan.
@@ -163,7 +163,7 @@ Colors: red is 5V, black is GND, white is the clock, green is Q data, blue is I 
 - High-speed USB is fine over that length if D+ and D- are twisted together all the way, with 5V and GND alongside. Route it away from the IQ bundles, crossing them at right angles where it passes the gap.
 - The C5's 5V wire from VSYS runs back with this lead under the P4 and leaves it at the gap to reach the C5's 5V pad, the corner nearest the P4.
 - A USB-C receptacle needs 5.1 kΩ from each CC pin to GND, or a USB-C to USB-C cable will not supply power.
-- The P4's own USB-C stays reachable at the rear for flashing, so the rear has two ports: video and power, and programming.
+- The P4's own USB-C stays reachable at the rear for boot logs and recovery. Flashing and the console run over the high-speed port, so day to day only that one is plugged in.
 
 ## Controls and display
 
@@ -224,7 +224,7 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 - Demodulate FM from I/Q with a 16 KB phase table: index it with the 14 I/Q bits to get an 8-bit phase, then subtract the previous sample's phase, where uint8 wraparound handles the 360° wrap. That is a shift-or, a load and a subtract per sample, within the roughly 20 cycles per sample per core at 400 MHz. The table should stay in L1 data cache. The fixed LSB lines make the raw 16-bit PARLIO word usable as an index with no shift-or, but only a quarter of that 64K-entry table is reachable and it touches twice the cache, so the compact 14-bit index is the default. If 8-bit phase proves limiting, 16-bit entries (32 KB) keep the full precision of the 7-bit input.
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
 - Never stop or blank the output on weak or lost sync. Field and line timing coast at their last lock (or nominal NTSC) and every field is decoded regardless, so noise shows as static, frames keep arriving at about 59.94 fps, and the picture relocks without flashing, as an analog monitor does. The JPEG stamp can carry a lock flag and sync quality without changing the picture.
-- Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, Espressif's `usb_device_uvc`).
+- Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, with our own descriptors).
 - Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
 - Offer 720×480 at 60 fps (one frame per field, deinterlaced) and at 30 fps (fields woven). 60 is the default for FPV. The hardware encoder takes 3.5 ms for a 720×480 grayscale frame, well inside a 16.7 ms field.
 - Drive the OLED and buttons as described in [Controls and display](#controls-and-display).
@@ -262,13 +262,16 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 
 Two ESP-IDF 6.1 projects hold the firmware for this build, separate from the standalone C5 receiver in `main/`:
 
-- `p4usb/` runs on the P4. Its console is on the P4's USB-C (CH343) at 115200.
+- `p4usb/` runs on the P4. Its console is a CDC serial port ("C5VRX Console") on the high-speed port, next to the camera, and also on the USB-C (CH343) at 115200. Replies go to whichever port sent the last input.
 - `c5rx/` runs on the C5. Its console is UART0 on GPIO 11/12, relayed by the P4. The C5's USB-Serial-JTAG is off, since GPIO 13/14 carry I2 and I1.
 
 The Rakefile builds both with the local ESP-IDF (`~/.espressif`):
 
-- `rake p4usb:flash` flashes the P4 over its USB-C, and `rake p4usb:console` opens its console in picocom. Opening and closing the port doesn't reset the P4.
-- `rake c5rx:flash` flashes the C5 through the P4, and `rake p4usb:c5_flash_id` checks that path.
+- Tasks find each board's port by USB ID, so other ESP boards can stay plugged in: 303a:8000 is the P4 console, 303a:0012 the P4's ROM loader, 1a86:55d3 the CH343 on the P4's USB-C, and 303a:1001 a C5 or S3 on its own USB. When two ports match, the task stops and asks for `PORT=`.
+- `rake p4usb:flash` flashes the P4 over its high-speed port. It toggles DTR and RTS on the console the way esptool's reset does, which reboots the P4 into its ROM loader on the same port, then flashes it there (about 11 s). With only the USB-C plugged in, it flashes through the CH343 instead. `reboot download` on the console does the same by hand.
+- `rake p4usb:console` opens the console in picocom, preferring the high-speed port. Opening and closing the port doesn't reset the P4. `rake p4usb:monitor` shows the boot and panic log on the USB-C.
+- `rake c5rx:flash` flashes the C5 through the P4, and `rake p4usb:c5_flash_id` checks that path. Both work over the high-speed console as well as the USB-C.
+- macOS asks before each new USB device may connect, and the P4's ROM loader and each new descriptor set count as new devices. Until that is allowed, the device enumerates without a driver and no serial port appears.
 
 The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset, leaves every bus pin as an input, and keeps its TX to the C5 undriven, because other C5 firmware may drive GPIO 12 (the standalone receiver uses it for the DAC). Its console commands:
 
@@ -281,7 +284,7 @@ The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset
 
 The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways, starting at 115200. When the C5 acknowledges esptool's baud-change command, the P4 switches both UARTs to the new rate. The session ends when the C5 reboots (esptool's `--after watchdog-reset`, seen as bytes outside any SLIP frame), when the C5 fails to answer for 2 s, or after 30 s of silence in both directions. Both UARTs then return to 115200. esptool runs with `--before no-reset`, which the Rake tasks pass along with `-b 921600` (override with `BAUD=`).
 
-The P4 streams a test pattern as a UVC webcam on its high-speed port, named "C5VRX Receiver" (the video interface shows as "UVC CAM1", a string fixed in `usb_device_uvc`). A 60 fps timer renders status text on black into a 720×480 grayscale frame in PSRAM, with a sweeping block that shows dropped or repeated frames, and the hardware encoder writes it to one of three JPEG slots. One slot is being sent, one holds the newest frame and the encoder writes the third, so a slow or absent host drops frames and never stalls the producer. The pattern has one raw frame because rendering and encoding run back to back; the NTSC decoder will need two, so it can fill one while the encoder reads the other. `usb_device_uvc` polls every 16 ms (whole milliseconds), faster than frames arrive, so the P4 blocks each poll until the next unsent frame: every frame goes out once, never repeated, and `video` counts any the host was too slow to take. Each JPEG carries a COM segment after APP0 with its frame number and capture time (`C5VRX frame=210 t_us=3517257`), which survives only in a recorder that keeps the raw MJPEG. macOS asks before a new USB accessory may connect, and the camera doesn't enumerate until that is allowed.
+The P4 streams a test pattern as a UVC webcam on its high-speed port, named "C5VRX Receiver" (video interface "C5VRX Video"). A 60 fps timer renders status text on black into a 720×480 grayscale frame in PSRAM, with a sweeping block that shows dropped or repeated frames, and the hardware encoder writes it to one of three JPEG slots. One slot is being sent, one holds the newest frame and the encoder writes the third, so a slow or absent host drops frames and never stalls the producer. The pattern has one raw frame because rendering and encoding run back to back; the NTSC decoder will need two, so it can fill one while the encoder reads the other. The camera task waits on the producer for the next unsent frame and sends it as one bulk transfer, so every frame goes out once, never repeated, and `video` counts any the host was too slow to take. Each JPEG carries a COM segment after APP0 with its frame number and capture time (`C5VRX frame=210 t_us=3517257`), which survives only in a recorder that keeps the raw MJPEG. macOS asks before a new USB accessory may connect, and the device doesn't enumerate until that is allowed.
 
 Verified on the hardware:
 
