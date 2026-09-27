@@ -4,7 +4,7 @@ Plan for a self-contained receiver built from the Waveshare ESP32-C5-Zero and th
 
 This is a separate build from the standalone C5 receiver. The C5-only path, which recovers composite video onto the resistor DAC and never decodes pixels, stays as it is.
 
-Bring-up is done: the P4 resets and reflashes the C5, and every wire checks out (see [Bring-up](#bring-up)). The receiver itself isn't built yet. The open questions at the end need answers before some choices are final.
+Bring-up is done: the P4 resets and reflashes the C5, and every wire checks out (see [Bring-up](#bring-up)). The C5 tunes and exports live I/Q, and a P4 capture demodulated offline shows the transmitter's picture. Realtime demodulation and NTSC decoding on the P4 are not built yet. The open questions at the end need answers before some choices are final.
 
 ## System overview
 
@@ -281,6 +281,8 @@ The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset
 - `link [MHz]` tests the clocked link. `c5rx` drives a 7-bit counter on one side's lanes (Q1-Q7, then I1-I7) from its 8-lane PARLIO TX, with the clock on GPIO 0. The P4 captures 16-bit words with PARLIO RX on the C5's clock at 10, 20, 40 and 80 MHz, on each edge, and checks every sample, the idle side, and the constant-1 lines 0 and 8.
 - `info` shows the P4's chip revision, uptime and bridge counters.
 - `video` shows the test-pattern pipeline's frame rate, render and encode times, JPEG size, and USB state. `video grab` prints the newest JPEG as base64 over the console, for checking frames without the high-speed port.
+- `iq start [channel]` resets the C5, tunes it (default R3), starts the I/Q export and picks the P4's clock edge. `iq` captures two fields (1.4 M samples, 35 ms) into PSRAM and prints I/Q statistics, and `iq dump` sends the raw 16-bit words. `p4usb/tools/iq.py` runs the capture and dump from the Mac and has offline checks: `lanes` shows each lane's activity and `field` FM-demodulates the capture into an image of lines. It needs numpy, pillow and pyserial.
+- `c5 send <command>` reaches `c5rx`'s own commands: `tune R3` (or a frequency in MHz) starts the radio on first use and tunes it, `gain N` forces the RX gain index (default 52), `status` reports channel, gain, RSSI and noise floor, and `iq on` routes MODEM_DIAG bits 9-3 (Q) and 19-13 (I) to the lanes with a 40 MHz PARLIO TX clock on GPIO 0. `iq on Q I` routes other DIAG bits, with Q and I naming the top one on each side. The radio setup follows `main/rf.c`: BW40, promiscuous receive with the MAC TX queues disabled, the vendor AGC off, and fixed gain.
 
 The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways, starting at 115200. When the C5 acknowledges esptool's baud-change command, the P4 switches both UARTs to the new rate. The session ends when the C5 reboots (esptool's `--after watchdog-reset`, seen as bytes outside any SLIP frame), when the C5 fails to answer for 2 s, or after 30 s of silence in both directions. Both UARTs then return to 115200. esptool runs with `--before no-reset`, which the Rake tasks pass along with `-b 921600` (override with `BAUD=`).
 
@@ -294,11 +296,13 @@ Verified on the hardware:
 - All 15 bus wires (clock and 14 I/Q lanes), with no opens, swaps or shorts.
 - The clocked link at 10, 20 and 40 MHz: no errors in 8,175 samples per side, on either P4 clock edge, with the idle side low and lines 0 and 8 held at 1. At 80 MHz it fails (see [Open questions](#open-questions)).
 - The test pattern at 60 fps: 6 ms to render, 3.5 ms to encode, about 40 KB per JPEG at quality 80, with no late frames. Over high-speed USB (480 Mb/s, bulk), ffmpeg received 601 distinct frames in 10 s, and the P4 skipped none.
+- Live I/Q from a transmitter on R3 (5732 MHz, reached from Wi-Fi channel 144 with `phy_set_freq`). A plain phase-difference demodulation of a P4 capture, folded at the nominal line period, shows the transmitter's OSD text. The carrier sits within about 0.3 MHz of the tuned center, so what looks like a DC spur in the spectrum is the carrier itself. The signal is small at gain 52: I and Q have a standard deviation of about 16 of ±127, so the top three or four lanes on each side mostly carry the sign. The `iq` edge check preferred the falling edge on every boot so far (roughness about 5 against 7 to 8 on the rising edge).
+- A PARLIO RX receive on the P4 puts its DMA descriptor list on the caller's stack, 16 bytes per 4 KB, so the 2.8 MB capture needs a 20 KB main task stack. The soft delimiter is limited to 64 KB, so long captures use partial (continuous) receive and stop once the buffer is full.
 
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
 2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video. Power, UART, EN and BOOT, bridged flashing and the wire check are done.
-3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline. The counter-pattern link check is done.
+3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline. Done: the offline decode shows the transmitter's picture.
 4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside. JPEG and UVC work with a test pattern; the serial port on the same cable is not done.
 5. Optional: microSD recording.
