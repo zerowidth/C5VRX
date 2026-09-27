@@ -66,6 +66,11 @@ namespace :p4usb do
     local_idf "p4usb", "idf.py", "-p", serial_port, "monitor"
   end
 
+  desc "Open the P4 console in picocom without resetting the P4 (exit with C-a C-x)"
+  task :console do
+    sh "picocom", "-b", "115200", "--imap", "lfcrlf", serial_port
+  end
+
   desc "Read the C5's flash ID through the P4 bridge"
   task :c5_flash_id do
     c5_via_p4 ".", "flash-id"
