@@ -21,14 +21,20 @@
 /* Two NTSC fields, so a whole field is in every capture. */
 #define CAPTURE_SAMPLES (1400 * 1000)
 #define CAPTURE_BYTES (CAPTURE_SAMPLES * 2)
-/* The DMA keeps writing, circularly, until the task stops it; this absorbs that latency. */
+/* The DMA keeps writing, circularly, until the task stops it; this absorbs that latency, which into
+ * PSRAM has exceeded 64 KB. */
 #define MARGIN_BYTES (64 * 1024)
+#define PSRAM_MARGIN_BYTES (1024 * 1024)
 /* The soft delimiter's limit; with partial receive it only sets the EOF interrupt period. */
 #define EOF_BYTES 0xfc00
 /* Enough to compare edges: about 100 lines. */
 #define PROBE_SAMPLES (256 * 1024)
 #define SKIP 64
 
+static uint16_t *s_psram;
+static uint16_t *s_sram;
+static size_t s_sram_samples;
+/* The buffer the last capture went to. */
 static uint16_t *s_buf;
 static size_t s_len;
 static parlio_sample_edge_t s_edge = PARLIO_SAMPLE_EDGE_POS;
@@ -46,11 +52,13 @@ static bool IRAM_ATTR on_partial(parlio_rx_unit_handle_t rx, const parlio_rx_eve
 }
 
 /* Same line map as the link test: I in the low byte, Q in the high byte, lines 0 and 8 at 1. */
-static esp_err_t capture(size_t samples, parlio_sample_edge_t edge)
+static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edge)
 {
+    s_buf = buf;
+    const size_t margin = buf == s_psram ? PSRAM_MARGIN_BYTES : MARGIN_BYTES;
     parlio_rx_unit_config_t cfg = {
         .trans_queue_depth = 1,
-        .max_recv_size = samples * 2 + MARGIN_BYTES,
+        .max_recv_size = samples * 2 + margin,
         .data_width = 16,
         .clk_src = PARLIO_CLK_SRC_EXTERNAL,
         .ext_clk_freq_hz = IQ_HZ,
@@ -87,7 +95,7 @@ static esp_err_t capture(size_t samples, parlio_sample_edge_t edge)
     if (err == ESP_OK) err = parlio_rx_unit_enable(rx, true);
     if (err == ESP_OK) {
         const parlio_receive_config_t rcfg = {.delimiter = delim, .flags.partial_rx_en = 1};
-        err = parlio_rx_unit_receive(rx, s_buf, samples * 2 + MARGIN_BYTES, &rcfg);
+        err = parlio_rx_unit_receive(rx, s_buf, samples * 2 + margin, &rcfg);
         if (err == ESP_OK) err = parlio_rx_soft_delimiter_start_stop(rx, delim, true);
         if (err == ESP_OK && xSemaphoreTake(s_full, pdMS_TO_TICKS(1000)) != pdTRUE) err = ESP_ERR_TIMEOUT;
         parlio_rx_soft_delimiter_start_stop(rx, delim, false);
@@ -95,6 +103,10 @@ static esp_err_t capture(size_t samples, parlio_sample_edge_t edge)
     }
     if (delim) parlio_del_rx_delimiter(delim);
     parlio_del_rx_unit(rx);
+    if (err == ESP_OK && s_got > samples * 2 + margin) {
+        say("iq: DMA wrapped %u bytes past the end\n", (unsigned)(s_got - samples * 2 - margin));
+        err = ESP_ERR_INVALID_SIZE;
+    }
     if (err == ESP_OK) {
         esp_cache_msync(s_buf, samples * 2, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         s_len = samples;
@@ -147,7 +159,7 @@ static void pick_edge(void)
     const parlio_sample_edge_t edges[] = {PARLIO_SAMPLE_EDGE_POS, PARLIO_SAMPLE_EDGE_NEG};
     uint32_t r[2];
     for (int e = 0; e < 2; ++e) {
-        esp_err_t err = capture(PROBE_SAMPLES, edges[e]);
+        esp_err_t err = capture(s_psram, PROBE_SAMPLES, edges[e]);
         if (err != ESP_OK) {
             say("iq: capture failed, %s\n", esp_err_to_name(err));
             return;
@@ -193,10 +205,10 @@ static bool start_c5(const char *channel)
 
 void iq_command(int argc, char **argv)
 {
-    if (!s_buf) {
-        s_buf = heap_caps_aligned_calloc(128, 1, CAPTURE_BYTES + MARGIN_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!s_psram) {
+        s_psram = heap_caps_aligned_calloc(128, 1, CAPTURE_BYTES + PSRAM_MARGIN_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
         s_full = xSemaphoreCreateBinary();
-        if (!s_buf) {
+        if (!s_psram) {
             say("iq: no memory\n");
             return;
         }
@@ -210,12 +222,26 @@ void iq_command(int argc, char **argv)
         pick_edge();
     } else if (strcmp(sub, "dump") == 0) {
         dump();
+    } else if (strcmp(sub, "sram") == 0) {
+        if (!s_sram) {
+            size_t bytes = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) - 64 * 1024;
+            bytes &= ~(size_t)127;
+            s_sram = heap_caps_aligned_calloc(128, 1, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            if (!s_sram) {
+                say("iq: no internal memory\n");
+                return;
+            }
+            s_sram_samples = (bytes - MARGIN_BYTES) / 2;
+        }
+        esp_err_t err = capture(s_sram, s_sram_samples, s_edge);
+        if (err == ESP_OK) stats();
+        else say("iq: capture failed, %s\n", esp_err_to_name(err));
     } else if (strcmp(sub, "") == 0 || atoi(sub) > 0) {
         size_t n = atoi(sub) > 0 && atoi(sub) < CAPTURE_SAMPLES ? atoi(sub) : CAPTURE_SAMPLES;
-        esp_err_t err = capture(n, s_edge);
+        esp_err_t err = capture(s_psram, n, s_edge);
         if (err == ESP_OK) stats();
         else say("iq: capture failed, %s\n", esp_err_to_name(err));
     } else {
-        say("iq [samples | start [channel] | edge | dump]\n");
+        say("iq [samples | sram | start [channel] | edge | dump]\n");
     }
 }

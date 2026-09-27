@@ -1,8 +1,9 @@
 """Capture I/Q from the P4 console and look at it offline.
 
-    iq.py capture out.bin      capture two fields on the P4 and save the raw words
+    iq.py capture out.bin [sram] capture two fields (or what fits in internal RAM) and save the raw words
     iq.py lanes in.bin         per-lane toggle rates and I/Q statistics
     iq.py field in.bin out.png FM-demodulate and draw the samples as NTSC lines
+    iq.py gaps in.bin          find hsync spacings that aren't whole lines, which mean lost samples
 
 Needs numpy, pillow and pyserial.
 """
@@ -40,9 +41,9 @@ def run(s, cmd, until, timeout):
     return out
 
 
-def capture(path):
+def capture(path, cmd="iq"):
     s = console()
-    text = run(s, "iq", b"\n> ", 5).decode(errors="replace")
+    text = run(s, cmd, b"\n> ", 5).decode(errors="replace")
     print(text.strip())
     out = run(s, "iq dump", b"-----END IQ-----", 30)
     head = out.index(b"-----BEGIN IQ ")
@@ -102,11 +103,50 @@ def field(path, png):
     print(f"{nlines} lines, levels {lo / 1e6:.2f}..{hi / 1e6:.2f} MHz, saved {png}")
 
 
+def lut_demod(w, i, q):
+    """The firmware's demodulator: 14-bit I/Q index to 8-bit phase, DC removed, every 3rd sample."""
+    k = np.arange(1 << 14)
+
+    def s7(x):
+        x = x & 0x7F
+        return np.where(x >= 64, x - 128, x) * 2 + 1
+
+    lut = (np.round(np.arctan2(s7(k >> 7) - q.mean(), s7(k) - i.mean()) / (2 * np.pi) * 256) % 256).astype(np.uint8)
+    p = lut[((w >> 1) & 0x7F) | (((w >> 9) & 0x7F) << 7)][::3].astype(np.int32)
+    return (((p[1:] - p[:-1] + 128) % 256) - 128) * (RATE / 3) / 256
+
+
+def gaps(path):
+    w, i, q = load(path)
+    f = lut_demod(w, i, q)
+    fs = RATE / 3
+    line = LINE * fs
+    s = np.convolve(f, np.ones(6) / 6, "same")
+    tip = np.percentile(s, 2)
+    blank = np.median(s[(s > tip + 1e6) & (s < tip + 3e6)])
+    low = s < (tip + blank) / 2
+    starts = np.flatnonzero(low[1:] & ~low[:-1]) + 1
+    ends = np.flatnonzero(~low[1:] & low[:-1]) + 1
+    ends = ends[np.searchsorted(ends, starts[0]) :]
+    n = min(len(starts), len(ends))
+    width = (ends[:n] - starts[:n]) / fs
+    hs = starts[:n][(width > 3.5e-6) & (width < 6e-6)].astype(float)
+    r = np.diff(hs) / line
+    off = np.abs(r - np.round(r))
+    bad = np.flatnonzero((off > 0.03) & (np.round(r) >= 1) & (np.round(r) <= 3))
+    print(f"sync tip {tip / 1e6:.2f} MHz, blanking {blank / 1e6:.2f} MHz, {len(hs)} hsyncs over {len(f) / line:.0f} lines")
+    print(f"{len(bad)} spacings off the line grid")
+    for b in bad[:20]:
+        print(f"  byte {int(hs[b] * 6)}: {r[b]:.3f} lines")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "capture":
-        capture(sys.argv[2])
+        capture(sys.argv[2], " ".join(["iq"] + sys.argv[3:]))
     elif cmd == "lanes":
         lanes(sys.argv[2])
+    elif cmd == "gaps":
+        gaps(sys.argv[2])
     elif cmd == "field":
         field(sys.argv[2], sys.argv[3])
