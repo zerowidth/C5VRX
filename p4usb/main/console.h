@@ -15,3 +15,5 @@ void console_feed(uint8_t c);
 void console_reboot(bool download);
 size_t uart_read_some(uart_port_t port, uint8_t *buf, size_t len, uint32_t timeout_ms);
 size_t host_read(uint8_t *buf, size_t len, uint32_t timeout_ms);
+/* The UART console runs at the bridge's baud rate; the USB console has none. */
+bool host_is_uart(void);

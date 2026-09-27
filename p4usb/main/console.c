@@ -15,6 +15,7 @@
 #include "c5.h"
 #include "census.h"
 #include "link.h"
+#include "usb.h"
 #include "video.h"
 #include "wires.h"
 
@@ -69,14 +70,25 @@ static void cmd_help(int argc, char **argv)
     }
 }
 
+typedef enum { FROM_ANY, FROM_UART, FROM_USB } source_t;
+
+/* Replies go where the last input came from; until then, to both. */
+static volatile source_t s_source;
+
 void console_init(void)
 {
     ESP_ERROR_CHECK(uart_driver_install(HOST_UART, 4096, 4096, 0, NULL, 0));
 }
 
+bool host_is_uart(void)
+{
+    return s_source == FROM_UART;
+}
+
 void host_write(const void *data, size_t len)
 {
-    uart_write_bytes(HOST_UART, data, len);
+    if (s_source != FROM_UART) usb_console_write(data, len);
+    if (s_source != FROM_USB) uart_write_bytes(HOST_UART, data, len);
 }
 
 void say(const char *fmt, ...)
@@ -103,7 +115,14 @@ size_t uart_read_some(uart_port_t port, uint8_t *buf, size_t len, uint32_t timeo
 
 size_t host_read(uint8_t *buf, size_t len, uint32_t timeout_ms)
 {
-    return uart_read_some(HOST_UART, buf, len, timeout_ms);
+    size_t n = uart_read_some(HOST_UART, buf, len, 0);
+    if (n) {
+        s_source = FROM_UART;
+        return n;
+    }
+    n = usb_console_read(buf, len, timeout_ms);
+    if (n) s_source = FROM_USB;
+    return n;
 }
 
 static void run_line(char *line)

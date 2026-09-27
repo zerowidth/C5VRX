@@ -80,8 +80,10 @@ static uint32_t le32(const uint8_t *p)
 
 static void set_baud(uint32_t baud)
 {
-    uart_wait_tx_done(HOST_UART, pdMS_TO_TICKS(50));
-    uart_set_baudrate(HOST_UART, baud);
+    if (host_is_uart()) {
+        uart_wait_tx_done(HOST_UART, pdMS_TO_TICKS(50));
+        uart_set_baudrate(HOST_UART, baud);
+    }
     uart_set_baudrate(C5_UART, baud);
     s_baud = baud;
     s_settle_until_us = esp_timer_get_time() + SETTLE_US;
