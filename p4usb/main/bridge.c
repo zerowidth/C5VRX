@@ -2,14 +2,12 @@
 
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
 #include "c5.h"
 #include "console.h"
-#include "pins.h"
 
 /* esptool's first SYNC frame starts with these bytes: SLIP end, then command 0x08. */
 static const uint8_t SYNC_PREFIX[] = {0xc0, 0x00, 0x08, 0x24, 0x00};
@@ -94,26 +92,10 @@ bool bridge_active(void)
     return s_active;
 }
 
-static void attach_tx(void)
-{
-    ESP_ERROR_CHECK(uart_set_pin(C5_UART, PIN_C5_TX, PIN_C5_RX, UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE));
-    /* Open-drain, so a C5 that is already running its app can't fight the P4.
-     * gpio_set_direction would unroute the UART signal, so only flip the driver. */
-    gpio_od_enable(PIN_C5_TX);
-    gpio_set_pull_mode(PIN_C5_TX, GPIO_PULLUP_ONLY);
-}
-
-static void detach_tx(void)
-{
-    gpio_set_direction(PIN_C5_TX, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(PIN_C5_TX, GPIO_FLOATING);
-}
-
 static void start(void)
 {
     c5_download();
-    attach_tx();
+    c5_tx_attach();
     s_answered = false;
     s_rebooted = false;
     s_junk = 0;
@@ -130,7 +112,7 @@ static void start(void)
 static void stop(const char *why)
 {
     s_active = false;
-    detach_tx();
+    c5_tx_detach();
     if (s_baud != BRIDGE_BAUD) set_baud(BRIDGE_BAUD);
     say("\nbridge: %s\n> ", why);
 }

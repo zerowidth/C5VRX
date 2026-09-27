@@ -38,7 +38,7 @@ static const command_t s_commands[] = {
     {"info", cmd_info, "chip revision, uptime and bridge counters"},
     {"census", census_run, "read every C5-facing pin with pull-down, then pull-up"},
     {"wires", wires_run, "reset the C5 and check its walking-ones boot test lane by lane"},
-    {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART"},
+    {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},
 };
 
 static void cmd_help(int argc, char **argv)
