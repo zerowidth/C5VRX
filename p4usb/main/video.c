@@ -19,7 +19,7 @@
 #define JPEG_SLOT_BYTES (128 * 1024)
 /* Room in front of the encoder's output for a COM segment; a multiple of the cache line. */
 #define HEAD_ROOM 128
-#define JPEG_QUALITY 80
+#define JPEG_QUALITY 70
 #define TEXT_SCALE 3
 #define MARKER 24
 
@@ -47,6 +47,7 @@ static TaskHandle_t s_task;
 
 static uint32_t s_frames;
 static uint32_t s_errors;
+static esp_err_t s_last_error;
 static uint32_t s_render_us;
 static uint32_t s_encode_us;
 static uint32_t s_fps_tenths;
@@ -144,8 +145,10 @@ static void encode(const uint8_t *raw, uint32_t seq, int64_t t_us)
     slot_t *s = &s_slots[w];
     uint8_t *out = s->base + HEAD_ROOM;
     uint32_t len = 0;
-    if (jpeg_encoder_process(s_enc, &cfg, raw, s_raw_size, out, s->cap - HEAD_ROOM, &len) != ESP_OK) {
+    esp_err_t err = jpeg_encoder_process(s_enc, &cfg, raw, s_raw_size, out, s->cap - HEAD_ROOM, &len);
+    if (err != ESP_OK) {
         ++s_errors;
+        s_last_error = err;
         return;
     }
     const uint8_t *jpeg = add_comment(out, &len, seq, t_us);
@@ -300,8 +303,9 @@ void video_command(int argc, char **argv)
         grab();
         return;
     }
-    say("%lu frames at %lu.%lu fps, %lu errors\n", (unsigned long)s_frames, (unsigned long)(s_fps_tenths / 10),
+    say("%lu frames at %lu.%lu fps, %lu errors", (unsigned long)s_frames, (unsigned long)(s_fps_tenths / 10),
         (unsigned long)(s_fps_tenths % 10), (unsigned long)s_errors);
+    say(s_errors ? " (last %s)\n" : "\n", esp_err_to_name(s_last_error));
     say("render %lu us, encode %lu us, jpeg %u bytes\n", (unsigned long)s_render_us,
         (unsigned long)s_encode_us, (unsigned)newest_len());
     uvc_info();
