@@ -189,7 +189,8 @@ void c5_command(int argc, char **argv)
             strlcat(cmd, argv[i], sizeof cmd);
         }
         char reply[96];
-        c5_request(cmd, reply, sizeof reply, 1000);
+        /* Starting the radio takes about a second. */
+        c5_request(cmd, reply, sizeof reply, 5000);
         say("%s\n", reply);
         return;
     } else {

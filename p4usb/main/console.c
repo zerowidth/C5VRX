@@ -14,6 +14,7 @@
 #include "bridge.h"
 #include "c5.h"
 #include "census.h"
+#include "iq.h"
 #include "link.h"
 #include "usb.h"
 #include "video.h"
@@ -33,8 +34,16 @@ static void cmd_info(int argc, char **argv)
 {
     esp_chip_info_t chip;
     esp_chip_info(&chip);
-    say("p4usb rev v%d.%d uptime %lld ms\n", chip.revision / 100, chip.revision % 100,
-        esp_timer_get_time() / 1000);
+    static const char *const reasons[] = {
+        [ESP_RST_POWERON] = "power-on", [ESP_RST_SW] = "restart",      [ESP_RST_PANIC] = "panic",
+        [ESP_RST_INT_WDT] = "interrupt watchdog", [ESP_RST_TASK_WDT] = "task watchdog",
+        [ESP_RST_WDT] = "watchdog", [ESP_RST_BROWNOUT] = "brownout",
+    };
+    esp_reset_reason_t r = esp_reset_reason();
+    const char *reason = r < sizeof reasons / sizeof reasons[0] && reasons[r] ? reasons[r] : "other";
+    /* The panic dump itself only reaches the USB-C, so name the cause here. */
+    say("p4usb rev v%d.%d uptime %lld ms, last reset: %s (%d)\n", chip.revision / 100, chip.revision % 100,
+        esp_timer_get_time() / 1000, reason, (int)r);
     bridge_info();
 }
 
@@ -58,6 +67,7 @@ static const command_t s_commands[] = {
     {"census", census_run, "read every C5-facing pin with pull-down, then pull-up"},
     {"wires", wires_run, "reset the C5 and check its walking-ones boot test lane by lane"},
     {"link", link_run, "clocked counter test on each side's lanes, optionally at one MHz"},
+    {"iq", iq_command, "capture two fields of I/Q; start [channel] tunes the C5 and picks a clock edge; dump sends the capture"},
     {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64"},
     {"reboot", cmd_reboot, "restart the P4; reboot download enters its ROM loader"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},

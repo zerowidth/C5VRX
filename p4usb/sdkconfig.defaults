@@ -13,3 +13,6 @@ CONFIG_FREERTOS_HZ=1000
 # Frame and JPEG buffers live in the in-package PSRAM.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
+
+# The console runs here, and a PARLIO RX receive puts 16 bytes per 4 KB of buffer on the caller's stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
