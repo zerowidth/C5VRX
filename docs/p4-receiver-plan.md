@@ -276,7 +276,7 @@ The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset
 - `wires` resets the C5 and checks the walking-ones test that `c5rx` runs at boot, naming any lane that lands on the wrong P4 pin.
 - `info` shows the P4's chip revision, uptime and bridge counters.
 
-The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways at a fixed 115200 until the C5 reboots (esptool's `--after watchdog-reset`), the C5 fails to answer for 2 s, or both sides are silent for 30 s. esptool runs with `--before no-reset -b 115200`, which the Rake tasks pass.
+The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways, starting at 115200. When the C5 acknowledges esptool's baud-change command, the P4 switches both UARTs to the new rate. The session ends when the C5 reboots (esptool's `--after watchdog-reset`, seen as bytes outside any SLIP frame), when the C5 fails to answer for 2 s, or after 30 s of silence in both directions. Both UARTs then return to 115200. esptool runs with `--before no-reset`, which the Rake tasks pass along with `-b 921600` (override with `BAUD=`).
 
 Verified on the hardware:
 

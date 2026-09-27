@@ -5,6 +5,8 @@
 
 #include "driver/uart.h"
 
+#define HOST_UART UART_NUM_0
+
 void console_init(void);
 void host_write(const void *data, size_t len);
 void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

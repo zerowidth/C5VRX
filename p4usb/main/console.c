@@ -14,7 +14,6 @@
 #include "census.h"
 #include "wires.h"
 
-#define HOST_UART UART_NUM_0
 #define MAX_ARGS 8
 
 typedef struct {

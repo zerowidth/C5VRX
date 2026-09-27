@@ -49,9 +49,12 @@ static void relay_task(void *arg)
     for (;;) {
         size_t n = uart_read_some(C5_UART, buf, sizeof buf, 20);
         if (n == 0) continue;
-        bridge_c5_bytes(buf, n);
-        if (s_log || bridge_active()) host_write(buf, n);
-        if (!bridge_active()) split_lines(buf, n);
+        if (bridge_active()) {
+            bridge_c5_bytes(buf, n);
+            continue;
+        }
+        if (s_log) host_write(buf, n);
+        split_lines(buf, n);
     }
 }
 

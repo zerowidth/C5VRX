@@ -44,9 +44,9 @@ def local_idf(dir, *cmd)
 end
 
 # esptool against the C5 through the p4usb bridge, which resets the C5 into
-# download mode when it sees esptool's SYNC and only forwards at 115200.
+# download mode when it sees esptool's SYNC and follows esptool's baud change.
 def c5_via_p4(dir, *args)
-  local_idf dir, "esptool", "--chip", "esp32c5", "-p", serial_port, "-b", "115200",
+  local_idf dir, "esptool", "--chip", "esp32c5", "-p", serial_port, "-b", ENV.fetch("BAUD", "921600"),
             "--before", "no-reset", "--after", "watchdog-reset", *args
 end
 
