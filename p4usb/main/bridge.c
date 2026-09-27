@@ -15,11 +15,14 @@ static const uint8_t SYNC_PREFIX[] = {0xc0, 0x00, 0x08, 0x24, 0x00};
 static const char ROM_BANNER[] = "ESP-ROM:";
 /* Long enough for a whole-chip erase, which is silent in both directions. */
 #define IDLE_US (30 * 1000 * 1000)
+/* esptool gives up after a few seconds, so an unanswered session should not hold the console. */
+#define ANSWER_US (2 * 1000 * 1000)
 
 static volatile bool s_active;
 static volatile bool s_answered;
 static volatile bool s_rebooted;
 static volatile int64_t s_last_us;
+static int64_t s_start_us;
 static size_t s_sync_match;
 static uint32_t s_sessions;
 static volatile uint32_t s_to_c5;
@@ -54,7 +57,7 @@ static void start(void)
     s_answered = false;
     s_rebooted = false;
     s_banner_match = 0;
-    s_last_us = esp_timer_get_time();
+    s_start_us = s_last_us = esp_timer_get_time();
     s_to_c5 = 0;
     s_from_c5 = 0;
     ++s_sessions;
@@ -112,6 +115,8 @@ void bridge_poll(void)
     if (!s_active) return;
     if (s_rebooted) {
         stop("C5 rebooted");
+    } else if (!s_answered && esp_timer_get_time() - s_start_us > ANSWER_US) {
+        stop("C5 did not answer SYNC");
     } else if (esp_timer_get_time() - s_last_us > IDLE_US) {
         c5_run();
         stop("idle, C5 reset to run");
