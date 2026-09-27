@@ -15,9 +15,10 @@
 
 #include "c5.h"
 #include "console.h"
+#include "decode.h"
 #include "pins.h"
 
-#define IQ_HZ 40000000
+#define BUS_HZ 80000000
 /* Two NTSC fields, so a whole field is in every capture. */
 #define CAPTURE_SAMPLES (1400 * 1000)
 #define CAPTURE_BYTES (CAPTURE_SAMPLES * 2)
@@ -38,6 +39,8 @@ static size_t s_sram_samples;
 static uint16_t *s_buf;
 static size_t s_len;
 static parlio_sample_edge_t s_edge = PARLIO_SAMPLE_EDGE_POS;
+/* The C5 keeps one of every s_every samples of its 80 MS/s bus. */
+static int s_every = 2;
 static SemaphoreHandle_t s_full;
 static size_t s_want;
 static size_t s_got;
@@ -51,18 +54,15 @@ static bool IRAM_ATTR on_partial(parlio_rx_unit_handle_t rx, const parlio_rx_eve
     return woken == pdTRUE;
 }
 
-/* Same line map as the link test: I in the low byte, Q in the high byte, lines 0 and 8 at 1. */
-static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edge)
+esp_err_t iq_new_rx(size_t max_recv_size, parlio_rx_unit_handle_t *ret)
 {
-    s_buf = buf;
-    const size_t margin = buf == s_psram ? PSRAM_MARGIN_BYTES : MARGIN_BYTES;
     parlio_rx_unit_config_t cfg = {
         .trans_queue_depth = 1,
-        .max_recv_size = samples * 2 + margin,
+        .max_recv_size = max_recv_size,
         .data_width = 16,
         .clk_src = PARLIO_CLK_SRC_EXTERNAL,
-        .ext_clk_freq_hz = IQ_HZ,
-        .exp_clk_freq_hz = IQ_HZ,
+        .ext_clk_freq_hz = BUS_HZ / s_every,
+        .exp_clk_freq_hz = BUS_HZ / s_every,
         .clk_in_gpio_num = BUS_WIRES[0].p4,
         .clk_out_gpio_num = -1,
         .valid_gpio_num = -1,
@@ -73,14 +73,24 @@ static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edg
         cfg.data_gpio_nums[k] = BUS_WIRES[15 - k].p4;
         cfg.data_gpio_nums[8 + k] = BUS_WIRES[8 - k].p4;
     }
-    parlio_rx_unit_handle_t rx = NULL;
-    parlio_rx_delimiter_handle_t delim = NULL;
-    esp_err_t err = parlio_new_rx_unit(&cfg, &rx);
+    esp_err_t err = parlio_new_rx_unit(&cfg, ret);
     if (err != ESP_OK) return err;
     for (int k = 0; k < 16; k += 8) {
         esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT,
                                        soc_parlio_signals[0].rx_units[0].data_sigs[k], false);
     }
+    return ESP_OK;
+}
+
+/* Same line map as the link test: I in the low byte, Q in the high byte, lines 0 and 8 at 1. */
+static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edge)
+{
+    s_buf = buf;
+    const size_t margin = buf == s_psram ? PSRAM_MARGIN_BYTES : MARGIN_BYTES;
+    parlio_rx_unit_handle_t rx = NULL;
+    parlio_rx_delimiter_handle_t delim = NULL;
+    esp_err_t err = iq_new_rx(samples * 2 + margin, &rx);
+    if (err != ESP_OK) return err;
     const parlio_rx_soft_delimiter_config_t dcfg = {
         .sample_edge = edge,
         .bit_pack_order = PARLIO_BIT_PACK_ORDER_LSB,
@@ -154,7 +164,7 @@ static void stats(void)
     if (bad_ones) say("constant-1 lines read low %lu times\n", (unsigned long)bad_ones);
 }
 
-static void pick_edge(void)
+static bool pick_edge(void)
 {
     const parlio_sample_edge_t edges[] = {PARLIO_SAMPLE_EDGE_POS, PARLIO_SAMPLE_EDGE_NEG};
     uint32_t r[2];
@@ -162,7 +172,7 @@ static void pick_edge(void)
         esp_err_t err = capture(s_psram, PROBE_SAMPLES, edges[e]);
         if (err != ESP_OK) {
             say("iq: capture failed, %s\n", esp_err_to_name(err));
-            return;
+            return false;
         }
         r[e] = roughness(PROBE_SAMPLES);
     }
@@ -170,6 +180,7 @@ static void pick_edge(void)
     say("roughness rise %lu.%02lu, fall %lu.%02lu: using %s\n", (unsigned long)(r[0] / 100),
         (unsigned long)(r[0] % 100), (unsigned long)(r[1] / 100), (unsigned long)(r[1] % 100),
         s_edge == PARLIO_SAMPLE_EDGE_POS ? "rise" : "fall");
+    return true;
 }
 
 /* Raw little-endian words between text markers, so a host script can cut them out of the console. */
@@ -184,15 +195,35 @@ static void dump(void)
     say("\n-----END IQ-----\n");
 }
 
-static bool start_c5(const char *channel)
+static bool prepare(void)
 {
+    if (!s_psram) {
+        s_psram = heap_caps_aligned_calloc(128, 1, CAPTURE_BYTES + PSRAM_MARGIN_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        s_full = xSemaphoreCreateBinary();
+        if (!s_psram) {
+            say("iq: no memory\n");
+            return false;
+        }
+    }
+    /* Lines 0 and 8 have no pin, which the driver warns about on every capture. */
+    esp_log_level_set("parlio", ESP_LOG_ERROR);
+    return true;
+}
+
+bool iq_start(const char *channel, int every)
+{
+    if (!prepare()) return false;
     char cmd[24], reply[96];
+    decode_stop();
     if (!c5_run_c5rx(2000)) {
         say("iq: c5rx did not start\n");
         return false;
     }
     snprintf(cmd, sizeof cmd, "tune %s", channel);
-    const char *steps[] = {cmd, "iq on"};
+    char iq_on[16];
+    snprintf(iq_on, sizeof iq_on, "iq on %d", every);
+    s_every = every;
+    const char *steps[] = {cmd, iq_on};
     for (int i = 0; i < 2; ++i) {
         if (!c5_request(steps[i], reply, sizeof reply, 5000)) {
             say("iq: %s: %s\n", steps[i], reply);
@@ -200,24 +231,22 @@ static bool start_c5(const char *channel)
         }
         say("%s\n", reply);
     }
-    return true;
+    return pick_edge();
+}
+
+parlio_sample_edge_t iq_edge(void)
+{
+    return s_edge;
 }
 
 void iq_command(int argc, char **argv)
 {
-    if (!s_psram) {
-        s_psram = heap_caps_aligned_calloc(128, 1, CAPTURE_BYTES + PSRAM_MARGIN_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-        s_full = xSemaphoreCreateBinary();
-        if (!s_psram) {
-            say("iq: no memory\n");
-            return;
-        }
-    }
-    /* Lines 0 and 8 have no pin, which the driver warns about on every capture. */
-    esp_log_level_set("parlio", ESP_LOG_ERROR);
+    if (!prepare()) return;
     const char *sub = argc > 1 ? argv[1] : "";
+    /* The decoder owns the one PARLIO RX unit while it runs. */
+    if (strcmp(sub, "dump") != 0) decode_stop();
     if (strcmp(sub, "start") == 0) {
-        if (start_c5(argc > 2 ? argv[2] : "R3")) pick_edge();
+        iq_start(argc > 2 ? argv[2] : "R3", argc > 3 ? atoi(argv[3]) : 2);
     } else if (strcmp(sub, "edge") == 0) {
         pick_edge();
     } else if (strcmp(sub, "dump") == 0) {
@@ -242,6 +271,6 @@ void iq_command(int argc, char **argv)
         if (err == ESP_OK) stats();
         else say("iq: capture failed, %s\n", esp_err_to_name(err));
     } else {
-        say("iq [samples | sram | start [channel] | edge | dump]\n");
+        say("iq [samples | sram | start [channel [every]] | edge | dump]\n");
     }
 }

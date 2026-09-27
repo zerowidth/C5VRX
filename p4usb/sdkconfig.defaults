@@ -16,3 +16,6 @@ CONFIG_SPIRAM_SPEED_200M=y
 
 # The console runs here, and a PARLIO RX receive puts 16 bytes per 4 KB of buffer on the caller's stack.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
+
+# The decoder's per-sample loop needs optimized code.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

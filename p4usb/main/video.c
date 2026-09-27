@@ -37,19 +37,28 @@ static uint32_t s_taken[VIDEO_READERS];
 static SemaphoreHandle_t s_published;
 static uint8_t *s_raw;
 static size_t s_raw_size;
+/* The decoder fills one while the encoder reads the other. */
+static uint8_t *s_field[2];
+static int s_fill;
+static volatile int s_ready = -1;
+static int64_t s_last_field_us;
 static jpeg_encoder_handle_t s_enc;
 static TaskHandle_t s_task;
 
 static uint32_t s_frames;
-static uint32_t s_late;
 static uint32_t s_errors;
 static uint32_t s_render_us;
 static uint32_t s_encode_us;
 static uint32_t s_fps_tenths;
 
+#define NOTIFY_TICK 1
+#define NOTIFY_FIELD 2
+/* Without a decoded field for this long, the test pattern takes over. */
+#define PATTERN_AFTER_US (100 * 1000)
+
 static void tick(void *arg)
 {
-    xTaskNotifyGive(s_task);
+    xTaskNotify(s_task, NOTIFY_TICK, eSetBits);
 }
 
 static int writable_slot(void)
@@ -88,7 +97,7 @@ static void render(uint32_t seq)
     snprintf(lines[4], sizeof lines[4], "jpeg   %u bytes", (unsigned)newest_len());
     snprintf(lines[5], sizeof lines[5], "encode %lu us", (unsigned long)s_encode_us);
     snprintf(lines[6], sizeof lines[6], "usb    %lu sent %lu skip", (unsigned long)sent, (unsigned long)skipped);
-    snprintf(lines[7], sizeof lines[7], "late   %lu", (unsigned long)s_late);
+    snprintf(lines[7], sizeof lines[7], "video  no decoded fields");
     snprintf(lines[8], sizeof lines[8], "bridge %s", bridge_active() ? "active" : "idle");
 
     memset(s_raw, 0, s_raw_size);
@@ -122,7 +131,7 @@ static uint8_t *add_comment(uint8_t *jpeg, uint32_t *len, uint32_t seq, int64_t 
     return start;
 }
 
-static void encode(uint32_t seq, int64_t t_us)
+static void encode(const uint8_t *raw, uint32_t seq, int64_t t_us)
 {
     static const jpeg_encode_cfg_t cfg = {
         .width = VIDEO_WIDTH,
@@ -135,7 +144,7 @@ static void encode(uint32_t seq, int64_t t_us)
     slot_t *s = &s_slots[w];
     uint8_t *out = s->base + HEAD_ROOM;
     uint32_t len = 0;
-    if (jpeg_encoder_process(s_enc, &cfg, s_raw, s_raw_size, out, s->cap - HEAD_ROOM, &len) != ESP_OK) {
+    if (jpeg_encoder_process(s_enc, &cfg, raw, s_raw_size, out, s->cap - HEAD_ROOM, &len) != ESP_OK) {
         ++s_errors;
         return;
     }
@@ -152,14 +161,22 @@ static void video_task(void *arg)
     int64_t window_start = esp_timer_get_time();
     uint32_t window_frames = 0;
     for (;;) {
-        uint32_t ticks = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (ticks > 1) s_late += ticks - 1;
-
+        uint32_t bits = 0;
+        xTaskNotifyWait(0, UINT32_MAX, &bits, portMAX_DELAY);
         uint32_t seq = s_frames + 1;
         int64_t t0 = esp_timer_get_time();
-        render(seq);
+        const uint8_t *raw;
+        if (bits & NOTIFY_FIELD) {
+            raw = s_field[s_ready];
+            s_last_field_us = t0;
+        } else if (t0 - s_last_field_us > PATTERN_AFTER_US) {
+            render(seq);
+            raw = s_raw;
+        } else {
+            continue;
+        }
         int64_t t1 = esp_timer_get_time();
-        encode(seq, t0);
+        encode(raw, seq, t0);
         int64_t t2 = esp_timer_get_time();
         s_render_us = t1 - t0;
         s_encode_us = t2 - t1;
@@ -183,6 +200,10 @@ void video_init(void)
     const jpeg_encode_memory_alloc_cfg_t out = {.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER};
     s_raw = jpeg_alloc_encoder_mem(VIDEO_WIDTH * VIDEO_HEIGHT, &in, &s_raw_size);
     assert(s_raw);
+    for (int i = 0; i < 2; ++i) {
+        s_field[i] = jpeg_alloc_encoder_mem(VIDEO_WIDTH * VIDEO_HEIGHT, &in, &s_raw_size);
+        assert(s_field[i]);
+    }
     for (int i = 0; i < JPEG_SLOTS; ++i) {
         s_slots[i].base = jpeg_alloc_encoder_mem(JPEG_SLOT_BYTES, &out, &s_slots[i].cap);
         assert(s_slots[i].base);
@@ -194,6 +215,18 @@ void video_init(void)
     esp_timer_handle_t h;
     ESP_ERROR_CHECK(esp_timer_create(&timer, &h));
     ESP_ERROR_CHECK(esp_timer_start_periodic(h, 1000000 / VIDEO_FPS));
+}
+
+uint8_t *video_field_buffer(void)
+{
+    return s_field[s_fill];
+}
+
+void video_field_done(void)
+{
+    s_ready = s_fill;
+    s_fill ^= 1;
+    xTaskNotify(s_task, NOTIFY_FIELD, eSetBits);
 }
 
 static bool take(video_reader_t who, video_frame_t *f, bool only_new)
@@ -267,9 +300,8 @@ void video_command(int argc, char **argv)
         grab();
         return;
     }
-    say("%lu frames at %lu.%lu fps, %lu late, %lu errors\n", (unsigned long)s_frames,
-        (unsigned long)(s_fps_tenths / 10), (unsigned long)(s_fps_tenths % 10), (unsigned long)s_late,
-        (unsigned long)s_errors);
+    say("%lu frames at %lu.%lu fps, %lu errors\n", (unsigned long)s_frames, (unsigned long)(s_fps_tenths / 10),
+        (unsigned long)(s_fps_tenths % 10), (unsigned long)s_errors);
     say("render %lu us, encode %lu us, jpeg %u bytes\n", (unsigned long)s_render_us,
         (unsigned long)s_encode_us, (unsigned)newest_len());
     uvc_info();
