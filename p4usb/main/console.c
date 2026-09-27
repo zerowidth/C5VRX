@@ -6,8 +6,10 @@
 
 #include "driver/uart.h"
 #include "esp_chip_info.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "soc/lp_system_reg.h"
 
 #include "bridge.h"
 #include "c5.h"
@@ -35,6 +37,20 @@ static void cmd_info(int argc, char **argv)
     bridge_info();
 }
 
+void console_reboot(bool download)
+{
+    /* The ROM loader then listens on UART0 and the high-speed USB port. */
+    if (download) REG_SET_BIT(LP_SYSTEM_REG_SYS_CTRL_REG, LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT);
+    esp_restart();
+}
+
+static void cmd_reboot(int argc, char **argv)
+{
+    say("rebooting\n");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    console_reboot(argc > 1 && strcmp(argv[1], "download") == 0);
+}
+
 static const command_t s_commands[] = {
     {"help", cmd_help, "list commands"},
     {"info", cmd_info, "chip revision, uptime and bridge counters"},
@@ -42,6 +58,7 @@ static const command_t s_commands[] = {
     {"wires", wires_run, "reset the C5 and check its walking-ones boot test lane by lane"},
     {"link", link_run, "clocked counter test on each side's lanes, optionally at one MHz"},
     {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64"},
+    {"reboot", cmd_reboot, "restart the P4; reboot download enters its ROM loader"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},
 };
 
