@@ -37,7 +37,7 @@
 #define SELECTOR_MASK 0x01fe0000u
 
 #define DEFAULT_GAIN 52
-#define IQ_CLOCK_HZ 40000000
+#define BUS_HZ 80000000
 #define CLOCK_PATTERN_BYTES 64
 
 extern int lmac_stop_hw_txq(void);
@@ -236,7 +236,7 @@ bool radio_noise_floor(int *dbm)
 }
 
 /* PARLIO TX with no data pins, looping, is a continuous clock from the same PLL as the modem. */
-static esp_err_t start_clock(void)
+static esp_err_t start_clock(uint32_t hz)
 {
     if (!s_clock_pattern) {
         s_clock_pattern = heap_caps_calloc(1, CLOCK_PATTERN_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -245,7 +245,7 @@ static esp_err_t start_clock(void)
     parlio_tx_unit_config_t cfg = {
         .clk_src = PARLIO_CLK_SRC_DEFAULT,
         .clk_in_gpio_num = -1,
-        .output_clk_freq_hz = IQ_CLOCK_HZ,
+        .output_clk_freq_hz = hz,
         .data_width = 8,
         .clk_out_gpio_num = LANES[LANE_CLK].gpio,
         .valid_gpio_num = -1,
@@ -262,8 +262,9 @@ static esp_err_t start_clock(void)
     return parlio_tx_unit_transmit(s_clock, s_clock_pattern, CLOCK_PATTERN_BYTES * 8, &tx);
 }
 
-esp_err_t radio_iq_start(int q_top, int i_top)
+esp_err_t radio_iq_start(int every, int q_top, int i_top)
 {
+    if (every < 2 || every > 16) return ESP_ERR_INVALID_ARG;
     if (!s_started) return ESP_ERR_INVALID_STATE;
     if (q_top < 6 || q_top > 31 || i_top < 6 || i_top > 31) return ESP_ERR_INVALID_ARG;
     radio_iq_stop();
@@ -276,7 +277,7 @@ esp_err_t radio_iq_start(int q_top, int i_top)
         esp_rom_gpio_connect_out_signal(q, MODEM_DIAG0_IDX + q_top - k, false, false);
         esp_rom_gpio_connect_out_signal(i, MODEM_DIAG0_IDX + i_top - k, false, false);
     }
-    esp_err_t err = start_clock();
+    esp_err_t err = start_clock(BUS_HZ / every);
     if (err != ESP_OK) radio_iq_stop();
     return err;
 }

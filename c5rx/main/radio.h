@@ -15,7 +15,8 @@ uint8_t radio_gain(void);
 /* Wideband RSSI and noise floor in dBm; false when the PHY gave an implausible value. */
 bool radio_rssi(int *dbm);
 bool radio_noise_floor(int *dbm);
-/* Drives MODEM_DIAG bits q_top..q_top-6 onto Q7..Q1 and i_top..i_top-6 onto I7..I1, with a 40 MHz clock
- * on GPIO 0. Q is DIAG 0-9 and I is DIAG 10-19, so 9 and 19 give the top 7 bits of each. */
-esp_err_t radio_iq_start(int q_top, int i_top);
+/* Drives MODEM_DIAG bits q_top..q_top-6 onto Q7..Q1 and i_top..i_top-6 onto I7..I1, with a clock on
+ * GPIO 0 that keeps one of every `every` samples of the 80 MS/s bus. Q is DIAG 0-9 and I is DIAG 10-19,
+ * so 9 and 19 give the top 7 bits of each. */
+esp_err_t radio_iq_start(int every, int q_top, int i_top);
 void radio_iq_stop(void);

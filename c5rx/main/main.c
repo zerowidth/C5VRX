@@ -73,11 +73,12 @@ static void run_command(char *line)
     } else if (strcmp(argv[0], "gain") == 0 && argc == 2) {
         radio_set_gain((uint8_t)atoi(argv[1]));
         reply("ok gain %u", radio_gain());
-    } else if (strcmp(argv[0], "iq") == 0 && (argc == 2 || argc == 4) && strcmp(argv[1], "on") == 0) {
+    } else if (strcmp(argv[0], "iq") == 0 && (argc == 2 || argc == 3 || argc == 5) && strcmp(argv[1], "on") == 0) {
         link_stop();
-        int q_top = argc == 4 ? atoi(argv[2]) : 9, i_top = argc == 4 ? atoi(argv[3]) : 19;
-        esp_err_t err = radio_iq_start(q_top, i_top);
-        if (err == ESP_OK) reply("ok iq on %d %d", q_top, i_top);
+        int every = argc >= 3 ? atoi(argv[2]) : 2;
+        int q_top = argc == 5 ? atoi(argv[3]) : 9, i_top = argc == 5 ? atoi(argv[4]) : 19;
+        esp_err_t err = radio_iq_start(every, q_top, i_top);
+        if (err == ESP_OK) reply("ok iq on %d %d %d", every, q_top, i_top);
         else reply("err %s", esp_err_to_name(err));
     } else if (strcmp(argv[0], "iq") == 0 && argc == 2 && strcmp(argv[1], "off") == 0) {
         radio_iq_stop();
