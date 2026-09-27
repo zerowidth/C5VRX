@@ -254,7 +254,7 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 
 - Does the camera capture 60 images per second, or 30 split across fields? Capture a moving scene and compare the two fields of one frame.
 - Can the P4 demodulate 7+7-bit I/Q at 40 MS/s with time left for decoding and encoding?
-- What is the maximum PARLIO RX external clock on the P4 through the GPIO matrix, and which clock edge gives margin?
+- The counter test passes at 40 MHz on either P4 clock edge but fails at 80 MHz, with one error every 16 samples on bits 5-7 of both sides. Is that the C5's PARLIO TX or the P4's RX? It matters only if the link ever runs faster than 40 MHz.
 - Each kept sample is valid for about 12.5 ns. How much of that window is left after the C5 and P4 GPIO matrices, wire skew and the low drive strength, and is the modem-to-divider phase the same on every boot? If the margin is thin, can the C5 output an 80 MHz clock so the P4 can choose which half-cycle to keep?
 
 ## Bring-up
@@ -272,8 +272,9 @@ The Rakefile builds both with the local ESP-IDF (`~/.espressif`):
 The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset, leaves every bus pin as an input, and keeps its TX to the C5 undriven, because other C5 firmware may drive GPIO 12 (the standalone receiver uses it for the DAC). Its console commands:
 
 - `census` reads every C5-facing pin with the P4's pull-down, then its pull-up, and reports each as floating, high, low or toggling. With the C5 in reset, every bus lane should float.
-- `c5 hold`, `c5 run` and `c5 dl` hold the C5 in reset, run it, or reset it into download mode. `c5 log on` relays the C5's UART to the console.
+- `c5 hold`, `c5 run` and `c5 dl` hold the C5 in reset, run it, or reset it into download mode. `c5 log on` relays the C5's UART to the console. `c5 send <command>` sends a line to `c5rx` and prints its `ok` or `err` reply; the P4 connects its TX only after `c5rx` prints `c5rx ready`.
 - `wires` resets the C5 and checks the walking-ones test that `c5rx` runs at boot, naming any lane that lands on the wrong P4 pin.
+- `link [MHz]` tests the clocked link. `c5rx` drives a 7-bit counter on one side's lanes (Q1-Q7, then I1-I7) from its 8-lane PARLIO TX, with the clock on GPIO 0. The P4 captures 16-bit words with PARLIO RX on the C5's clock at 10, 20, 40 and 80 MHz, on each edge, and checks every sample, the idle side, and the constant-1 lines 0 and 8.
 - `info` shows the P4's chip revision, uptime and bridge counters.
 
 The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways, starting at 115200. When the C5 acknowledges esptool's baud-change command, the P4 switches both UARTs to the new rate. The session ends when the C5 reboots (esptool's `--after watchdog-reset`, seen as bytes outside any SLIP frame), when the C5 fails to answer for 2 s, or after 30 s of silence in both directions. Both UARTs then return to 115200. esptool runs with `--before no-reset`, which the Rake tasks pass along with `-b 921600` (override with `BAUD=`).
@@ -284,11 +285,12 @@ Verified on the hardware:
 - EN and BOOT: the ROM reports `boot:0x18 (SPI_FAST_FLASH_BOOT)` after a normal reset and `boot:0x8 (DOWNLOAD(UART0/USB))` with BOOT held, so the P4's pins don't disturb the C5's straps.
 - UART both ways, and flashing the C5 through the bridge.
 - All 15 bus wires (clock and 14 I/Q lanes), with no opens, swaps or shorts.
+- The clocked link at 10, 20 and 40 MHz: no errors in 8,175 samples per side, on either P4 clock edge, with the idle side low and lines 0 and 8 held at 1. At 80 MHz it fails (see [Open questions](#open-questions)).
 
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
 2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video. Power, UART, EN and BOOT, bridged flashing and the wire check are done.
-3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline.
+3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline. The counter-pattern link check is done.
 4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside.
 5. Optional: microSD recording.
