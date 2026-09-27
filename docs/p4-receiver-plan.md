@@ -30,7 +30,7 @@ flowchart LR
 
 ## Power
 
-- The P4-Pico is powered through its high-speed USB connector (the bottom 4-pin MX1.25 JST), which feeds its VCC_5V rail directly. The top USB-C also powers it, through a power-path FET, so both can be plugged in at once.
+- The P4-Pico is powered through its high-speed USB connector (the bottom 4-pin MX1.25 JST), which feeds its VCC_5V rail directly. The top USB-C also powers it, through an ideal-diode FET (AO3401 driven by an MMDT3906 pair), so both can be plugged in at once. That FET stops the JST from back-feeding the USB-C, but JST pin 1 is tied straight to VCC_5V, so a USB-C supply that sits higher pushes current back into the JST host. Plug both into the same computer, not the USB-C into a charger.
 - The C5 takes 5V from the P4's VSYS pin (right header, row 2), which is the same VCC_5V net as JST pin 1. VSYS is at the far end of the P4, so this is one 7.5 cm wire, routed under the P4 alongside the USB lead. Neither board has a 5V pad near the JST, and splicing into the crimped JST lead is fragile. Do not use VBUS, which is the USB-C input before the power-path FET.
 - The C5's ground return is the clock-return wire from the P4's left row-18 GND to the C5's GND pad, plus a wire from a USB-C shell tab on the I side. At about 150 mA, 30 AWG over 3 cm drops under 2 mV, so no separate power ground is needed.
 - Do not power the C5 from its own USB while it is also fed from VSYS, unless the C5-Zero schematic shows a diode on its VBUS.
@@ -225,7 +225,7 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 - Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb.
 - Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, Espressif's `usb_device_uvc`).
 - Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
-- Offer 720×480 at 60 fps (one frame per field, deinterlaced) and at 30 fps (fields woven). 60 is the default for FPV. 720×480 at 60 fps is about 20 megapixels per second, within the JPEG encoder's limit.
+- Offer 720×480 at 60 fps (one frame per field, deinterlaced) and at 30 fps (fields woven). 60 is the default for FPV. The hardware encoder takes 3.5 ms for a 720×480 grayscale frame, well inside a 16.7 ms field.
 - Drive the OLED and buttons as described in [Controls and display](#controls-and-display).
 - Control the C5's EN and BOOT pins for reset, and bridge its UART0 so esptool on the host can reflash it (see [Bring-up](#bring-up)).
 - Optional standalone recording of MJPEG to microSD (roughly 3-4 MB/s).
@@ -276,8 +276,11 @@ The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset
 - `wires` resets the C5 and checks the walking-ones test that `c5rx` runs at boot, naming any lane that lands on the wrong P4 pin.
 - `link [MHz]` tests the clocked link. `c5rx` drives a 7-bit counter on one side's lanes (Q1-Q7, then I1-I7) from its 8-lane PARLIO TX, with the clock on GPIO 0. The P4 captures 16-bit words with PARLIO RX on the C5's clock at 10, 20, 40 and 80 MHz, on each edge, and checks every sample, the idle side, and the constant-1 lines 0 and 8.
 - `info` shows the P4's chip revision, uptime and bridge counters.
+- `video` shows the test-pattern pipeline's frame rate, render and encode times, JPEG size, and USB state. `video grab` prints the newest JPEG as base64 over the console, for checking frames without the high-speed port.
 
 The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways, starting at 115200. When the C5 acknowledges esptool's baud-change command, the P4 switches both UARTs to the new rate. The session ends when the C5 reboots (esptool's `--after watchdog-reset`, seen as bytes outside any SLIP frame), when the C5 fails to answer for 2 s, or after 30 s of silence in both directions. Both UARTs then return to 115200. esptool runs with `--before no-reset`, which the Rake tasks pass along with `-b 921600` (override with `BAUD=`).
+
+The P4 streams a test pattern as a UVC webcam on its high-speed port, named "C5VRX Receiver" (the video interface shows as "UVC CAM1", a string fixed in `usb_device_uvc`). A 60 fps timer renders status text on black into a 720×480 grayscale frame in PSRAM, with a sweeping block that shows dropped or repeated frames, and the hardware encoder writes it to one of three JPEG slots. One slot is being sent, one holds the newest frame and the encoder writes the third, so a slow or absent host drops frames and never stalls the producer. The pattern has one raw frame because rendering and encoding run back to back; the NTSC decoder will need two, so it can fill one while the encoder reads the other. `usb_device_uvc` pulls a frame every 16 ms (whole milliseconds), so it repeats about one frame in 25. macOS asks before a new USB accessory may connect, and the camera doesn't enumerate until that is allowed.
 
 Verified on the hardware:
 
@@ -286,11 +289,12 @@ Verified on the hardware:
 - UART both ways, and flashing the C5 through the bridge.
 - All 15 bus wires (clock and 14 I/Q lanes), with no opens, swaps or shorts.
 - The clocked link at 10, 20 and 40 MHz: no errors in 8,175 samples per side, on either P4 clock edge, with the idle side low and lines 0 and 8 held at 1. At 80 MHz it fails (see [Open questions](#open-questions)).
+- The test pattern at 60 fps: 6 ms to render, 3.5 ms to encode, about 40 KB per JPEG at quality 80, with no late frames. Over high-speed USB (480 Mb/s, bulk), ffmpeg received 585 distinct frames in 10 s.
 
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
 2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video. Power, UART, EN and BOOT, bridged flashing and the wire check are done.
 3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline. The counter-pattern link check is done.
-4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside.
+4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside. JPEG and UVC work with a test pattern; the serial port on the same cable is not done.
 5. Optional: microSD recording.
