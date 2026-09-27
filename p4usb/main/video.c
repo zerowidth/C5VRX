@@ -12,6 +12,7 @@
 #include "bridge.h"
 #include "console.h"
 #include "overlay.h"
+#include "uvc.h"
 
 /* One being sent, the newest finished, and one being encoded, so the producer never waits on USB. */
 #define JPEG_SLOTS 3
@@ -222,4 +223,5 @@ void video_command(int argc, char **argv)
         (unsigned long)s_errors, (unsigned long)s_acquired);
     say("render %lu us, encode %lu us, jpeg %u bytes\n", (unsigned long)s_render_us,
         (unsigned long)s_encode_us, (unsigned)newest_len());
+    uvc_info();
 }

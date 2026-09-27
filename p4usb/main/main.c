@@ -4,6 +4,7 @@
 #include "c5.h"
 #include "console.h"
 #include "pins.h"
+#include "uvc.h"
 #include "video.h"
 
 void app_main(void)
@@ -16,6 +17,7 @@ void app_main(void)
     console_init();
     c5_init();
     video_init();
+    uvc_init();
     say("\np4usb ready, C5 held in reset, type help\n> ");
 
     uint8_t buf[64];
