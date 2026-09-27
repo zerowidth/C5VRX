@@ -9,3 +9,4 @@ bool bridge_active(void);
 bool bridge_host_bytes(const uint8_t *buf, size_t n);
 void bridge_c5_bytes(const uint8_t *buf, size_t n);
 void bridge_poll(void);
+void bridge_info(void);

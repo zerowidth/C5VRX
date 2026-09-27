@@ -21,6 +21,9 @@ static volatile bool s_answered;
 static volatile bool s_rebooted;
 static volatile int64_t s_last_us;
 static size_t s_sync_match;
+static uint32_t s_sessions;
+static volatile uint32_t s_to_c5;
+static volatile uint32_t s_from_c5;
 static size_t s_banner_match;
 
 bool bridge_active(void)
@@ -52,6 +55,9 @@ static void start(void)
     s_rebooted = false;
     s_banner_match = 0;
     s_last_us = esp_timer_get_time();
+    s_to_c5 = 0;
+    s_from_c5 = 0;
+    ++s_sessions;
     s_active = true;
 }
 
@@ -68,6 +74,7 @@ bool bridge_host_bytes(const uint8_t *buf, size_t n)
     if (s_active) {
         s_last_us = esp_timer_get_time();
         uart_write_bytes(C5_UART, buf, n);
+        s_to_c5 += n;
         return true;
     }
     for (size_t i = 0; i < n; ++i) {
@@ -88,6 +95,7 @@ void bridge_c5_bytes(const uint8_t *buf, size_t n)
 {
     if (!s_active) return;
     s_last_us = esp_timer_get_time();
+    s_from_c5 += n;
     for (size_t i = 0; i < n; ++i) {
         if (buf[i] == 0xc0) s_answered = true;
         /* The download-mode banner arrives before the first answer; a later one is a reboot. */
@@ -108,4 +116,11 @@ void bridge_poll(void)
         c5_run();
         stop("idle, C5 reset to run");
     }
+}
+
+void bridge_info(void)
+{
+    say("bridge %s, %lu session(s); last: %lu bytes to C5, %lu from C5%s\n",
+        s_active ? "active" : "idle", (unsigned long)s_sessions, (unsigned long)s_to_c5,
+        (unsigned long)s_from_c5, s_answered ? ", C5 answered" : "");
 }

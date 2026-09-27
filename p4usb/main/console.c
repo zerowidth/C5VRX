@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
+#include "bridge.h"
 #include "c5.h"
 #include "census.h"
 #include "wires.h"
@@ -30,11 +31,12 @@ static void cmd_info(int argc, char **argv)
     esp_chip_info(&chip);
     say("p4usb rev v%d.%d uptime %lld ms\n", chip.revision / 100, chip.revision % 100,
         esp_timer_get_time() / 1000);
+    bridge_info();
 }
 
 static const command_t s_commands[] = {
     {"help", cmd_help, "list commands"},
-    {"info", cmd_info, "chip revision and uptime"},
+    {"info", cmd_info, "chip revision, uptime and bridge counters"},
     {"census", census_run, "read every C5-facing pin with pull-down, then pull-up"},
     {"wires", wires_run, "reset the C5 and check its walking-ones boot test lane by lane"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART"},
