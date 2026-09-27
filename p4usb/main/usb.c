@@ -25,7 +25,7 @@
 #define UVC_CLOCK_HZ 27000000
 #define TERM_CAMERA 1
 #define TERM_OUTPUT 2
-/* A closed or stalled reader should cost the console a moment, not hang it. */
+/* A closed or stalled reader should cost the console a moment, not hang it; any progress restarts it. */
 #define WRITE_TIMEOUT_US (200 * 1000)
 
 enum { ITF_CDC, ITF_CDC_DATA, ITF_VIDEO_CONTROL, ITF_VIDEO_STREAMING, ITF_COUNT };
@@ -174,6 +174,7 @@ void usb_console_write(const void *data, size_t len)
         tud_cdc_write_flush();
         p += n;
         len -= n;
+        if (n) deadline = esp_timer_get_time() + WRITE_TIMEOUT_US;
         if (len) {
             if (esp_timer_get_time() > deadline) return;
             vTaskDelay(1);
