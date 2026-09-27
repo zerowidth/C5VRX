@@ -267,9 +267,9 @@ Two ESP-IDF 6.1 projects hold the firmware for this build, separate from the sta
 
 The Rakefile builds both with the local ESP-IDF (`~/.espressif`):
 
-- Tasks find each board's port by USB ID, so other ESP boards can stay plugged in: 303a:8000 is the P4 console, 303a:0012 the P4's ROM loader, 1a86:55d3 the CH343 on the P4's USB-C, and 303a:1001 a C5 or S3 on its own USB. When two ports match, the task stops and asks for `PORT=`.
+- Tasks find each board's port by USB ID, so other ESP boards can stay plugged in: 303a:8000 is the P4 console, 303a:0012 the P4's ROM loader, 1a86:55d3 the CH343 on the P4's USB-C, and 303a:1001 a C5 or S3 on its own USB. When two ports match, the task stops and asks for `PORT=`. The ID can't tell a C5 from an S3, so the top-level `rake flash` takes the only 303a:1001 port even if it is an S3; pass `PORT=` whenever another ESP board is plugged in on its own USB.
 - `rake p4usb:flash` flashes the P4 over its high-speed port. It toggles DTR and RTS on the console the way esptool's reset does, which reboots the P4 into its ROM loader on the same port, then flashes it there (about 11 s). With only the USB-C plugged in, it flashes through the CH343 instead. `reboot download` on the console does the same by hand.
-- `rake p4usb:console` opens the console in picocom, preferring the high-speed port. Opening and closing the port doesn't reset the P4. `rake p4usb:monitor` shows the boot and panic log on the USB-C.
+- `rake p4usb:console` opens the console in picocom, preferring the high-speed port. Opening and closing the port doesn't reset the P4. The boot log and panic dumps come out of the USB-C only, so plug it in for `rake p4usb:monitor` when debugging a crash or a boot failure. Nothing else needs the USB-C.
 - `rake c5rx:flash` flashes the C5 through the P4, and `rake p4usb:c5_flash_id` checks that path. Both work over the high-speed console as well as the USB-C.
 - macOS asks before each new USB device may connect, and the P4's ROM loader and each new descriptor set count as new devices. Until that is allowed, the device enumerates without a driver and no serial port appears.
 
