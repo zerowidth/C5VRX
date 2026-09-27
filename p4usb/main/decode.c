@@ -5,11 +5,13 @@
 #include <string.h>
 
 #include "driver/parlio_rx.h"
+#include "esp_cache.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "soc/axi_dma_struct.h"
 
 #include "console.h"
 #include "iq.h"
@@ -49,37 +51,37 @@
 #define SYNC_MAX_LAG (HIST - 4096)
 #define BOX 4
 
-#define RING_BYTES (96 * 1024)
-#define NODES 64
+/* The driver fills the ring in 4032-byte DMA nodes. Each soft-delimiter EOF ends the node it lands in
+ * early, so the EOF period and the ring are whole numbers of nodes and every node comes back full. */
+#define NODE_BYTES 4032
+#define RING_BYTES (24 * NODE_BYTES)
+/* How long the DMA takes to fill the ring. */
+#define RING_US ((int64_t)RING_BYTES / 2 * 1000000 / FS_HZ)
 #define NOTIFY_EVERY 4
-#define EOF_BYTES 0xfc00
+#define EOF_BYTES (8 * NODE_BYTES)
 /* Enough raw words per DMA node for a steady DC estimate at little cost. */
 #define DC_WORDS 32
-/* The top 6 bits of I and Q index the phase table: at a working gain that costs about 0.5% of the
- * sync-to-white range, and 4 KB fits the zero-wait SPM, where a lookup is several times faster than
- * from L2 memory through the L1 cache. */
+/* The top 6 bits of I and Q index the phase table; at a working gain that costs about 0.5% of the
+ * sync-to-white range, and the small table stays in the L1 cache. */
 #define LUT_SIZE (1 << 12)
 
-typedef struct {
-    const uint16_t *data;
-    uint32_t words;
-} node_t;
+/* PARLIO RX's DMA request line on the P4's AXI-GDMA. */
+#define PARLIO_DMA_PERIPH 3
 
 static parlio_rx_unit_handle_t s_rx;
 static parlio_rx_delimiter_handle_t s_delim;
 static uint16_t *s_ring;
-static uint32_t s_ring_nodes;
-static node_t s_nodes[NODES];
-static volatile uint32_t s_head;
-static uint32_t s_tail;
+static int s_dma_ch = -1;
+/* Byte offset in the ring the decoder has read up to. */
+static uint32_t s_read;
+static int64_t s_read_us;
+static int64_t s_max_gap_us;
 static TaskHandle_t s_task;
 static TaskHandle_t s_sync_task;
 static volatile bool s_running;
 
-SPM_DRAM_ATTR static uint8_t s_lut[LUT_SIZE];
-/* Built with a new DC estimate and copied into s_lut by the decode task between DMA batches. */
-static uint8_t s_lut_next[LUT_SIZE];
-static volatile bool s_lut_ready;
+static uint8_t s_luts[2][LUT_SIZE];
+static const uint8_t *volatile s_lut = s_luts[0];
 static int s_lut_dc_i = 1000, s_lut_dc_q = 1000;
 static volatile int32_t s_dc_sum_i, s_dc_sum_q, s_dc_n;
 
@@ -116,20 +118,40 @@ static uint8_t *s_frame;
 static uint32_t s_fields, s_field_hits, s_field_vsync;
 static uint32_t s_last_hits, s_last_vsync_ok;
 static uint32_t s_overruns, s_sync_overruns;
+/* Vertical syncs that moved the line count, beyond the first. */
+static uint32_t s_vjumps;
 typedef struct {
     uint32_t busy_cycles, permille;
     int64_t start;
 } load_t;
 static load_t s_demod_load, s_sync_load;
 
+/* Only a wake-up: the driver counts one node per interrupt, so it falls behind when interrupts are late
+ * and two nodes finish together. The decoder reads the DMA's position from the hardware instead. */
 static bool IRAM_ATTR on_partial(parlio_rx_unit_handle_t rx, const parlio_rx_event_data_t *e, void *arg)
 {
-    uint32_t h = s_head;
-    s_nodes[h % NODES] = (node_t){e->data, e->recv_bytes / 2};
-    __atomic_store_n(&s_head, h + 1, __ATOMIC_RELEASE);
+    static uint32_t count;
     BaseType_t woken = pdFALSE;
-    if (h % NOTIFY_EVERY == NOTIFY_EVERY - 1) vTaskNotifyGiveFromISR(s_task, &woken);
+    if (++count % NOTIFY_EVERY == 0) vTaskNotifyGiveFromISR(s_task, &woken);
     return woken == pdTRUE;
+}
+
+static int find_dma_channel(void)
+{
+    for (int ch = 0; ch < 3; ++ch) {
+        if (AXI_DMA.in[ch].conf.in_peri_sel.peri_in_sel_chn == PARLIO_DMA_PERIPH) return ch;
+    }
+    return -1;
+}
+
+/* The ring offset of the node the DMA finished last or is still filling; everything before it is done.
+ * A descriptor's second word is its buffer address. */
+static uint32_t dma_offset(void)
+{
+    uint32_t desc = AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
+    if (!desc) return s_read;
+    uint32_t off = ((const uint32_t *)desc)[1] - (uint32_t)s_ring;
+    return off < RING_BYTES ? off : s_read;
 }
 
 /* Words carry I and Q as 2v+1 for signed 7-bit v; the table sees the top 6 bits of each, so it takes
@@ -154,9 +176,9 @@ static void update_lut(void)
     /* Quarter-LSB steps, so small drift doesn't rebuild the table every time. */
     int qi = lrintf(dc_i * 4), qq = lrintf(dc_q * 4);
     if (abs(qi - s_lut_dc_i) < 2 && abs(qq - s_lut_dc_q) < 2) return;
-    if (s_lut_ready) return;
-    build_lut(s_lut_next, qi / 4.0f, qq / 4.0f);
-    s_lut_ready = true;
+    uint8_t *spare = s_lut == s_luts[0] ? s_luts[1] : s_luts[0];
+    build_lut(spare, qi / 4.0f, qq / 4.0f);
+    s_lut = spare;
     s_lut_dc_i = qi;
     s_lut_dc_q = qq;
 }
@@ -274,6 +296,8 @@ static void on_pulse(uint32_t start, uint32_t width)
             int32_t into = (int32_t)(start - s_line);
             int32_t half = LINE_Q16 >> 17;
             s_parity = into > half / 2 && into < half * 3 / 2;
+            /* The count wraps at 262 and 263 lines alternately, so one line either way is expected. */
+            if (abs(s_vline - VSYNC_LINE) > 1 && s_vline < FIELD_LINES - 1) ++s_vjumps;
             s_vline = VSYNC_LINE;
             ++s_field_vsync;
         }
@@ -326,8 +350,19 @@ static void detect(uint32_t until)
     s_low = low;
 }
 
+/* A copy of the raw words the decoder processed, for checking offline with iq.py. Copying into PSRAM
+ * slows the demodulator, so a tap can itself cause overruns. */
+#define TAP_WORDS (1400 * 1000)
+static uint16_t *s_tap;
+static volatile uint32_t s_tap_len, s_tap_want;
+
 static void process(const uint16_t *w, uint32_t words)
 {
+    if (s_tap_len < s_tap_want) {
+        uint32_t n = words < s_tap_want - s_tap_len ? words : s_tap_want - s_tap_len;
+        memcpy(s_tap + s_tap_len, w, n * 2);
+        s_tap_len += n;
+    }
     int32_t si = 0, sq = 0;
     for (int k = 0; k < DC_WORDS && k < (int)words; ++k) {
         si += (int8_t)w[k];
@@ -399,24 +434,27 @@ static void sync_task(void *arg)
 static void decode_task(void *arg)
 {
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        ulTaskNotifyTake(pdTRUE, 1);
         uint32_t t0 = esp_cpu_get_cycle_count();
-        uint32_t head;
-        while (s_running && s_tail != (head = __atomic_load_n(&s_head, __ATOMIC_ACQUIRE))) {
-            /* The DMA is refilling the oldest node; skip to the newest complete one. */
-            if (head - s_tail >= s_ring_nodes - 1) {
+        if (s_running) {
+            uint32_t end = dma_offset();
+            int64_t now = esp_timer_get_time();
+            if (now - s_read_us > s_max_gap_us) s_max_gap_us = now - s_read_us;
+            /* Nearly a ring's worth of time without reading means the DMA has lapped us. */
+            if (now - s_read_us > RING_US - 500) {
                 ++s_overruns;
-                s_tail = head - 1;
+                s_read = end;
             }
-            node_t node = s_nodes[s_tail % NODES];
-            ++s_tail;
-            process(node.data, node.words);
+            while (s_read != end) {
+                uint32_t stop = end > s_read ? end : RING_BYTES;
+                uint8_t *p = (uint8_t *)s_ring + s_read;
+                esp_cache_msync(p, stop - s_read, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+                process((const uint16_t *)p, (stop - s_read) / 2);
+                s_read = stop % RING_BYTES;
+            }
+            s_read_us = now;
         }
         account(&s_demod_load, t0);
-        if (s_lut_ready) {
-            memcpy(s_lut, s_lut_next, LUT_SIZE);
-            s_lut_ready = false;
-        }
     }
 }
 
@@ -450,10 +488,12 @@ static esp_err_t start_rx(void)
     if ((err = parlio_new_rx_soft_delimiter(&dcfg, &s_delim)) != ESP_OK) return err;
     if ((err = parlio_rx_unit_register_event_callbacks(s_rx, &cbs, NULL)) != ESP_OK) return err;
     if ((err = parlio_rx_unit_enable(s_rx, true)) != ESP_OK) return err;
-    s_tail = s_head;
-    s_running = true;
     const parlio_receive_config_t rcfg = {.delimiter = s_delim, .flags.partial_rx_en = 1};
     if ((err = parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg)) != ESP_OK) return err;
+    if ((s_dma_ch = find_dma_channel()) < 0) return ESP_ERR_NOT_FOUND;
+    s_read = 0;
+    s_read_us = esp_timer_get_time();
+    s_running = true;
     return parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true);
 }
 
@@ -465,13 +505,12 @@ static void start(const char *channel)
             say("decode: no memory for the ring\n");
             return;
         }
-        /* The driver splits the ring into nodes of at most 4032 bytes. */
-        s_ring_nodes = RING_BYTES / 4032;
-        build_lut(s_lut, 0, 0);
+        build_lut(s_luts[0], 0, 0);
         xTaskCreatePinnedToCore(lut_task, "decode_lut", 3072, NULL, 1, NULL, 0);
         set_thresholds();
         s_frame = video_field_buffer();
-        /* Core 1, above everything else there; the DMA interrupt stays on core 0 with the console. */
+        /* The demodulator has core 1 to itself; sync and rendering share core 0 with the DMA interrupt,
+         * USB and the console. */
         xTaskCreatePinnedToCore(sync_task, "decode_sync", 4096, NULL, 9, &s_sync_task, 0);
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
@@ -491,8 +530,12 @@ static void status(void)
         s_running ? "running" : "stopped", (unsigned long)s_fields, (unsigned long)s_last_hits, FIELD_LINES,
         s_last_vsync_ok ? ", vsync" : ", no vsync", (unsigned long)(s_period >> 16),
         (unsigned long)((s_period & 0xffff) * 1000 >> 16));
+    say("%lu vertical corrections\n", (unsigned long)s_vjumps);
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT, s_blank * KHZ_PER_UNIT,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
+    say("longest gap between ring reads since last asked %lld us, of the %lld us the ring holds\n", s_max_gap_us,
+        RING_US);
+    s_max_gap_us = 0;
     say("demod on core 1 %lu.%lu%% with %lu overruns, sync on core 0 %lu.%lu%% with %lu\n",
         (unsigned long)(s_demod_load.permille / 10), (unsigned long)(s_demod_load.permille % 10),
         (unsigned long)s_overruns, (unsigned long)(s_sync_load.permille / 10),
@@ -532,6 +575,23 @@ static void bench(void)
         (unsigned long)(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000ull / FS_HZ));
 }
 
+static void tap(void)
+{
+    if (!s_tap) s_tap = heap_caps_malloc(TAP_WORDS * 2, MALLOC_CAP_SPIRAM);
+    if (!s_tap || !s_running) {
+        say("decode: tap needs memory and a running decoder\n");
+        return;
+    }
+    s_tap_len = 0;
+    s_tap_want = TAP_WORDS;
+    for (int k = 0; k < 100 && s_tap_len < TAP_WORDS; ++k) vTaskDelay(pdMS_TO_TICKS(10));
+    s_tap_want = 0;
+
+    say("-----BEGIN IQ %u-----\n", (unsigned)(s_tap_len * 2));
+    host_write(s_tap, s_tap_len * 2);
+    say("\n-----END IQ-----\n");
+}
+
 void decode_command(int argc, char **argv)
 {
     const char *sub = argc > 1 ? argv[1] : "";
@@ -540,11 +600,18 @@ void decode_command(int argc, char **argv)
         start(argc > 2 ? argv[2] : "R3");
     } else if (strcmp(sub, "off") == 0) {
         decode_stop();
+    } else if (strcmp(sub, "rx") == 0) {
+        /* The ring reader alone, on whatever the C5 is already sending (for example its link counter). */
+        decode_stop();
+        esp_err_t err = s_ring ? start_rx() : ESP_ERR_INVALID_STATE;
+        say(err == ESP_OK ? "receiving\n" : "decode: %s\n", esp_err_to_name(err));
+    } else if (strcmp(sub, "tap") == 0) {
+        tap();
     } else if (strcmp(sub, "bench") == 0) {
         bench();
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off]\n");
+        say("decode [on [channel] | off | rx | tap | bench]\n");
     }
 }

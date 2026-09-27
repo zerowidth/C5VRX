@@ -1,9 +1,10 @@
 """Capture I/Q from the P4 console and look at it offline.
 
-    iq.py capture out.bin [sram] capture two fields (or what fits in internal RAM) and save the raw words
+    iq.py capture out.bin [sram|tap] capture two fields (or what fits in internal RAM, or the running decoder's
+                                input) and save the raw words
     iq.py lanes in.bin         per-lane toggle rates and I/Q statistics
     iq.py field in.bin out.png FM-demodulate and draw the samples as NTSC lines
-    iq.py gaps in.bin          find hsync spacings that aren't whole lines, which mean lost samples
+    iq.py gaps in.bin [every]  find hsync spacings that aren't whole lines, which mean lost samples
 
 Needs numpy, pillow and pyserial.
 """
@@ -43,9 +44,13 @@ def run(s, cmd, until, timeout):
 
 def capture(path, cmd="iq"):
     s = console()
-    text = run(s, cmd, b"\n> ", 5).decode(errors="replace")
-    print(text.strip())
-    out = run(s, "iq dump", b"-----END IQ-----", 30)
+    if cmd == "iq tap":
+        # The running decoder's own input, as it processed it.
+        out = run(s, "decode tap", b"-----END IQ-----", 40)
+    else:
+        text = run(s, cmd, b"\n> ", 5).decode(errors="replace")
+        print(text.strip())
+        out = run(s, "iq dump", b"-----END IQ-----", 30)
     head = out.index(b"-----BEGIN IQ ")
     nl = out.index(b"\n", head)
     n = int(out[head + 14 : nl].split(b"-")[0])
@@ -103,8 +108,8 @@ def field(path, png):
     print(f"{nlines} lines, levels {lo / 1e6:.2f}..{hi / 1e6:.2f} MHz, saved {png}")
 
 
-def lut_demod(w, i, q):
-    """The firmware's demodulator: 14-bit I/Q index to 8-bit phase, DC removed, every 3rd sample."""
+def lut_demod(w, i, q, step=3):
+    """The firmware's demodulator: I/Q index to 8-bit phase, DC removed, every `step`th word, so 13.33 MS/s."""
     k = np.arange(1 << 14)
 
     def s7(x):
@@ -112,13 +117,14 @@ def lut_demod(w, i, q):
         return np.where(x >= 64, x - 128, x) * 2 + 1
 
     lut = (np.round(np.arctan2(s7(k >> 7) - q.mean(), s7(k) - i.mean()) / (2 * np.pi) * 256) % 256).astype(np.uint8)
-    p = lut[((w >> 1) & 0x7F) | (((w >> 9) & 0x7F) << 7)][::3].astype(np.int32)
+    p = lut[((w >> 1) & 0x7F) | (((w >> 9) & 0x7F) << 7)][::step].astype(np.int32)
     return (((p[1:] - p[:-1] + 128) % 256) - 128) * (RATE / 3) / 256
 
 
-def gaps(path):
+def gaps(path, every=2):
+    """every: the C5 kept one of this many 80 MS/s bus samples (2 for 40 MS/s captures, 6 for the decoder)."""
     w, i, q = load(path)
-    f = lut_demod(w, i, q)
+    f = lut_demod(w, i, q, step=6 // every)
     fs = RATE / 3
     line = LINE * fs
     s = np.convolve(f, np.ones(6) / 6, "same")
@@ -147,6 +153,6 @@ if __name__ == "__main__":
     elif cmd == "lanes":
         lanes(sys.argv[2])
     elif cmd == "gaps":
-        gaps(sys.argv[2])
+        gaps(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 2)
     elif cmd == "field":
         field(sys.argv[2], sys.argv[3])

@@ -69,7 +69,7 @@ static const command_t s_commands[] = {
     {"wires", wires_run, "reset the C5 and check its walking-ones boot test lane by lane"},
     {"link", link_run, "clocked counter test on each side's lanes, optionally at one MHz"},
     {"iq", iq_command, "capture two fields of I/Q; start [channel] tunes the C5 and picks a clock edge; dump sends the capture"},
-    {"decode", decode_command, "on [channel] tunes the C5 and decodes its video into the camera; off stops; alone shows lock and levels"},
+    {"decode", decode_command, "on [channel] tunes the C5 and decodes its video into the camera; off stops; alone shows lock and load; rx, tap and bench are for debugging"},
     {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64"},
     {"reboot", cmd_reboot, "restart the P4; reboot download enters its ROM loader"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},
