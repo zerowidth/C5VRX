@@ -11,6 +11,7 @@
 
 #include "lanes.h"
 #include "link.h"
+#include "radio.h"
 
 /* Waveshare C5-Zero antenna switch: low selects the on-board antenna. */
 #define ANTENNA_SEL_GPIO GPIO_NUM_26
@@ -61,9 +62,31 @@ static void run_command(char *line)
         link_stop();
         reply("ok link off");
     } else if (strcmp(argv[0], "link") == 0 && argc == 3) {
+        radio_iq_stop();
         esp_err_t err = link_start(argv[1][0], (uint32_t)atoi(argv[2]) * 1000000u);
         if (err == ESP_OK) reply("ok link %s", argv[1]);
         else reply("err %s", esp_err_to_name(err));
+    } else if (strcmp(argv[0], "tune") == 0 && argc == 2) {
+        esp_err_t err = radio_tune(argv[1]);
+        if (err == ESP_OK) reply("ok tune %s %u", radio_channel(), radio_mhz());
+        else reply("err %s", esp_err_to_name(err));
+    } else if (strcmp(argv[0], "gain") == 0 && argc == 2) {
+        radio_set_gain((uint8_t)atoi(argv[1]));
+        reply("ok gain %u", radio_gain());
+    } else if (strcmp(argv[0], "iq") == 0 && (argc == 2 || argc == 4) && strcmp(argv[1], "on") == 0) {
+        link_stop();
+        int q_top = argc == 4 ? atoi(argv[2]) : 9, i_top = argc == 4 ? atoi(argv[3]) : 19;
+        esp_err_t err = radio_iq_start(q_top, i_top);
+        if (err == ESP_OK) reply("ok iq on %d %d", q_top, i_top);
+        else reply("err %s", esp_err_to_name(err));
+    } else if (strcmp(argv[0], "iq") == 0 && argc == 2 && strcmp(argv[1], "off") == 0) {
+        radio_iq_stop();
+        reply("ok iq off");
+    } else if (strcmp(argv[0], "status") == 0) {
+        int rssi = 0, noise = 0;
+        bool have_rssi = radio_rssi(&rssi), have_noise = radio_noise_floor(&noise);
+        reply("ok status ch=%s freq=%u gain=%u rssi=%d%s noise=%d%s", radio_channel(), radio_mhz(), radio_gain(),
+              rssi, have_rssi ? "" : "?", noise, have_noise ? "" : "?");
     } else {
         reply("err unknown command %s", argv[0]);
     }
