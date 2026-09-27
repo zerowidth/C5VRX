@@ -4,7 +4,7 @@ Plan for a self-contained receiver built from the Waveshare ESP32-C5-Zero and th
 
 This is a separate build from the standalone C5 receiver. The C5-only path, which recovers composite video onto the resistor DAC and never decodes pixels, stays as it is.
 
-Nothing here is built yet. The open questions at the end need answers before some choices are final.
+Bring-up is done: the P4 resets and reflashes the C5, and every wire checks out (see [Bring-up](#bring-up)). The receiver itself isn't built yet. The open questions at the end need answers before some choices are final.
 
 ## System overview
 
@@ -66,7 +66,7 @@ Each data wire carries one fixed bit, so the build can be handed to someone else
 | Function | C5 pins | Notes |
 |---|---|---|
 | 5V, GND | 5V, GND (left, rows 1-2) | 5V from the P4's VSYS; GND is the clock-return wire |
-| UART to P4 | 11 (TX), 12 (RX) | UART0, so the ROM bootloader can be reached and the P4 can reflash the C5. TX has a 499 Ω series resistor on the board |
+| UART to P4 | 11 (TX), 12 (RX) | UART0, so the ROM bootloader can be reached and the P4 can reflash the C5 (confirmed: the ROM banner and esptool both reach it). TX has a 499 Ω series resistor on the board |
 | BOOT | 28 (back pad) | Driven by the P4, open-drain. The board's BOOT button is unreliable, so this is also the manual fallback: ground 28 while resetting |
 | Reset | EN, via the RESET button pad | Driven by the P4, open-drain. EN (CHIP_PU) is not on the edge pads; it has a 10k pull-up and 1 µF to GND, so reset release is slow |
 | Sample clock out | 0 | Two rows from the GND pad |
@@ -105,6 +105,8 @@ Board facts from the [P4-Pico schematic](https://files.waveshare.com/wiki/ESP32-
 - The header pin labeled EN is the 3.3 V regulator enable, and RUN resets the P4. Neither is used here.
 - The audio codec (I2S on GPIO 9-13), speaker amp (GPIO 53), SD card (GPIO 39-45) and flash are on pins not used by this plan.
 - GPIO 34 and 36 are strapping pins; leave them alone.
+- This board's P4 is chip revision v1.3. ESP-IDF 6.x targets v3 by default, so `p4usb` sets `CONFIG_ESP32P4_SELECTS_REV_LESS_V3`.
+- GPIO 26 and 27 are also the full-speed OTG PHY pads, as 24 and 25 are the USB-Serial-JTAG's; selecting them as GPIOs detaches the PHY.
 
 ## Physical build
 
@@ -225,7 +227,7 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 - Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
 - Offer 720×480 at 60 fps (one frame per field, deinterlaced) and at 30 fps (fields woven). 60 is the default for FPV. 720×480 at 60 fps is about 20 megapixels per second, within the JPEG encoder's limit.
 - Drive the OLED and buttons as described in [Controls and display](#controls-and-display).
-- Control the C5's EN and BOOT pins for reset and reflashing it over UART0 (esp-serial-flasher).
+- Control the C5's EN and BOOT pins for reset, and bridge its UART0 so esptool on the host can reflash it (see [Bring-up](#bring-up)).
 - Optional standalone recording of MJPEG to microSD (roughly 3-4 MB/s).
 
 ### Control protocol
@@ -254,12 +256,39 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 - Can the P4 demodulate 7+7-bit I/Q at 40 MS/s with time left for decoding and encoding?
 - What is the maximum PARLIO RX external clock on the P4 through the GPIO matrix, and which clock edge gives margin?
 - Each kept sample is valid for about 12.5 ns. How much of that window is left after the C5 and P4 GPIO matrices, wire skew and the low drive strength, and is the modem-to-divider phase the same on every boot? If the margin is thin, can the C5 output an 80 MHz clock so the P4 can choose which half-cycle to keep?
-- Are C5 GPIO 11/12 the ROM bootloader's UART0 pins?
+
+## Bring-up
+
+Two ESP-IDF 6.1 projects hold the firmware for this build, separate from the standalone C5 receiver in `main/`:
+
+- `p4usb/` runs on the P4. Its console is on the P4's USB-C (CH343) at 115200.
+- `c5rx/` runs on the C5. Its console is UART0 on GPIO 11/12, relayed by the P4. The C5's USB-Serial-JTAG is off, since GPIO 13/14 carry I2 and I1.
+
+The Rakefile builds both with the local ESP-IDF (`~/.espressif`):
+
+- `rake p4usb:flash` flashes the P4 over its USB-C, and `rake p4usb:console` opens its console in picocom. Opening and closing the port doesn't reset the P4.
+- `rake c5rx:flash` flashes the C5 through the P4, and `rake p4usb:c5_flash_id` checks that path.
+
+The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset, leaves every bus pin as an input, and keeps its TX to the C5 undriven, because other C5 firmware may drive GPIO 12 (the standalone receiver uses it for the DAC). Its console commands:
+
+- `census` reads every C5-facing pin with the P4's pull-down, then its pull-up, and reports each as floating, high, low or toggling. With the C5 in reset, every bus lane should float.
+- `c5 hold`, `c5 run` and `c5 dl` hold the C5 in reset, run it, or reset it into download mode. `c5 log on` relays the C5's UART to the console.
+- `wires` resets the C5 and checks the walking-ones test that `c5rx` runs at boot, naming any lane that lands on the wrong P4 pin.
+- `info` shows the P4's chip revision, uptime and bridge counters.
+
+The bridge starts when the P4 sees esptool's SYNC frame on its console: it resets the C5 into download mode and connects its TX, open-drain, to the C5's RX. It forwards bytes both ways at a fixed 115200 until the C5 reboots (esptool's `--after watchdog-reset`), the C5 fails to answer for 2 s, or both sides are silent for 30 s. esptool runs with `--before no-reset -b 115200`, which the Rake tasks pass.
+
+Verified on the hardware:
+
+- Power from VSYS, with the C5's own USB unplugged.
+- EN and BOOT: the ROM reports `boot:0x18 (SPI_FAST_FLASH_BOOT)` after a normal reset and `boot:0x8 (DOWNLOAD(UART0/USB))` with BOOT held, so the P4's pins don't disturb the C5's straps.
+- UART both ways, and flashing the C5 through the bridge.
+- All 15 bus wires (clock and 14 I/Q lanes), with no opens, swaps or shorts.
 
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
-2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video.
+2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video. Power, UART, EN and BOOT, bridged flashing and the wire check are done.
 3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline.
 4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside.
 5. Optional: microSD recording.
