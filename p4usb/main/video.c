@@ -6,7 +6,7 @@
 #include "driver/jpeg_encode.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "bridge.h"
@@ -14,23 +14,27 @@
 #include "overlay.h"
 #include "uvc.h"
 
-/* One being sent, the newest finished, and one being encoded, so the producer never waits on USB. */
-#define JPEG_SLOTS 3
+/* One held per reader, the newest finished, and one being encoded, so the producer never waits. */
+#define JPEG_SLOTS (VIDEO_READERS + 2)
 #define JPEG_SLOT_BYTES (128 * 1024)
+/* Room in front of the encoder's output for a COM segment; a multiple of the cache line. */
+#define HEAD_ROOM 128
 #define JPEG_QUALITY 80
 #define TEXT_SCALE 3
 #define MARKER 24
 
 typedef struct {
-    uint8_t *buf;
+    uint8_t *base;
     size_t cap;
-    size_t len;
+    video_frame_t frame;
 } slot_t;
 
 static slot_t s_slots[JPEG_SLOTS];
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static int s_newest = -1;
-static int s_held = -1;
+static int s_held[VIDEO_READERS] = {-1, -1};
+static uint32_t s_taken[VIDEO_READERS];
+static SemaphoreHandle_t s_published;
 static uint8_t *s_raw;
 static size_t s_raw_size;
 static jpeg_encoder_handle_t s_enc;
@@ -38,7 +42,6 @@ static TaskHandle_t s_task;
 
 static uint32_t s_frames;
 static uint32_t s_late;
-static uint32_t s_acquired;
 static uint32_t s_errors;
 static uint32_t s_render_us;
 static uint32_t s_encode_us;
@@ -51,9 +54,13 @@ static void tick(void *arg)
 
 static int writable_slot(void)
 {
-    int w = 0;
     taskENTER_CRITICAL(&s_lock);
-    while (w == s_newest || w == s_held) ++w;
+    int w = 0;
+    for (;; ++w) {
+        bool busy = w == s_newest;
+        for (int r = 0; r < VIDEO_READERS; ++r) busy |= w == s_held[r];
+        if (!busy) break;
+    }
     taskEXIT_CRITICAL(&s_lock);
     return w;
 }
@@ -61,27 +68,27 @@ static int writable_slot(void)
 static size_t newest_len(void)
 {
     taskENTER_CRITICAL(&s_lock);
-    size_t len = s_newest < 0 ? 0 : s_slots[s_newest].len;
+    size_t len = s_newest < 0 ? 0 : s_slots[s_newest].frame.len;
     taskEXIT_CRITICAL(&s_lock);
     return len;
 }
 
-static void render(void)
+static void render(uint32_t seq)
 {
-    int64_t now = esp_timer_get_time();
-    uint32_t ms = now / 1000;
+    uint32_t ms = esp_timer_get_time() / 1000;
+    uint32_t sent, skipped;
+    uvc_counts(&sent, &skipped);
     char lines[9][32];
     snprintf(lines[0], sizeof lines[0], "C5VRX P4 TEST PATTERN");
     snprintf(lines[1], sizeof lines[1], "uptime %02lu:%02lu:%02lu.%03lu", (unsigned long)(ms / 3600000),
              (unsigned long)(ms / 60000 % 60), (unsigned long)(ms / 1000 % 60), (unsigned long)(ms % 1000));
-    snprintf(lines[2], sizeof lines[2], "frame  %lu", (unsigned long)s_frames);
+    snprintf(lines[2], sizeof lines[2], "frame  %lu", (unsigned long)seq);
     snprintf(lines[3], sizeof lines[3], "rate   %lu.%lu fps", (unsigned long)(s_fps_tenths / 10),
              (unsigned long)(s_fps_tenths % 10));
     snprintf(lines[4], sizeof lines[4], "jpeg   %u bytes", (unsigned)newest_len());
     snprintf(lines[5], sizeof lines[5], "encode %lu us", (unsigned long)s_encode_us);
-    snprintf(lines[6], sizeof lines[6], "sent   %lu late %lu", (unsigned long)s_acquired, (unsigned long)s_late);
-    snprintf(lines[7], sizeof lines[7], "psram  %u KB free",
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    snprintf(lines[6], sizeof lines[6], "usb    %lu sent %lu skip", (unsigned long)sent, (unsigned long)skipped);
+    snprintf(lines[7], sizeof lines[7], "late   %lu", (unsigned long)s_late);
     snprintf(lines[8], sizeof lines[8], "bridge %s", bridge_active() ? "active" : "idle");
 
     memset(s_raw, 0, s_raw_size);
@@ -90,12 +97,32 @@ static void render(void)
     }
     /* A sweeping block makes dropped or repeated frames visible. */
     int span = VIDEO_WIDTH - MARKER;
-    int x = (int)(s_frames * 8 % (2 * span));
+    int x = (int)(seq * 8 % (2 * span));
     if (x > span) x = 2 * span - x;
     overlay_box(s_raw, VIDEO_WIDTH, x, VIDEO_HEIGHT - 2 * MARKER, MARKER, MARKER, 0xff);
 }
 
-static void encode(void)
+/* Moves SOI and APP0 back into the head room and puts a COM segment after them, so every JPEG
+ * names its own frame number and capture time even after it leaves the P4. */
+static uint8_t *add_comment(uint8_t *jpeg, uint32_t *len, uint32_t seq, int64_t t_us)
+{
+    size_t keep = 2;
+    if (jpeg[2] == 0xff && jpeg[3] == 0xe0) keep += 2 + (jpeg[4] << 8 | jpeg[5]);
+    char text[HEAD_ROOM - 8];
+    int n = snprintf(text, sizeof text, "C5VRX frame=%lu t_us=%lld", (unsigned long)seq, (long long)t_us);
+    uint8_t *start = jpeg - (4 + n);
+    memmove(start, jpeg, keep);
+    uint8_t *com = start + keep;
+    com[0] = 0xff;
+    com[1] = 0xfe;
+    com[2] = (n + 2) >> 8;
+    com[3] = (n + 2) & 0xff;
+    memcpy(com + 4, text, n);
+    *len += 4 + n;
+    return start;
+}
+
+static void encode(uint32_t seq, int64_t t_us)
 {
     static const jpeg_encode_cfg_t cfg = {
         .width = VIDEO_WIDTH,
@@ -105,15 +132,19 @@ static void encode(void)
         .image_quality = JPEG_QUALITY,
     };
     int w = writable_slot();
+    slot_t *s = &s_slots[w];
+    uint8_t *out = s->base + HEAD_ROOM;
     uint32_t len = 0;
-    if (jpeg_encoder_process(s_enc, &cfg, s_raw, s_raw_size, s_slots[w].buf, s_slots[w].cap, &len) != ESP_OK) {
+    if (jpeg_encoder_process(s_enc, &cfg, s_raw, s_raw_size, out, s->cap - HEAD_ROOM, &len) != ESP_OK) {
         ++s_errors;
         return;
     }
+    const uint8_t *jpeg = add_comment(out, &len, seq, t_us);
     taskENTER_CRITICAL(&s_lock);
-    s_slots[w].len = len;
+    s->frame = (video_frame_t){.jpeg = jpeg, .len = len, .seq = seq, .t_us = t_us};
     s_newest = w;
     taskEXIT_CRITICAL(&s_lock);
+    xSemaphoreGive(s_published);
 }
 
 static void video_task(void *arg)
@@ -124,14 +155,15 @@ static void video_task(void *arg)
         uint32_t ticks = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (ticks > 1) s_late += ticks - 1;
 
+        uint32_t seq = s_frames + 1;
         int64_t t0 = esp_timer_get_time();
-        render();
+        render(seq);
         int64_t t1 = esp_timer_get_time();
-        encode();
+        encode(seq, t0);
         int64_t t2 = esp_timer_get_time();
         s_render_us = t1 - t0;
         s_encode_us = t2 - t1;
-        ++s_frames;
+        s_frames = seq;
 
         ++window_frames;
         if (t2 - window_start >= 1000000) {
@@ -152,9 +184,10 @@ void video_init(void)
     s_raw = jpeg_alloc_encoder_mem(VIDEO_WIDTH * VIDEO_HEIGHT, &in, &s_raw_size);
     assert(s_raw);
     for (int i = 0; i < JPEG_SLOTS; ++i) {
-        s_slots[i].buf = jpeg_alloc_encoder_mem(JPEG_SLOT_BYTES, &out, &s_slots[i].cap);
-        assert(s_slots[i].buf);
+        s_slots[i].base = jpeg_alloc_encoder_mem(JPEG_SLOT_BYTES, &out, &s_slots[i].cap);
+        assert(s_slots[i].base);
     }
+    s_published = xSemaphoreCreateBinary();
 
     xTaskCreate(video_task, "video", 4096, NULL, 4, &s_task);
     const esp_timer_create_args_t timer = {.callback = tick, .name = "video"};
@@ -163,36 +196,52 @@ void video_init(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(h, 1000000 / VIDEO_FPS));
 }
 
-const uint8_t *video_acquire(size_t *len)
+static bool take(video_reader_t who, video_frame_t *f, bool only_new)
 {
-    const uint8_t *buf = NULL;
+    bool ok = false;
     taskENTER_CRITICAL(&s_lock);
-    if (s_newest >= 0) {
-        s_held = s_newest;
-        buf = s_slots[s_held].buf;
-        *len = s_slots[s_held].len;
+    if (s_newest >= 0 && (!only_new || s_slots[s_newest].frame.seq != s_taken[who])) {
+        s_held[who] = s_newest;
+        *f = s_slots[s_newest].frame;
+        s_taken[who] = f->seq;
+        ok = true;
     }
     taskEXIT_CRITICAL(&s_lock);
-    if (buf) ++s_acquired;
-    return buf;
+    return ok;
 }
 
-void video_release(void)
+bool video_next(video_reader_t who, video_frame_t *f, TickType_t wait)
+{
+    TickType_t start = xTaskGetTickCount();
+    while (!take(who, f, true)) {
+        TickType_t waited = xTaskGetTickCount() - start;
+        if (waited >= wait || xSemaphoreTake(s_published, wait - waited) != pdTRUE) return false;
+    }
+    return true;
+}
+
+bool video_newest(video_reader_t who, video_frame_t *f)
+{
+    return take(who, f, false);
+}
+
+void video_release(video_reader_t who)
 {
     taskENTER_CRITICAL(&s_lock);
-    s_held = -1;
+    s_held[who] = -1;
     taskEXIT_CRITICAL(&s_lock);
 }
 
 static void grab(void)
 {
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t len;
-    const uint8_t *p = video_acquire(&len);
-    if (!p) {
+    video_frame_t f;
+    if (!video_newest(VIDEO_READER_CONSOLE, &f)) {
         say("no frame yet\n");
         return;
     }
+    const uint8_t *p = f.jpeg;
+    size_t len = f.len;
     say("-----BEGIN JPEG %u-----\n", (unsigned)len);
     char line[80];
     size_t n = 0;
@@ -208,7 +257,7 @@ static void grab(void)
             n = 0;
         }
     }
-    video_release();
+    video_release(VIDEO_READER_CONSOLE);
     say("-----END JPEG-----\n");
 }
 
@@ -218,9 +267,9 @@ void video_command(int argc, char **argv)
         grab();
         return;
     }
-    say("%lu frames at %lu.%lu fps, %lu late, %lu errors, %lu acquired\n", (unsigned long)s_frames,
+    say("%lu frames at %lu.%lu fps, %lu late, %lu errors\n", (unsigned long)s_frames,
         (unsigned long)(s_fps_tenths / 10), (unsigned long)(s_fps_tenths % 10), (unsigned long)s_late,
-        (unsigned long)s_errors, (unsigned long)s_acquired);
+        (unsigned long)s_errors);
     say("render %lu us, encode %lu us, jpeg %u bytes\n", (unsigned long)s_render_us,
         (unsigned long)s_encode_us, (unsigned)newest_len());
     uvc_info();
