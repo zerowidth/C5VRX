@@ -39,8 +39,8 @@
 #define BROAD_MIN US(18)
 /* Measured from the sync's leading edge as the detector sees it. */
 #define ACTIVE_START US(9.4)
-/* Once the line's last pixel and the luma filter's lookahead are demodulated. */
-#define RENDER_AT (ACTIVE_START + US(52.66) + 16)
+/* Once the line's last pixel and the luma and chroma filters' lookahead are demodulated. */
+#define RENDER_AT (ACTIVE_START + US(52.66) + 32)
 /* A detected hsync this close to the predicted one steers the line clock. */
 #define LOCK_WINDOW US(3)
 #define LOST_AFTER_LINES 30
@@ -86,6 +86,9 @@
 #define LO_PERIOD 704
 #define LO_CYCLES 189
 #define LO_AMP 31
+#define LO8_AMP 127
+/* Pairs of chroma blocks mixed per line: the picture's blocks and one more to interpolate into. */
+#define PAIRS (VIDEO_WIDTH / MIX / 2 + 1)
 /* Samples per mixed block, about 0.6 us, which sets the color resolution. */
 #define MIX 8
 /* The burst lies 5.3-7.8 us after the sync's leading edge. */
@@ -120,10 +123,13 @@ static int s_rms, s_clip_permille;
 
 /* Demodulator and sync state, owned by the decode task. */
 /* Demodulated samples; the sync detector reads them four at a time. */
-static int8_t s_hist[HIST] __attribute__((aligned(4)));
+static int8_t s_hist[HIST] __attribute__((aligned(16)));
 /* The subcarrier at each sample of its 704-sample period (and a picture's width beyond, so a line never
  * wraps), packed as 65536 cos + sin so one multiply-add per sample mixes both. */
 static int32_t s_lo[LO_PERIOD + VIDEO_WIDTH + MIX];
+/* The same as int8 for PIE: per 16 samples, cos and sin for the first 8 with the rest zero, then for
+ * the last 8. */
+static int8_t s_lo4[(LO_PERIOD / 16 + PAIRS) * 64] __attribute__((aligned(16)));
 /* Sums of each aligned group of four demodulated samples, for the sync detector. */
 static int16_t s_blocks[HIST / 4];
 /* Next sample the sync detector looks at, always a multiple of 4. */
@@ -215,6 +221,12 @@ static void build_lo(void)
     for (int k = 0; k < LO_PERIOD + VIDEO_WIDTH + MIX; ++k) {
         float t = 2 * (float)M_PI * LO_CYCLES * (k % LO_PERIOD) / LO_PERIOD;
         s_lo[k] = (int32_t)lrintf(LO_AMP * cosf(t)) * 65536 + (int32_t)lrintf(LO_AMP * sinf(t));
+    }
+    for (int k = 0; k < (int)sizeof s_lo4 / 4; ++k) {
+        float t = 2 * (float)M_PI * LO_CYCLES * (k % LO_PERIOD) / LO_PERIOD;
+        int8_t *v = s_lo4 + k / 16 * 64 + k % 16 + (k & 8) * 4;
+        v[0] = (int8_t)lrintf(LO8_AMP * cosf(t));
+        v[16] = (int8_t)lrintf(LO8_AMP * sinf(t));
     }
 }
 
@@ -365,7 +377,7 @@ static void wait_strip(int k)
     s_strip_busy[k] = false;
 }
 
-static uint32_t s_prof_flush, s_prof_pix, s_prof_chroma, s_prof_lines;
+static uint32_t s_prof_flush, s_prof_pix, s_prof_chroma, s_prof_lines, s_prof_chroma1;
 static void flush_strip(void)
 {
     if (!s_strip_rows) return;
@@ -401,17 +413,19 @@ static uint8_t *strip_rows(int row, int n)
  * 720 samples at 13.5 MHz frame it in Rec. 601. */
 #define PICTURE_START (ACTIVE_START - (VIDEO_WIDTH - US(52.66)) / 2)
 /* The luma filter reads one sample before and two after each pixel. */
-#define LINE_SPAN (PICTURE_START + VIDEO_WIDTH + 3)
+#define LINE_SPAN (PICTURE_START + VIDEO_WIDTH + 32)
 /* A line's samples in one piece, for each core, when the line straddles the end of the ring. */
-static uint8_t s_wrapped[2][LINE_Q16 >> 16] __attribute__((aligned(4)));
+static uint8_t s_wrapped[2][(LINE_Q16 >> 16) + 64] __attribute__((aligned(16)));
 
 static const int8_t *line_samples(uint32_t l, uint8_t *wrapped)
 {
     uint32_t start = l % HIST;
     if (start + LINE_SPAN <= HIST) return s_hist + start;
-    memcpy(wrapped, s_hist + start, HIST - start);
-    memcpy(wrapped + HIST - start, s_hist, LINE_SPAN - (HIST - start));
-    return (const int8_t *)wrapped;
+    /* Keeping the ring's 16-byte alignment for PIE. */
+    uint32_t base = start & ~15u;
+    memcpy(wrapped, s_hist + base, HIST - base);
+    memcpy(wrapped + HIST - base, s_hist, LINE_SPAN + start - base - (HIST - base));
+    return (const int8_t *)wrapped + (start - base);
 }
 
 /* The sum of s[k] times the subcarrier lo[k], packed as in s_lo. */
@@ -437,24 +451,36 @@ static void measure_burst(const int8_t *s, uint32_t l)
     s_burst_im += (-(int16_t)m - s_burst_im) * 0.25f;
 }
 
+/* A line's chroma blocks, added to zr and zi from index 1: blocks on the absolute 8-sample grid, so
+ * samples and table are aligned for PIE, and each picture block interpolated from the two it straddles. */
+void chroma_mix(const int8_t *s, const int8_t *lo, int32_t *out, int pairs);
+
+static void chroma_blocks(const int8_t *s, uint32_t l, bool half, int32_t *zr, int32_t *zi)
+{
+    uint32_t a = l & ~15u;
+    int32_t b[PAIRS * 4];
+    chroma_mix(s - (l - a), s_lo4 + a % LO_PERIOD / 16 * 64, b, PAIRS);
+    const int32_t *p = b + ((l - a) >> 3) * 2;
+    int32_t f = (l & 7) * 2 + half;
+    for (int j = 0; j < VIDEO_WIDTH / MIX; ++j, p += 2) {
+        zr[j + 1] += p[0] + ((p[2] - p[0]) * f >> 4);
+        zi[j + 1] += p[1] + ((p[3] - p[1]) * f >> 4);
+    }
+}
+
 /* U - jV = -j z conj(burst) / |burst|^2 * 20 IRE for a block's mixed sum z, since the burst sits at 180
  * degrees on the U axis with 20 IRE amplitude; then full-range Cb and Cr at 100 IRE to 255. The signs
- * were set against SMPTE bars. */
-static void line_chroma(const int8_t *s, uint32_t l, uint32_t *uv)
+ * were set against SMPTE bars. zr and zi hold two lines' blocks from index 1, with room either side: the
+ * subcarrier turns half a cycle a line, so luma detail that leaks into chroma cancels while chroma adds. */
+static void chroma_words(int32_t *zr, int32_t *zi, uint32_t *uv)
 {
+    enum { N = VIDEO_WIDTH / MIX };
     float m2 = s_burst_re * s_burst_re + s_burst_im * s_burst_im;
-    /* The burst is summed over several blocks, and a chroma block's sum weighted 1 2 1 with its neighbours. */
-    float k = 20.0f * (BURST_END - BURST_START) / MIX / 4 * s_saturation / 100 / m2 * 4096;
+    /* The burst is summed over several blocks against the smaller table, and a chroma block's sum over two
+     * lines weighted 1 2 1 with its neighbours. */
+    float k = 20.0f * (BURST_END - BURST_START) / MIX / 8 * LO_AMP / LO8_AMP * s_saturation / 100 / m2 * 4096;
     float wr = s_burst_im * k, wi = s_burst_re * k;
     int32_t a1 = lrintf(2.925f * wr), a2 = lrintf(-2.925f * wi), a3 = lrintf(-2.074f * wi), a4 = lrintf(-2.074f * wr);
-    const int32_t *lo = s_lo + l % LO_PERIOD;
-    enum { N = VIDEO_WIDTH / MIX };
-    int32_t zr[N + 2], zi[N + 2];
-    for (int j = 0; j < N; ++j) {
-        int32_t m = mixed(s + j * MIX, lo + j * MIX);
-        zr[j + 1] = mixed_re(m);
-        zi[j + 1] = -(int16_t)m;
-    }
     zr[0] = zr[1], zi[0] = zi[1], zr[N + 1] = zr[N], zi[N + 1] = zi[N];
     /* Chroma sits where the FM noise is strongest, so trade some color resolution for a quieter picture. */
     for (int j = 0; j < N; ++j) {
@@ -466,22 +492,22 @@ static void line_chroma(const int8_t *s, uint32_t l, uint32_t *uv)
     }
 }
 
-/* A line for the drawing task: where it starts, where it goes, its chroma (none without color), and
- * whether it ends the field. */
+/* A line for the drawing task: where it starts, where it goes, whether it has color, and whether it ends
+ * the field. The first line of each pair also carries the pair's chroma blocks, which the second shares. */
 typedef struct {
     uint32_t l;
     int16_t row;
-    bool draw, last, half;
-    const uint32_t *uv;
+    bool draw, last, half, color;
+    int32_t *z;
 } job_t;
 
-/* Lines queued from sync detection on core 1 to drawing on core 0, and the chroma core 1 worked out
- * for each: per block of MIX pixels, Cb and Cr placed where the encoder's words want them. */
+/* Lines queued from sync detection on core 1 to drawing on core 0. */
 /* The sample ring holds about 38 lines, so a longer queue would only hold stale ones. */
 #define JOBS 40
+/* Chroma blocks summed over each pair of lines, real then imaginary, with room either side for smoothing. */
+static int32_t s_pair_z[JOBS / 2 + 2][2 * (VIDEO_WIDTH / MIX + 2)];
+static uint32_t s_pairs;
 static job_t s_jobs[JOBS];
-static uint32_t s_job_uv[JOBS][VIDEO_WIDTH / MIX];
-static const uint32_t *s_last_uv;
 static volatile uint32_t s_job_head, s_job_tail;
 static TaskHandle_t s_draw_task;
 static uint32_t s_draw_dropped, s_draw_full, s_draw_max_lag, s_draw_max_gap_us, s_draw_max_run_us;
@@ -667,11 +693,15 @@ static void draw_line(const job_t *j)
         /* The encoder reads its Y0 V Y1 U as big-endian halfwords, so in memory they are V Y0 U Y1. */
         uint32_t t0 = esp_cpu_get_cycle_count();
         ++s_prof_lines;
-        if (j->uv) {
+        if (j->color) {
+            /* Per block of MIX pixels, Cb and Cr placed where the encoder's words want them. */
+            static uint32_t uv[VIDEO_WIDTH / MIX];
+            if (j->z) chroma_words(j->z, j->z + VIDEO_WIDTH / MIX + 2, uv);
+            s_prof_chroma += esp_cpu_get_cycle_count() - t0;
             if (j->half)
-                luma_row(dst, s, j->uv, true);
+                luma_row(dst, s, uv, true);
             else
-                luma_row(dst, s, j->uv, false);
+                luma_row(dst, s, uv, false);
         } else {
             const uint8_t *map = s_map;
             const uint8_t *u = (const uint8_t *)s;
@@ -706,6 +736,8 @@ static void submit(const job_t *j)
     if (head % 4 == 3 || j->last) xTaskNotifyGive(s_draw_task);
 }
 
+static job_t s_held;
+
 static void render_line(void)
 {
     int row = (s_vline - FIRST_ACTIVE) * 2 + s_parity;
@@ -715,22 +747,30 @@ static void render_line(void)
         /* The line clock's nearest half sample. */
         uint32_t halves = (s_line_frac + 0x4000) >> 15;
         job_t j = {.l = s_line + (halves >> 1), .row = row, .draw = draw, .last = last, .half = halves & 1};
+        bool second = (s_vline - FIRST_ACTIVE) % 2;
         if (draw && s_job_head - s_job_tail < JOBS) {
-            uint32_t t0 = esp_cpu_get_cycle_count();
             const int8_t *src = line_samples(j.l, s_wrapped[1]);
             if (s_hit) measure_burst(src, j.l);
+            j.color = s_color;
             if (s_color) {
-                /* Every other line's chroma serves two, which halves its cost. */
-                if (s_vline % 2 == 0 || !s_last_uv) {
-                    uint32_t *uv = s_job_uv[s_job_head % JOBS];
-                    line_chroma(src + PICTURE_START, j.l + PICTURE_START, uv);
-                    s_last_uv = uv;
+                uint32_t t0 = esp_cpu_get_cycle_count();
+                int32_t *z = s_pair_z[s_pairs % (JOBS / 2 + 2)];
+                if (!second) {
+                    memset(z, 0, sizeof s_pair_z[0]);
+                    j.z = z;
                 }
-                j.uv = s_last_uv;
+                if (!second || s_held.z == z) chroma_blocks(src + PICTURE_START, j.l + PICTURE_START, j.half, z, z + VIDEO_WIDTH / MIX + 2);
+                s_prof_chroma1 += esp_cpu_get_cycle_count() - t0;
             }
-            s_prof_chroma += esp_cpu_get_cycle_count() - t0;
         }
-        submit(&j);
+        /* The first of each pair of lines waits for the second, whose chroma it shares. */
+        if (second) ++s_pairs;
+        if (s_held.draw || s_held.last) submit(&s_held);
+        s_held = (job_t){0};
+        if (j.draw && !second && !last)
+            s_held = j;
+        else
+            submit(&j);
     }
     if (s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1) emit_field();
 
@@ -1079,6 +1119,11 @@ static void status(void)
         (unsigned long)(s_demod_load.permille / 10), (unsigned long)(s_demod_load.permille % 10),
         (unsigned long)s_overruns, (unsigned long)(s_draw_load.permille / 10),
         (unsigned long)(s_draw_load.permille % 10), (unsigned long)s_draw_dropped);
+    if (s_prof_lines)
+        say("per drawn line: %lu cycles, %lu of them chroma, and %lu of chroma on core 1\n",
+            (unsigned long)(s_prof_pix / s_prof_lines), (unsigned long)(s_prof_chroma / s_prof_lines),
+            (unsigned long)(s_prof_chroma1 / s_prof_lines));
+    s_prof_pix = s_prof_chroma = s_prof_lines = s_prof_chroma1 = 0;
 }
 
 /* Runs the stopped decoder over whatever the ring holds, to price each stage per demodulated sample. */
