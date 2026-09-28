@@ -64,9 +64,9 @@
 #define EOF_BYTES (8 * NODE_BYTES)
 /* Enough raw words per DMA node for a steady DC estimate at little cost. */
 #define DC_WORDS 32
-/* The top 6 bits of I and Q index the phase table; at a working gain that costs about 0.5% of the
- * sync-to-white range, and the small table stays in the L1 cache. */
-#define LUT_SIZE (1 << 12)
+/* The raw word shifted right by two indexes the phase table: the top 6 bits of I, Q's constant bit and
+ * all 7 of Q. One shift per sample instead of five operations, and 16 KB still stays in the L1 cache. */
+#define LUT_SIZE (1 << 14)
 
 /* Gain keeps the I/Q RMS (in the lanes' 2v+1 units, full scale 127) in this range, which leaves the
  * 6-bit phase table enough resolution without clipping; below it the picture gets grainy. */
@@ -170,14 +170,14 @@ static uint32_t dma_offset(void)
     return off < RING_BYTES ? off : s_read;
 }
 
-/* Words carry I and Q as 2v+1 for signed 7-bit v; the table sees the top 6 bits of each, so it takes
- * the midpoint of the dropped bit, 4u+2 for signed 6-bit u. */
-#define IDX(x) ((((x) >> 2) & 0x3f) | (((x) >> 4) & 0xfc0))
+/* Words carry I and Q as 2v+1 for signed 7-bit v. The table sees the top 6 bits of I, so it takes the
+ * midpoint of the dropped bit, 4u+2 for signed 6-bit u. */
+#define IDX(x) ((x) >> 2)
 
 static void build_lut(uint8_t *lut, float dc_i, float dc_q)
 {
     for (int k = 0; k < LUT_SIZE; ++k) {
-        int i = ((int8_t)(k << 2) >> 2) * 4 + 2, q = ((int8_t)((k >> 6) << 2) >> 2) * 4 + 2;
+        int i = ((int8_t)(k << 2) >> 2) * 4 + 2, q = ((int8_t)((k >> 7) << 1) >> 1) * 2 + 1;
         float turns = atan2f(q - dc_q, i - dc_i) * (float)(0.5 / M_PI);
         lut[k] = (uint8_t)(int)lrintf(turns * 256);
     }
