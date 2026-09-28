@@ -25,6 +25,8 @@ static volatile bool s_log;
 static volatile bool s_c5rx;
 static SemaphoreHandle_t s_ready;
 static SemaphoreHandle_t s_reply;
+/* The console and the decoder's gain control both send requests. */
+static SemaphoreHandle_t s_request;
 static char s_reply_line[96];
 
 static void open_drain_high(int pin)
@@ -101,6 +103,7 @@ void c5_init(void)
     gpio_pullup_en(PIN_C5_RX);
     s_ready = xSemaphoreCreateBinary();
     s_reply = xSemaphoreCreateBinary();
+    s_request = xSemaphoreCreateMutex();
     xTaskCreate(relay_task, "c5_relay", 3072, NULL, 5, NULL);
 }
 
@@ -134,15 +137,14 @@ bool c5_request(const char *cmd, char *reply, size_t reply_len, uint32_t timeout
         strlcpy(reply, "err c5rx not running", reply_len);
         return false;
     }
+    xSemaphoreTake(s_request, portMAX_DELAY);
     xSemaphoreTake(s_reply, 0);
     uart_write_bytes(C5_UART, cmd, strlen(cmd));
     uart_write_bytes(C5_UART, "\n", 1);
-    if (xSemaphoreTake(s_reply, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        strlcpy(reply, "err no reply", reply_len);
-        return false;
-    }
-    strlcpy(reply, s_reply_line, reply_len);
-    return strncmp(reply, "ok", 2) == 0;
+    bool got = xSemaphoreTake(s_reply, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    strlcpy(reply, got ? s_reply_line : "err no reply", reply_len);
+    xSemaphoreGive(s_request);
+    return got && strncmp(reply, "ok", 2) == 0;
 }
 
 void c5_hold(void)
