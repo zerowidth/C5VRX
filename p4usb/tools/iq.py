@@ -5,6 +5,7 @@
     iq.py lanes in.bin         per-lane toggle rates and I/Q statistics
     iq.py field in.bin out.png FM-demodulate and draw the samples as NTSC lines
     iq.py gaps in.bin [every]  find hsync spacings that aren't whole lines, which mean lost samples
+    iq.py burst in.bin [every] look for an NTSC or PAL colorburst on the back porch
 
 Needs numpy, pillow and pyserial.
 """
@@ -121,12 +122,8 @@ def lut_demod(w, i, q, step=3):
     return (((p[1:] - p[:-1] + 128) % 256) - 128) * (RATE / 3) / 256
 
 
-def gaps(path, every=2):
-    """every: the C5 kept one of this many 80 MS/s bus samples (2 for 40 MS/s captures, 6 for the decoder)."""
-    w, i, q = load(path)
-    f = lut_demod(w, i, q, step=6 // every)
-    fs = RATE / 3
-    line = LINE * fs
+def hsyncs(f, fs):
+    """Leading and trailing edges of the hsync pulses in demodulated frequency f."""
     s = np.convolve(f, np.ones(6) / 6, "same")
     tip = np.percentile(s, 2)
     blank = np.median(s[(s > tip + 1e6) & (s < tip + 3e6)])
@@ -136,7 +133,18 @@ def gaps(path, every=2):
     ends = ends[np.searchsorted(ends, starts[0]) :]
     n = min(len(starts), len(ends))
     width = (ends[:n] - starts[:n]) / fs
-    hs = starts[:n][(width > 3.5e-6) & (width < 6e-6)].astype(float)
+    ok = (width > 3.5e-6) & (width < 6e-6)
+    return starts[:n][ok], ends[:n][ok], tip, blank
+
+
+def gaps(path, every=2):
+    """every: the C5 kept one of this many 80 MS/s bus samples (2 for 40 MS/s captures, 6 for the decoder)."""
+    w, i, q = load(path)
+    f = lut_demod(w, i, q, step=6 // every)
+    fs = RATE / 3
+    line = LINE * fs
+    hs, _, tip, blank = hsyncs(f, fs)
+    hs = hs.astype(float)
     r = np.diff(hs) / line
     off = np.abs(r - np.round(r))
     bad = np.flatnonzero((off > 0.03) & (np.round(r) >= 1) & (np.round(r) <= 3))
@@ -144,6 +152,25 @@ def gaps(path, every=2):
     print(f"{len(bad)} spacings off the line grid")
     for b in bad[:20]:
         print(f"  byte {int(hs[b] * 6)}: {r[b]:.3f} lines")
+
+
+def burst(path, every=2):
+    """Compares the back porch's spectrum at the NTSC and PAL subcarriers with FM noise either side."""
+    w, i, q = load(path)
+    f = lut_demod(w, i, q, step=6 // every)
+    fs = RATE / 3
+    _, ends, _, _ = hsyncs(f, fs)
+    # The burst starts about 0.6 us after the sync's trailing edge and lasts 2.5 us.
+    a, b = int(0.2e-6 * fs), int(3.6e-6 * fs)
+    ends = ends[ends + b < len(f)]
+    porch = np.array([f[e + a : e + b] - f[e + a : e + b].mean() for e in ends])
+    p = np.mean(np.abs(np.fft.rfft(porch, 512, axis=1)) ** 2, axis=0)
+    freq = np.fft.rfftfreq(512, 1 / fs)
+    print(f"{len(ends)} lines")
+    for name, fsc in (("NTSC", 315e6 / 88), ("PAL", 4.43361875e6)):
+        at = np.argmin(abs(freq - fsc))
+        side = np.r_[p[at - 30 : at - 10], p[at + 10 : at + 30]]
+        print(f"{name} {fsc / 1e6:.2f} MHz: {10 * np.log10(p[at] / np.median(side)):+.1f} dB over the noise beside it (a 40 IRE burst is some 20 dB)")
 
 
 if __name__ == "__main__":
@@ -154,5 +181,7 @@ if __name__ == "__main__":
         lanes(sys.argv[2])
     elif cmd == "gaps":
         gaps(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 2)
+    elif cmd == "burst":
+        burst(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 2)
     elif cmd == "field":
         field(sys.argv[2], sys.argv[3])
