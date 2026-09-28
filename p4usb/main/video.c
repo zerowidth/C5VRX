@@ -12,6 +12,7 @@
 
 #include "bridge.h"
 #include "console.h"
+#include "decode.h"
 #include "overlay.h"
 #include "uvc.h"
 
@@ -26,7 +27,7 @@
 #define JPEG_QUALITY_MIN 20
 #define JPEG_QUALITY_STEP 10
 #define JPEG_RAISE_AFTER 30
-#define TEXT_SCALE 3
+#define TEXT_HALVES 3
 #define MARKER 24
 
 typedef struct {
@@ -97,7 +98,7 @@ static void render(uint32_t seq)
     uint32_t ms = esp_timer_get_time() / 1000;
     uint32_t sent, skipped;
     uvc_counts(&sent, &skipped);
-    char lines[9][32];
+    char lines[10][32];
     snprintf(lines[0], sizeof lines[0], "C5VRX P4 TEST PATTERN");
     snprintf(lines[1], sizeof lines[1], "uptime %02lu:%02lu:%02lu.%03lu", (unsigned long)(ms / 3600000),
              (unsigned long)(ms / 60000 % 60), (unsigned long)(ms / 1000 % 60), (unsigned long)(ms % 1000));
@@ -109,10 +110,11 @@ static void render(uint32_t seq)
     snprintf(lines[6], sizeof lines[6], "usb    %lu sent %lu skip", (unsigned long)sent, (unsigned long)skipped);
     snprintf(lines[7], sizeof lines[7], "video  no decoded fields");
     snprintf(lines[8], sizeof lines[8], "bridge %s", bridge_active() ? "active" : "idle");
+    snprintf(lines[9], sizeof lines[9], "chan   %s%s", decode_channel(), decode_running() ? "" : ", stopped");
 
     memset(s_raw, 0, s_raw_size);
-    for (int i = 0; i < 9; ++i) {
-        overlay_text(s_raw, VIDEO_WIDTH, 48, 48 + i * 10 * TEXT_SCALE, TEXT_SCALE, lines[i]);
+    for (int i = 0; i < 10; ++i) {
+        overlay_text(s_raw, VIDEO_WIDTH, 48, 48 + i * 5 * TEXT_HALVES, TEXT_HALVES, lines[i]);
     }
     /* A sweeping block makes dropped or repeated frames visible. */
     int span = VIDEO_WIDTH - MARKER;
