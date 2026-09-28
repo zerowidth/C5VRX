@@ -80,6 +80,9 @@
 #define GAIN_MIN 30
 #define GAIN_MAX 80
 #define GAIN_STEP 2
+/* Heavy clipping, as when a signal returns while the gain sits at its maximum, steps down faster. */
+#define CLIP_PERMILLE_HEAVY 100
+#define GAIN_STEP_HEAVY 8
 
 /* The subcarrier is exactly 189/704 of the sample rate, so its phase repeats every 704 samples. The
  * mixing table's amplitude keeps a block's packed sine sum inside 16 bits. */
@@ -263,7 +266,8 @@ static void control(void)
     s_clip_permille = clipped * 1000 / n;
     if (s_agc) {
         int gain = s_gain;
-        if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
+        if (s_clip_permille > CLIP_PERMILLE_HEAVY) gain -= GAIN_STEP_HEAVY;
+        else if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
         else if (s_rms < RMS_LOW) gain += GAIN_STEP;
         gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
         if (gain != s_gain) set_gain(gain);
