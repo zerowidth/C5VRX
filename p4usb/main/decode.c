@@ -36,9 +36,8 @@
 #define BROAD_MIN US(18)
 /* Measured from the sync's leading edge as the detector sees it. */
 #define ACTIVE_START US(9.4)
-#define ACTIVE_Q16 ((uint32_t)(52.66 * FS_HZ / 1e6 * 65536))
-#define STEP_Q16 (ACTIVE_Q16 / VIDEO_WIDTH)
-#define RENDER_AT (ACTIVE_START + US(52.66) + 4)
+/* Once the line's last pixel and the luma filter's lookahead are demodulated. */
+#define RENDER_AT (ACTIVE_START + US(52.66) + 16)
 /* A detected hsync this close to the predicted one steers the line clock. */
 #define LOCK_WINDOW US(3)
 #define LOST_AFTER_LINES 30
@@ -52,10 +51,8 @@
 #define VSYNC_WINDOW 6
 #define VSYNC_REACQUIRE 3
 
-/* Demodulated samples waiting for the sync task on the other core: 2.5 ms. */
+/* Demodulated samples, 2.5 ms of them, which is how far drawing on the other core may fall behind. */
 #define HIST 32768
-/* The sync task keeps this far behind the demodulator at most, dropping older samples if it falls back. */
-#define SYNC_MAX_LAG (HIST - 4096)
 #define BOX 4
 
 /* The driver fills the ring in 4032-byte DMA nodes. Each soft-delimiter EOF ends the node it lands in
@@ -81,6 +78,20 @@
 #define GAIN_MAX 80
 #define GAIN_STEP 2
 
+/* The subcarrier is exactly 189/704 of the sample rate, so its phase repeats every 704 samples. The
+ * mixing table's amplitude keeps a block's packed sine sum inside 16 bits. */
+#define LO_PERIOD 704
+#define LO_CYCLES 189
+#define LO_AMP 31
+/* Samples per mixed block, about 0.6 us, which sets the color resolution. */
+#define MIX 8
+/* The burst lies 5.3-7.8 us after the sync's leading edge. */
+#define BURST_START 72
+#define BURST_END 104
+/* Filtered burst magnitude, in mixed units, that turns color on and back off. */
+#define COLOR_ON 700
+#define COLOR_OFF 400
+
 /* PARLIO RX's DMA request line on the P4's AXI-GDMA. */
 #define PARLIO_DMA_PERIPH 3
 
@@ -93,7 +104,6 @@ static uint32_t s_read;
 static int64_t s_read_us;
 static int64_t s_max_gap_us;
 static TaskHandle_t s_task;
-static TaskHandle_t s_sync_task;
 static volatile bool s_running;
 
 static uint8_t s_luts[2][LUT_SIZE];
@@ -108,6 +118,9 @@ static int s_rms, s_clip_permille;
 /* Demodulator and sync state, owned by the decode task. */
 /* Demodulated samples; the sync detector reads them four at a time. */
 static int8_t s_hist[HIST] __attribute__((aligned(4)));
+/* The subcarrier at each sample of its 704-sample period (and a picture's width beyond, so a line never
+ * wraps), packed as 65536 cos + sin so one multiply-add per sample mixes both. */
+static int32_t s_lo[LO_PERIOD + VIDEO_WIDTH + MIX];
 /* Sums of each aligned group of four demodulated samples, for the sync detector. */
 static int16_t s_blocks[HIST / 4];
 /* Next sample the sync detector looks at, always a multiple of 4. */
@@ -132,12 +145,14 @@ static uint32_t s_last_broad;
 static int s_tip = -57, s_blank = -17;
 /* Demodulated sample, as a uint8_t, to pixel level. */
 static uint8_t s_map[256];
+/* The same for the sum of four samples, which nulls the subcarrier's dots out of luma when there is color. */
+static uint8_t s_map4[1024];
 static uint8_t *s_frame;
 
 /* Per-field counters for the status line. */
 static uint32_t s_fields, s_field_hits, s_field_vsync;
 static uint32_t s_last_hits, s_last_vsync_ok;
-static uint32_t s_overruns, s_sync_overruns;
+static uint32_t s_overruns;
 /* Vertical syncs that moved the line count, beyond the first. */
 static uint32_t s_vjumps;
 /* Broad pulses that fell outside the vsync window, and fields in a row without a vsync in it. */
@@ -147,7 +162,7 @@ typedef struct {
     uint32_t busy_cycles, permille;
     int64_t start;
 } load_t;
-static load_t s_demod_load, s_sync_load;
+static load_t s_demod_load, s_draw_load;
 
 /* Only a wake-up: the driver counts one node per interrupt, so it falls behind when interrupts are late
  * and two nodes finish together. The decoder reads the DMA's position from the hardware instead. */
@@ -181,12 +196,22 @@ static uint32_t dma_offset(void)
  * midpoint of the dropped bit, 4u+2 for signed 6-bit u. */
 #define IDX(x) ((x) >> 2)
 
-static void build_lut(uint8_t *lut, float dc_i, float dc_q)
+/* Yields every 1024 entries when asked, so a rebuild at high priority never holds sync up for long. */
+static void build_lut(uint8_t *lut, float dc_i, float dc_q, bool yield)
 {
     for (int k = 0; k < LUT_SIZE; ++k) {
+        if (yield && k % 1024 == 0) vTaskDelay(1);
         int i = ((int8_t)(k << 2) >> 2) * 4 + 2, q = ((int8_t)((k >> 7) << 1) >> 1) * 2 + 1;
         float turns = atan2f(q - dc_q, i - dc_i) * (float)(0.5 / M_PI);
         lut[k] = (uint8_t)(int)lrintf(turns * 256);
+    }
+}
+
+static void build_lo(void)
+{
+    for (int k = 0; k < LO_PERIOD + VIDEO_WIDTH + MIX; ++k) {
+        float t = 2 * (float)M_PI * LO_CYCLES * (k % LO_PERIOD) / LO_PERIOD;
+        s_lo[k] = (int32_t)lrintf(LO_AMP * cosf(t)) * 65536 + (int32_t)lrintf(LO_AMP * sinf(t));
     }
 }
 
@@ -221,7 +246,7 @@ static void control(void)
     int qi = lrintf(dc_i * 4), qq = lrintf(dc_q * 4);
     if (abs(qi - s_lut_dc_i) < 2 && abs(qq - s_lut_dc_q) < 2) return;
     uint8_t *spare = s_lut == s_luts[0] ? s_luts[1] : s_luts[0];
-    build_lut(spare, qi / 4.0f, qq / 4.0f);
+    build_lut(spare, qi / 4.0f, qq / 4.0f, true);
     s_lut = spare;
     s_lut_dc_i = qi;
     s_lut_dc_q = qq;
@@ -264,19 +289,41 @@ static void set_thresholds(void)
         int pix = (v - s_blank) * 255 * 2 / (span * 5);
         s_map[(uint8_t)v] = pix < 0 ? 0 : pix > 255 ? 255 : pix;
     }
+    for (int v = -512; v < 512; ++v) {
+        int pix = (v - 4 * s_blank) * 255 * 2 / (span * 20);
+        s_map4[v + 512] = pix < 0 ? 0 : pix > 255 ? 255 : pix;
+    }
 }
+
+/* The burst vector, filtered over lines, and the color killer's state. */
+static float s_burst_re, s_burst_im;
+static int s_burst;
+static bool s_color;
+static int s_saturation = 100;
 
 static void flush_strip(void);
 static void wait_strip(int k);
 
-static void emit_field(void)
+static uint32_t s_finish_max_us;
+
+/* The drawing side's end of a field: hand the frame to the encoder. */
+static void finish_field(void)
 {
-    if (!s_field_vsync && s_vsync_missed < VSYNC_REACQUIRE) ++s_vsync_missed;
+    int64_t t0 = esp_timer_get_time();
     flush_strip();
     wait_strip(0);
     wait_strip(1);
     video_field_done();
     s_frame = video_field_buffer();
+    if (esp_timer_get_time() - t0 > s_finish_max_us) s_finish_max_us = esp_timer_get_time() - t0;
+}
+
+/* The sync side's end of a field. */
+static void emit_field(void)
+{
+    if (!s_field_vsync && s_vsync_missed < VSYNC_REACQUIRE) ++s_vsync_missed;
+    s_burst = (int)hypotf(s_burst_re, s_burst_im);
+    s_color = s_burst > (s_color ? COLOR_OFF : COLOR_ON);
     update_levels();
     ++s_fields;
     s_last_hits = s_field_hits;
@@ -289,7 +336,8 @@ static bool s_skip_render, s_skip_detect;
 /* Lines are rendered, doubled, into internal RAM and DMA'd to the PSRAM frame a strip at a time: the
  * core writing PSRAM through its cache costs several cycles a byte. */
 #define STRIP_ROWS 16
-static uint8_t s_strips[2][STRIP_ROWS * VIDEO_WIDTH] __attribute__((aligned(64)));
+#define ROW_BYTES (VIDEO_WIDTH * 2)
+static uint8_t s_strips[2][STRIP_ROWS * ROW_BYTES] __attribute__((aligned(64)));
 static int s_strip, s_strip_rows, s_strip_row0;
 static volatile bool s_strip_busy[2];
 static async_memcpy_handle_t s_mcp;
@@ -310,19 +358,22 @@ static void wait_strip(int k)
     s_strip_busy[k] = false;
 }
 
+static uint32_t s_prof_flush, s_prof_pix, s_prof_chroma, s_prof_lines;
 static void flush_strip(void)
 {
     if (!s_strip_rows) return;
+    uint32_t t0 = esp_cpu_get_cycle_count();
     int rows = s_strip_rows;
     if (s_strip_row0 + rows > VIDEO_HEIGHT) rows = VIDEO_HEIGHT - s_strip_row0;
     s_strip_busy[s_strip] = true;
-    if (esp_async_memcpy(s_mcp, s_frame + s_strip_row0 * VIDEO_WIDTH, s_strips[s_strip], rows * VIDEO_WIDTH, strip_done,
+    if (esp_async_memcpy(s_mcp, s_frame + s_strip_row0 * ROW_BYTES, s_strips[s_strip], rows * ROW_BYTES, strip_done,
                          (void *)s_strip) != ESP_OK) {
         s_strip_busy[s_strip] = false;
         ++s_strip_errors;
     }
     s_strip ^= 1;
     s_strip_rows = 0;
+    s_prof_flush += esp_cpu_get_cycle_count() - t0;
 }
 
 /* Room for rows row and row + 1 of the frame. */
@@ -334,45 +385,162 @@ static uint8_t *strip_rows(int row)
         wait_strip(s_strip);
         s_strip_row0 = row;
     }
-    uint8_t *dst = s_strips[s_strip] + s_strip_rows * VIDEO_WIDTH;
+    uint8_t *dst = s_strips[s_strip] + s_strip_rows * ROW_BYTES;
     s_strip_rows += 2;
     return dst;
 }
 
-/* Which sample each pixel takes, from the line's start, for four steps of the line clock's fraction. */
-#define PHASES 4
-static uint16_t s_offs[PHASES][VIDEO_WIDTH];
-#define LINE_SPAN (ACTIVE_START + US(52.66) + 2)
-static uint8_t s_wrapped[LINE_Q16 >> 16] __attribute__((aligned(4)));
+/* Each pixel is one sample: 720 at 13.33 MS/s span 54 us, centred on the 52.66 us picture, much as
+ * 720 samples at 13.5 MHz frame it in Rec. 601. */
+#define PICTURE_START (ACTIVE_START - (VIDEO_WIDTH - US(52.66)) / 2)
+/* The luma filter reads one sample before and two after each pixel. */
+#define LINE_SPAN (PICTURE_START + VIDEO_WIDTH + 3)
+/* A line's samples in one piece, for each core, when the line straddles the end of the ring. */
+static uint8_t s_wrapped[2][LINE_Q16 >> 16] __attribute__((aligned(4)));
 
-static void build_offsets(void)
+static const int8_t *line_samples(uint32_t l, uint8_t *wrapped)
 {
-    for (int f = 0; f < PHASES; ++f) {
-        uint32_t p = ((uint32_t)ACTIVE_START << 16) + (2 * f + 1) * 65536 / (2 * PHASES) + 0x8000;
-        for (int x = 0; x < VIDEO_WIDTH; ++x, p += STEP_Q16) s_offs[f][x] = p >> 16;
+    uint32_t start = l % HIST;
+    if (start + LINE_SPAN <= HIST) return s_hist + start;
+    memcpy(wrapped, s_hist + start, HIST - start);
+    memcpy(wrapped + HIST - start, s_hist, LINE_SPAN - (HIST - start));
+    return (const int8_t *)wrapped;
+}
+
+/* The sum of s[k] times the subcarrier lo[k], packed as in s_lo. */
+static inline int32_t mixed(const int8_t *s, const int32_t *lo)
+{
+    return s[0] * lo[0] + s[1] * lo[1] + s[2] * lo[2] + s[3] * lo[3] + s[4] * lo[4] + s[5] * lo[5] + s[6] * lo[6] +
+           s[7] * lo[7];
+}
+
+static int32_t mixed_re(int32_t m)
+{
+    return (m - (int16_t)m) >> 16;
+}
+
+/* The mixing table follows the absolute sample count, so the burst's phase against it is fixed and
+ * averaging over lines only removes noise. */
+static void measure_burst(const int8_t *s, uint32_t l)
+{
+    int32_t m = 0;
+    const int32_t *lo = s_lo + l % LO_PERIOD;
+    for (int k = BURST_START; k + MIX <= BURST_END; k += MIX) m += mixed(s + k, lo + k);
+    s_burst_re += (mixed_re(m) - s_burst_re) * 0.25f;
+    s_burst_im += (-(int16_t)m - s_burst_im) * 0.25f;
+}
+
+/* U - jV = -j z conj(burst) / |burst|^2 * 20 IRE for a block's mixed sum z, since the burst sits at 180
+ * degrees on the U axis with 20 IRE amplitude; then full-range Cb and Cr at 100 IRE to 255. The signs
+ * were set against SMPTE bars. */
+static void line_chroma(const int8_t *s, uint32_t l, uint32_t *uv)
+{
+    float m2 = s_burst_re * s_burst_re + s_burst_im * s_burst_im;
+    float k = 20.0f * s_saturation / 100 / m2 * 4096;
+    float wr = s_burst_im * k, wi = s_burst_re * k;
+    int32_t a1 = lrintf(2.925f * wr), a2 = lrintf(-2.925f * wi), a3 = lrintf(-2.074f * wi), a4 = lrintf(-2.074f * wr);
+    const int32_t *lo = s_lo + l % LO_PERIOD;
+    for (int j = 0; j < VIDEO_WIDTH / MIX; ++j) {
+        int32_t m = mixed(s + j * MIX, lo + j * MIX);
+        int32_t re = mixed_re(m), im = -(int16_t)m;
+        int32_t cb = 128 + ((re * a1 + im * a2) >> 12), cr = 128 + ((re * a3 + im * a4) >> 12);
+        cb = cb < 0 ? 0 : cb > 255 ? 255 : cb;
+        cr = cr < 0 ? 0 : cr > 255 ? 255 : cr;
+        uv[j] = (uint32_t)cr | (uint32_t)cb << 16;
     }
+}
+
+/* A line for the drawing task: where it starts, where it goes, its chroma (none without color), and
+ * whether it ends the field. */
+typedef struct {
+    uint32_t l;
+    int16_t row;
+    bool draw, last;
+    const uint32_t *uv;
+} job_t;
+
+/* Lines queued from sync detection on core 1 to drawing on core 0, and the chroma core 1 worked out
+ * for each: per block of MIX pixels, Cb and Cr placed where the encoder's words want them. */
+/* The sample ring holds about 38 lines, so a longer queue would only hold stale ones. */
+#define JOBS 40
+static job_t s_jobs[JOBS];
+static uint32_t s_job_uv[JOBS][VIDEO_WIDTH / MIX];
+static const uint32_t *s_last_uv;
+static volatile uint32_t s_job_head, s_job_tail;
+static TaskHandle_t s_draw_task;
+static uint32_t s_draw_dropped, s_draw_full, s_draw_max_lag, s_draw_max_gap_us, s_draw_max_run_us;
+
+static void draw_line(const job_t *j)
+{
+    if (j->draw) {
+        uint32_t *dst = (uint32_t *)strip_rows(j->row);
+        const int8_t *s = line_samples(j->l, s_wrapped[0]) + PICTURE_START;
+        /* The encoder reads its Y0 V Y1 U as big-endian halfwords, so in memory they are V Y0 U Y1. */
+        uint32_t t0 = esp_cpu_get_cycle_count();
+        ++s_prof_lines;
+        if (j->uv) {
+            const uint8_t *map4 = s_map4 + 512;
+            const uint32_t *uv = j->uv;
+            int32_t p0 = s[-1], p1 = s[0], p2 = s[1];
+            for (int x = 0; x < VIDEO_WIDTH; x += 2) {
+                int32_t p3 = s[x + 2], p4 = s[x + 3];
+                int32_t a = p0 + p1 + p2 + p3, b = a - p0 + p4;
+                dst[x / 2] = (uint32_t)map4[a] << 8 | (uint32_t)map4[b] << 24 | uv[x / MIX];
+                p0 = p2;
+                p1 = p3;
+                p2 = p4;
+            }
+        } else {
+            const uint8_t *map = s_map;
+            const uint8_t *u = (const uint8_t *)s;
+            for (int x = 0; x < VIDEO_WIDTH; x += 2) dst[x / 2] = (uint32_t)map[u[x]] << 8 | (uint32_t)map[u[x + 1]] << 24 | 0x00800080u;
+        }
+        memcpy(dst + VIDEO_WIDTH / 2, dst, ROW_BYTES);
+        s_prof_pix += esp_cpu_get_cycle_count() - t0;
+    }
+    if (j->last) finish_field();
+}
+
+static void submit(const job_t *j)
+{
+    uint32_t head = s_job_head;
+    if (!s_draw_task) {
+        draw_line(j);
+        return;
+    }
+    if (head - s_job_tail >= JOBS) {
+        ++s_draw_full;
+        return;
+    }
+    s_jobs[head % JOBS] = *j;
+    __atomic_store_n(&s_job_head, head + 1, __ATOMIC_RELEASE);
+    if (head % 4 == 3 || j->last) xTaskNotifyGive(s_draw_task);
 }
 
 static void render_line(void)
 {
     int row = (s_vline - FIRST_ACTIVE) * 2 + s_parity;
-    if (!s_skip_render && s_vline >= FIRST_ACTIVE && s_vline < FIRST_ACTIVE + ACTIVE_LINES && row < VIDEO_HEIGHT) {
-        uint32_t *dst = (uint32_t *)strip_rows(row);
-        uint32_t start = s_line % HIST;
-        const uint8_t *src = (const uint8_t *)s_hist + start;
-        if (start + LINE_SPAN > HIST) {
-            memcpy(s_wrapped, src, HIST - start);
-            memcpy(s_wrapped + HIST - start, s_hist, LINE_SPAN - (HIST - start));
-            src = s_wrapped;
+    bool last = s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1;
+    bool draw = !s_skip_render && s_vline >= FIRST_ACTIVE && s_vline < FIRST_ACTIVE + ACTIVE_LINES && row < VIDEO_HEIGHT;
+    if (draw || last) {
+        /* The line clock's nearest sample. */
+        job_t j = {.l = s_line + (s_line_frac >> 15), .row = row, .draw = draw, .last = last};
+        if (draw && s_job_head - s_job_tail < JOBS) {
+            uint32_t t0 = esp_cpu_get_cycle_count();
+            const int8_t *src = line_samples(j.l, s_wrapped[1]);
+            if (s_hit) measure_burst(src, j.l);
+            if (s_color) {
+                /* Every other line's chroma serves two, which halves its cost. */
+                if (s_vline % 2 == 0 || !s_last_uv) {
+                    uint32_t *uv = s_job_uv[s_job_head % JOBS];
+                    line_chroma(src + PICTURE_START, j.l + PICTURE_START, uv);
+                    s_last_uv = uv;
+                }
+                j.uv = s_last_uv;
+            }
+            s_prof_chroma += esp_cpu_get_cycle_count() - t0;
         }
-        const uint16_t *off = s_offs[s_line_frac * PHASES >> 16];
-        const uint8_t *map = s_map;
-        /* Four pixels per store, so the loads needn't wait on the byte stores they might alias. */
-        for (int x = 0; x < VIDEO_WIDTH; x += 4) {
-            uint32_t a = src[off[x]], b = src[off[x + 1]], c = src[off[x + 2]], d = src[off[x + 3]];
-            dst[x / 4] = map[a] | map[b] << 8 | map[c] << 16 | (uint32_t)map[d] << 24;
-        }
-        memcpy(dst + VIDEO_WIDTH / 4, dst, VIDEO_WIDTH);
+        submit(&j);
     }
     if (s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1) emit_field();
 
@@ -469,6 +637,11 @@ static void detect(uint32_t until)
                 uint32_t end = refine(nb + 3, false, thr_hi);
                 on_pulse(s_low_start, end - s_low_start);
                 render_at = s_render_at;
+                /* Locked in the picture, nothing matters until the next hsync's window, so skip there. */
+                if (s_hit && s_vline > VSYNC_LINE + VSYNC_WINDOW && s_vline < FIELD_LINES - VSYNC_WINDOW - 1) {
+                    uint32_t skip = (s_line + (s_period >> 16) - LOCK_WINDOW - 8) & ~3u;
+                    if ((int32_t)(skip - nb) > 4) nb = skip - 4;
+                }
             }
         } else if (b < thr_lo) {
             low = true;
@@ -532,8 +705,7 @@ static void process(const uint16_t *w, uint32_t words)
     }
     __atomic_store_n(&s_n, n, __ATOMIC_RELEASE);
     s_prev_phase = prev;
-    if (s_sync_task) xTaskNotifyGive(s_sync_task);
-    else if (!s_skip_detect) detect(n);
+    if (!s_skip_detect) detect(n);
 }
 
 /* Rebuilding the table takes a couple of milliseconds, too long to hold up the decode task. */
@@ -556,19 +728,31 @@ static void account(load_t *l, uint32_t t0)
     }
 }
 
-/* Sync detection, the line clock and rendering run here, on core 0, behind the demodulator on core 1. */
-static void sync_task(void *arg)
+/* Lines are drawn here, on core 0, a few behind sync detection on core 1. */
+static void draw_task(void *arg)
 {
+    int64_t last = esp_timer_get_time();
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        int64_t woke = esp_timer_get_time();
         uint32_t t0 = esp_cpu_get_cycle_count();
-        uint32_t n = __atomic_load_n(&s_n, __ATOMIC_ACQUIRE);
-        if (n - s_nb > SYNC_MAX_LAG) {
-            ++s_sync_overruns;
-            s_nb = n - SYNC_MAX_LAG / 2;
+        uint32_t head = __atomic_load_n(&s_job_head, __ATOMIC_ACQUIRE);
+        uint32_t pending = head - s_job_tail;
+        for (; s_job_tail != head; ++s_job_tail) {
+            job_t j = s_jobs[s_job_tail % JOBS];
+            if (s_n - j.l > s_draw_max_lag) s_draw_max_lag = s_n - j.l;
+            /* The demodulator has overwritten a line this far behind it. */
+            if (j.draw && s_n - j.l > HIST - LINE_SPAN - 4096) {
+                j.draw = false;
+                ++s_draw_dropped;
+            }
+            draw_line(&j);
         }
-        detect(n);
-        account(&s_sync_load, t0);
+        int64_t done = esp_timer_get_time();
+        if (pending > 8 && woke - last > s_draw_max_gap_us) s_draw_max_gap_us = woke - last;
+        if (done - woke > s_draw_max_run_us) s_draw_max_run_us = done - woke;
+        last = done;
+        account(&s_draw_load, t0);
     }
 }
 
@@ -646,19 +830,21 @@ static void start(const char *channel)
             say("decode: no memory for the ring\n");
             return;
         }
-        build_lut(s_luts[0], 0, 0);
-        build_offsets();
+        build_lut(s_luts[0], 0, 0, false);
+        build_lo();
         async_memcpy_config_t mcfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
         if (esp_async_memcpy_install_gdma_axi(&mcfg, &s_mcp) != ESP_OK) {
             say("decode: no DMA channel for the frame\n");
             return;
         }
-        xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 1, NULL, 0);
+        /* Above sync, so the gain comes down even when a clipped signal floods the sync detector. */
+        xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 6, NULL, 0);
         set_thresholds();
         s_frame = video_field_buffer();
-        /* The demodulator has core 1 to itself; sync and rendering share core 0 with the DMA interrupt,
-         * USB and the console. */
-        xTaskCreatePinnedToCore(sync_task, "decode_sync", 4096, NULL, 9, &s_sync_task, 0);
+        /* Demodulation and sync detection stream through every sample on core 1; drawing shares core 0 with
+         * the DMA interrupt, USB and the console, level with USB and below the console so an overloaded
+         * decoder can't take the console with it. */
+        xTaskCreatePinnedToCore(draw_task, "decode_draw", 4096, NULL, 5, &s_draw_task, 0);
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
     if (!iq_start(channel, EVERY)) return;
@@ -685,14 +871,20 @@ static void status(void)
         s_clip_permille / 10, s_clip_permille % 10);
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT, s_blank * KHZ_PER_UNIT,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
+    say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
+    say("draw: %lu stale, %lu queue full, max lag %lu samples\n", (unsigned long)s_draw_dropped, (unsigned long)s_draw_full, (unsigned long)s_draw_max_lag);
+    say("longest field hand-off %lu us, longest wait with 8+ lines queued %lu us, longest run %lu us\n",
+        (unsigned long)s_finish_max_us, (unsigned long)s_draw_max_gap_us, (unsigned long)s_draw_max_run_us);
+    s_draw_max_gap_us = s_draw_max_run_us = 0;
+    s_draw_max_lag = s_finish_max_us = 0;
     say("%lu waits on the frame DMA, %lu errors\n", (unsigned long)s_strip_waits, (unsigned long)s_strip_errors);
     say("longest gap between ring reads since last asked %lld us, of the %lld us the ring holds\n", s_max_gap_us,
         RING_US);
     s_max_gap_us = 0;
-    say("demod on core 1 %lu.%lu%% with %lu overruns, sync on core 0 %lu.%lu%% with %lu\n",
+    say("demod and sync on core 1 %lu.%lu%% with %lu overruns, drawing on core 0 %lu.%lu%% with %lu lines dropped\n",
         (unsigned long)(s_demod_load.permille / 10), (unsigned long)(s_demod_load.permille % 10),
-        (unsigned long)s_overruns, (unsigned long)(s_sync_load.permille / 10),
-        (unsigned long)(s_sync_load.permille % 10), (unsigned long)s_sync_overruns);
+        (unsigned long)s_overruns, (unsigned long)(s_draw_load.permille / 10),
+        (unsigned long)(s_draw_load.permille % 10), (unsigned long)s_draw_dropped);
 }
 
 /* Runs the stopped decoder over whatever the ring holds, to price each stage per demodulated sample. */
@@ -702,8 +894,8 @@ static void bench(void)
         say("decode: bench needs a stopped decoder that has run\n");
         return;
     }
-    TaskHandle_t sync = s_sync_task;
-    s_sync_task = NULL;
+    TaskHandle_t draw = s_draw_task;
+    s_draw_task = NULL;
     const uint32_t small = 2048, small_rounds = 200;
     s_skip_detect = true;
     uint32_t c0 = esp_cpu_get_cycle_count();
@@ -712,6 +904,7 @@ static void bench(void)
     say("demod, 4 KB cached: %lu.%02lu cycles per sample\n", (unsigned long)(cs / (small * small_rounds)),
         (unsigned long)(cs * 100ull / (small * small_rounds) % 100));
     const uint32_t words = RING_BYTES / 2, rounds = 20;
+    s_prof_flush = s_prof_pix = s_prof_chroma = s_prof_lines = 0;
     for (int pass = 0; pass < 3; ++pass) {
         s_skip_detect = pass == 0;
         s_skip_render = pass <= 1;
@@ -723,7 +916,11 @@ static void bench(void)
             (unsigned long)(cycles * 100ull / (words * rounds) % 100));
     }
     s_skip_render = s_skip_detect = false;
-    s_sync_task = sync;
+    s_draw_task = draw;
+    if (s_prof_lines)
+        say("per rendered line: %lu cycles, %lu of them chroma; strip flushes %lu cycles per line\n",
+            (unsigned long)(s_prof_pix / s_prof_lines), (unsigned long)(s_prof_chroma / s_prof_lines),
+            (unsigned long)(s_prof_flush / s_prof_lines));
     say("budget at %d MHz: %lu cycles per sample\n", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         (unsigned long)(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000ull / FS_HZ));
 }
@@ -763,6 +960,8 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "gain") == 0 && argc > 2) {
         s_agc = strcmp(argv[2], "auto") == 0;
         if (!s_agc) set_gain(atoi(argv[2]));
+    } else if (strcmp(sub, "sat") == 0 && argc > 2) {
+        s_saturation = atoi(argv[2]);
     } else if (strcmp(sub, "rx") == 0) {
         /* The ring reader alone, on whatever the C5 is already sending (for example its link counter). */
         decode_stop();
@@ -775,6 +974,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | rx | tap | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | rx | tap | bench]\n");
     }
 }

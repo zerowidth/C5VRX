@@ -19,3 +19,8 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
 
 # The decoder's per-sample loop needs optimized code.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# The JPEG encoder writes its whole input back from the cache inside a critical section, which held
+# core 0 for about 5 ms per frame; in 32 KB chunks the decoder's drawing task gets in between.
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS_MAX_LEN=0x8000

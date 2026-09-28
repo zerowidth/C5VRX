@@ -25,7 +25,7 @@ bool video_next(video_reader_t who, video_frame_t *f, TickType_t wait);
 /* The newest frame, even if this reader already took it. */
 bool video_newest(video_reader_t who, video_frame_t *f);
 void video_release(video_reader_t who);
-/* A 720x480 grayscale frame for the NTSC decoder to fill; video_field_done hands it to the encoder
+/* A 720x480 YUV 4:2:2 frame (each pixel pair V Y0 U Y1 in memory) for the NTSC decoder to fill; video_field_done hands it to the encoder
  * and the next call returns the other one. The test pattern runs whenever no field has arrived for 100 ms. */
 uint8_t *video_field_buffer(void);
 void video_field_done(void);

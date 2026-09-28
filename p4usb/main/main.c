@@ -1,4 +1,6 @@
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "bridge.h"
 #include "c5.h"
@@ -16,6 +18,8 @@ void app_main(void)
     gpio_set_direction(PIN_C5_TX, GPIO_MODE_INPUT);
     gpio_set_pull_mode(PIN_C5_TX, GPIO_FLOATING);
 
+    /* Above the decoder, so the console and the flashing bridge answer however busy it gets. */
+    vTaskPrioritySet(NULL, 6);
     console_init();
     c5_init();
     video_init();

@@ -37,6 +37,7 @@ static uint32_t s_taken[VIDEO_READERS];
 static SemaphoreHandle_t s_published;
 static uint8_t *s_raw;
 static size_t s_raw_size;
+static size_t s_field_size;
 /* The decoder fills one while the encoder reads the other. */
 static uint8_t *s_field[2];
 static int s_fill;
@@ -132,20 +133,20 @@ static uint8_t *add_comment(uint8_t *jpeg, uint32_t *len, uint32_t seq, int64_t 
     return start;
 }
 
-static void encode(const uint8_t *raw, uint32_t seq, int64_t t_us)
+static void encode(const uint8_t *raw, size_t size, bool color, uint32_t seq, int64_t t_us)
 {
-    static const jpeg_encode_cfg_t cfg = {
+    const jpeg_encode_cfg_t cfg = {
         .width = VIDEO_WIDTH,
         .height = VIDEO_HEIGHT,
-        .src_type = JPEG_ENCODE_IN_FORMAT_GRAY,
-        .sub_sample = JPEG_DOWN_SAMPLING_GRAY,
+        .src_type = color ? JPEG_ENCODE_IN_FORMAT_YUV422 : JPEG_ENCODE_IN_FORMAT_GRAY,
+        .sub_sample = color ? JPEG_DOWN_SAMPLING_YUV422 : JPEG_DOWN_SAMPLING_GRAY,
         .image_quality = JPEG_QUALITY,
     };
     int w = writable_slot();
     slot_t *s = &s_slots[w];
     uint8_t *out = s->base + HEAD_ROOM;
     uint32_t len = 0;
-    esp_err_t err = jpeg_encoder_process(s_enc, &cfg, raw, s_raw_size, out, s->cap - HEAD_ROOM, &len);
+    esp_err_t err = jpeg_encoder_process(s_enc, &cfg, raw, size, out, s->cap - HEAD_ROOM, &len);
     if (err != ESP_OK) {
         ++s_errors;
         s_last_error = err;
@@ -169,7 +170,8 @@ static void video_task(void *arg)
         uint32_t seq = s_frames + 1;
         int64_t t0 = esp_timer_get_time();
         const uint8_t *raw;
-        if (bits & NOTIFY_FIELD) {
+        bool field = bits & NOTIFY_FIELD;
+        if (field) {
             raw = s_field[s_ready];
             s_last_field_us = t0;
         } else if (t0 - s_last_field_us > PATTERN_AFTER_US) {
@@ -179,7 +181,7 @@ static void video_task(void *arg)
             continue;
         }
         int64_t t1 = esp_timer_get_time();
-        encode(raw, seq, t0);
+        encode(raw, field ? s_field_size : s_raw_size, field, seq, t0);
         int64_t t2 = esp_timer_get_time();
         s_render_us = t1 - t0;
         s_encode_us = t2 - t1;
@@ -204,7 +206,7 @@ void video_init(void)
     s_raw = jpeg_alloc_encoder_mem(VIDEO_WIDTH * VIDEO_HEIGHT, &in, &s_raw_size);
     assert(s_raw);
     for (int i = 0; i < 2; ++i) {
-        s_field[i] = jpeg_alloc_encoder_mem(VIDEO_WIDTH * VIDEO_HEIGHT, &in, &s_raw_size);
+        s_field[i] = jpeg_alloc_encoder_mem(VIDEO_WIDTH * VIDEO_HEIGHT * 2, &in, &s_field_size);
         assert(s_field[i]);
     }
     for (int i = 0; i < JPEG_SLOTS; ++i) {
@@ -213,7 +215,9 @@ void video_init(void)
     }
     s_published = xSemaphoreCreateBinary();
 
-    xTaskCreate(video_task, "video", 4096, NULL, 4, &s_task);
+    /* On core 1, below the demodulator: the encoder driver's cache write-back of each frame is the
+     * biggest CPU cost here, and core 0 draws the decoder's lines. */
+    xTaskCreatePinnedToCore(video_task, "video", 4096, NULL, 4, &s_task, 1);
     const esp_timer_create_args_t timer = {.callback = tick, .name = "video"};
     esp_timer_handle_t h;
     ESP_ERROR_CHECK(esp_timer_create(&timer, &h));
