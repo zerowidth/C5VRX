@@ -102,6 +102,8 @@
 #define PORCH_START 72
 #define PORCH_END 112
 #define LEVEL_LINES_MIN 60
+/* Hsyncs in a field for it to count as locked, which color needs, since noise's random burst adds up. */
+#define LOCKED_HITS 200
 #define COLOR_ON 700
 #define COLOR_OFF 400
 
@@ -280,6 +282,7 @@ static void control(void)
 /* Until lines lock, levels come from each field's histogram: the sync tip is the 2nd percentile and
  * blanking is the median of what lies 1-3 MHz above it. */
 static void set_thresholds(void);
+static void set_maps(void);
 
 static void update_levels(void)
 {
@@ -303,10 +306,13 @@ static void update_levels(void)
         tip = s_tip_sum * 16 / (s_level_lines * (TIP_END - TIP_START));
         blank = s_porch_sum * 16 / (s_level_lines * (PORCH_END - PORCH_START));
     }
+    bool locked = s_level_lines >= LEVEL_LINES_MIN;
     s_tip_sum = s_porch_sum = s_level_lines = 0;
     s_tip = (3 * s_tip + tip) / 4;
     s_blank = (3 * s_blank + blank) / 4;
     set_thresholds();
+    /* Noise keeps the last locked picture levels, so it shows as snow rather than a gray wash. */
+    if (locked) set_maps();
 }
 
 static void set_thresholds(void)
@@ -316,6 +322,12 @@ static void set_thresholds(void)
     int thr = (s_tip + s_blank) / 32, hyst = span / 128;
     s_thr_lo = BOX * (thr - hyst);
     s_thr_hi = BOX * (thr + hyst);
+}
+
+static void set_maps(void)
+{
+    int span = s_blank - s_tip;
+    if (span < 8 * 16) span = 8 * 16;
     /* White is 100 IRE above blanking, and sync 40 below. */
     for (int v = -128; v < 128; ++v) {
         int pix = (v * 16 - s_blank) * 255 * 2 / (span * 5);
@@ -359,7 +371,7 @@ static void emit_field(void)
 {
     if (!s_field_vsync && s_vsync_missed < VSYNC_REACQUIRE) ++s_vsync_missed;
     s_burst = (int)hypotf(s_burst_re, s_burst_im);
-    s_color = s_burst > (s_color ? COLOR_OFF : COLOR_ON);
+    s_color = s_field_hits >= LOCKED_HITS && s_burst > (s_color ? COLOR_OFF : COLOR_ON);
     update_levels();
     ++s_fields;
     s_last_hits = s_field_hits;
@@ -1101,6 +1113,7 @@ static void start(const char *channel)
         /* Above sync, so the gain comes down even when a clipped signal floods the sync detector. */
         xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 6, NULL, 0);
         set_thresholds();
+        set_maps();
         s_frame = video_field_buffer();
         /* Demodulation and sync detection stream through every sample on core 1; drawing shares core 0 with
          * USB and the console, above them since level tasks would time-slice it 1 ms at a time. */
