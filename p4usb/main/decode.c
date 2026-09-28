@@ -471,7 +471,7 @@ static void line_chroma(const int8_t *s, uint32_t l, uint32_t *uv)
 typedef struct {
     uint32_t l;
     int16_t row;
-    bool draw, last;
+    bool draw, last, half;
     const uint32_t *uv;
 } job_t;
 
@@ -622,6 +622,34 @@ static void forget_old(void)
     s_old_errors_field = false;
 }
 
+/* 8 pixels to one chroma word, each Y a running 4-sample sum, or with `half` the mean of two, which
+ * starts the line half a sample later. */
+static inline __attribute__((always_inline)) void luma_row(uint32_t *dst, const int8_t *s, const uint32_t *uv, bool half)
+{
+    const uint8_t *map4 = s_map4 + 512;
+    int32_t p0 = s[-1], p1 = s[0], p2 = s[1];
+    int32_t sum = p0 + p1 + p2;
+    for (int x = 0; x < VIDEO_WIDTH; x += MIX, s += MIX, dst += MIX / 2) {
+        uint32_t c = *uv++;
+        int32_t q0 = s[2], q1 = s[3], q2 = s[4], q3 = s[5], q4 = s[6], q5 = s[7], q6 = s[8], q7 = s[9];
+        int32_t a0 = sum + q0, a1 = a0 - p0 + q1, a2 = a1 - p1 + q2, a3 = a2 - p2 + q3;
+        int32_t a4 = a3 - q0 + q4, a5 = a4 - q1 + q5, a6 = a5 - q2 + q6, a7 = a6 - q3 + q7;
+        sum = a7 - q4;
+        if (half) {
+            int32_t a8 = sum + s[10];
+            a0 = (a0 + a1) >> 1, a1 = (a1 + a2) >> 1, a2 = (a2 + a3) >> 1, a3 = (a3 + a4) >> 1;
+            a4 = (a4 + a5) >> 1, a5 = (a5 + a6) >> 1, a6 = (a6 + a7) >> 1, a7 = (a7 + a8) >> 1;
+        }
+        dst[0] = (uint32_t)map4[a0] << 8 | (uint32_t)map4[a1] << 24 | c;
+        dst[1] = (uint32_t)map4[a2] << 8 | (uint32_t)map4[a3] << 24 | c;
+        dst[2] = (uint32_t)map4[a4] << 8 | (uint32_t)map4[a5] << 24 | c;
+        dst[3] = (uint32_t)map4[a6] << 8 | (uint32_t)map4[a7] << 24 | c;
+        p0 = q5;
+        p1 = q6;
+        p2 = q7;
+    }
+}
+
 /* Each Y of a missing row is the median of the Ys above, below and in the previous field: where the
  * picture is still, that is the previous field's, and where it moves, one of its neighbours. */
 void deint_row(uint8_t *out, const uint8_t *above, const uint8_t *below, const uint8_t *old, int n);
@@ -640,26 +668,10 @@ static void draw_line(const job_t *j)
         uint32_t t0 = esp_cpu_get_cycle_count();
         ++s_prof_lines;
         if (j->uv) {
-            const uint8_t *map4 = s_map4 + 512;
-            const uint32_t *uv = j->uv;
-            /* A running 4-sample sum, 8 pixels to one chroma word. */
-            int32_t p0 = s[-1], p1 = s[0], p2 = s[1];
-            int32_t sum = p0 + p1 + p2;
-            for (int x = 0; x < VIDEO_WIDTH; x += MIX, s += MIX, dst += MIX / 2) {
-                uint32_t c = *uv++;
-                int32_t q0 = s[2], q1 = s[3], q2 = s[4], q3 = s[5], q4 = s[6], q5 = s[7], q6 = s[8], q7 = s[9];
-                int32_t a0 = sum + q0, a1 = a0 - p0 + q1, a2 = a1 - p1 + q2, a3 = a2 - p2 + q3;
-                int32_t a4 = a3 - q0 + q4, a5 = a4 - q1 + q5, a6 = a5 - q2 + q6, a7 = a6 - q3 + q7;
-                dst[0] = (uint32_t)map4[a0] << 8 | (uint32_t)map4[a1] << 24 | c;
-                dst[1] = (uint32_t)map4[a2] << 8 | (uint32_t)map4[a3] << 24 | c;
-                dst[2] = (uint32_t)map4[a4] << 8 | (uint32_t)map4[a5] << 24 | c;
-                dst[3] = (uint32_t)map4[a6] << 8 | (uint32_t)map4[a7] << 24 | c;
-                p0 = q5;
-                p1 = q6;
-                p2 = q7;
-                sum = a7 - q4;
-            }
-            dst -= VIDEO_WIDTH / 2;
+            if (j->half)
+                luma_row(dst, s, j->uv, true);
+            else
+                luma_row(dst, s, j->uv, false);
         } else {
             const uint8_t *map = s_map;
             const uint8_t *u = (const uint8_t *)s;
@@ -700,8 +712,9 @@ static void render_line(void)
     bool last = s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1;
     bool draw = !s_skip_render && s_vline >= FIRST_ACTIVE && s_vline < FIRST_ACTIVE + ACTIVE_LINES && row < VIDEO_HEIGHT;
     if (draw || last) {
-        /* The line clock's nearest sample. */
-        job_t j = {.l = s_line + (s_line_frac >> 15), .row = row, .draw = draw, .last = last};
+        /* The line clock's nearest half sample. */
+        uint32_t halves = (s_line_frac + 0x4000) >> 15;
+        job_t j = {.l = s_line + (halves >> 1), .row = row, .draw = draw, .last = last, .half = halves & 1};
         if (draw && s_job_head - s_job_tail < JOBS) {
             uint32_t t0 = esp_cpu_get_cycle_count();
             const int8_t *src = line_samples(j.l, s_wrapped[1]);
