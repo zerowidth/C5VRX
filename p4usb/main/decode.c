@@ -10,6 +10,9 @@
 #include "esp_cache.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
+#include "esp_private/gdma.h"
+#include "hal/cache_ll.h"
+#include "hal/dma_types.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -147,7 +150,7 @@ static int s_tip = -57, s_blank = -17;
 static uint8_t s_map[256];
 /* The same for the sum of four samples, which nulls the subcarrier's dots out of luma when there is color. */
 static uint8_t s_map4[1024];
-static uint8_t *s_frame;
+static uint8_t *s_frame, *s_prev;
 
 /* Per-field counters for the status line. */
 static uint32_t s_fields, s_field_hits, s_field_vsync;
@@ -303,6 +306,7 @@ static int s_saturation = 100;
 
 static void flush_strip(void);
 static void wait_strip(int k);
+static void forget_old(void);
 
 static uint32_t s_finish_max_us;
 
@@ -314,6 +318,9 @@ static void finish_field(void)
     wait_strip(0);
     wait_strip(1);
     video_field_done();
+    /* The previous field fills this one's missing rows. */
+    s_prev = s_frame;
+    forget_old();
     s_frame = video_field_buffer();
     if (esp_timer_get_time() - t0 > s_finish_max_us) s_finish_max_us = esp_timer_get_time() - t0;
 }
@@ -376,17 +383,17 @@ static void flush_strip(void)
     s_prof_flush += esp_cpu_get_cycle_count() - t0;
 }
 
-/* Room for rows row and row + 1 of the frame. */
-static uint8_t *strip_rows(int row)
+/* Room for n rows of the frame from row. */
+static uint8_t *strip_rows(int row, int n)
 {
-    if (s_strip_rows && (row != s_strip_row0 + s_strip_rows || s_strip_rows == STRIP_ROWS)) flush_strip();
+    if (s_strip_rows && (row != s_strip_row0 + s_strip_rows || s_strip_rows + n > STRIP_ROWS)) flush_strip();
     if (!s_strip_rows) {
         s_strip_waits += s_strip_busy[s_strip];
         wait_strip(s_strip);
         s_strip_row0 = row;
     }
     uint8_t *dst = s_strips[s_strip] + s_strip_rows * ROW_BYTES;
-    s_strip_rows += 2;
+    s_strip_rows += n;
     return dst;
 }
 
@@ -479,10 +486,155 @@ static volatile uint32_t s_job_head, s_job_tail;
 static TaskHandle_t s_draw_task;
 static uint32_t s_draw_dropped, s_draw_full, s_draw_max_lag, s_draw_max_gap_us, s_draw_max_run_us;
 
+/* Rows of the previous field come in by DMA, a strip's worth at a time: read through the data cache,
+ * which both cores share, PSRAM evicts core 1's tables. The DMA wants PSRAM in whole cache lines, so
+ * each row's copy covers its lines. */
+#define OLD_GROUP 8
+#define OLD_BYTES (ROW_BYTES + 32)
+/* From the heap after the ring, which needs the largest free block. */
+static uint8_t (*s_old)[OLD_GROUP * OLD_BYTES];
+static int s_old_key[2] = {-1, -1}, s_old_next;
+static bool s_old_ready[2];
+static volatile bool s_old_busy[2];
+static volatile int s_old_fetching = -1;
+static uint32_t s_old_late, s_old_errors;
+static bool s_old_errors_field;
+
+/* A channel pair of their own, with descriptors written uncached: the async memcpy driver writes the
+ * source back through the cache and builds descriptors on every call, some 40K cycles for one PSRAM row. */
+static gdma_channel_handle_t s_old_tx, s_old_rx;
+static dma_descriptor_align8_t s_old_desc[2 * OLD_GROUP] __attribute__((aligned(64)));
+#define UNCACHED(p) ((void *)CACHE_LL_L2MEM_NON_CACHE_ADDR(p))
+
+static bool IRAM_ATTR old_done(gdma_channel_handle_t chan, gdma_event_data_t *e, void *arg)
+{
+    if (s_old_fetching >= 0) s_old_busy[s_old_fetching] = false;
+    s_old_fetching = -1;
+    return false;
+}
+
+static esp_err_t old_dma_init(void)
+{
+    gdma_channel_alloc_config_t ccfg = {0};
+    esp_err_t err = gdma_new_axi_channel(&ccfg, &s_old_tx, &s_old_rx);
+    if (err != ESP_OK) return err;
+    gdma_trigger_t m2m = GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_M2M, 0);
+    uint32_t free_ids = 0;
+    gdma_get_free_m2m_trig_id_mask(s_old_tx, &free_ids);
+    m2m.instance_id = __builtin_ctz(free_ids);
+    gdma_connect(s_old_rx, m2m);
+    gdma_connect(s_old_tx, m2m);
+    gdma_strategy_config_t strategy = {.owner_check = true, .auto_update_desc = true, .eof_till_data_popped = true};
+    gdma_apply_strategy(s_old_tx, &strategy);
+    gdma_apply_strategy(s_old_rx, &strategy);
+    gdma_transfer_config_t xfer = {.max_data_burst_size = 64, .access_ext_mem = true};
+    gdma_config_transfer(s_old_tx, &xfer);
+    gdma_config_transfer(s_old_rx, &xfer);
+    gdma_rx_event_callbacks_t cbs = {.on_recv_eof = old_done};
+    gdma_register_rx_event_callbacks(s_old_rx, &cbs, NULL);
+    /* No cached copy may be written back over what the DMA or the uncached alias put there. */
+    s_old = heap_caps_aligned_calloc(64, 2, sizeof *s_old, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!s_old) return ESP_ERR_NO_MEM;
+    esp_cache_msync(s_old, 2 * sizeof *s_old, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    esp_cache_msync(s_old_desc, sizeof s_old_desc, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    return ESP_OK;
+}
+
+static bool wait_old(int k)
+{
+    int64_t give_up = esp_timer_get_time() + 500;
+    while (s_old_busy[k] && esp_timer_get_time() < give_up) {
+    }
+    return !s_old_busy[k];
+}
+
+/* A group is OLD_GROUP rows of one parity, keyed by its first row's pair number and the parity. */
+static int old_key(int row) { return (row >> 1) / OLD_GROUP * 2 + (row & 1); }
+
+static void fetch_group(int k, int key)
+{
+    s_old_key[k] = -1;
+    s_old_ready[k] = false;
+    /* One copy at a time on the channel; a failed start gives up for the field. */
+    if (!s_prev || s_old_errors_field || !wait_old(k) || !wait_old(k ^ 1)) return;
+    int first = (key >> 1) * OLD_GROUP * 2 + (key & 1);
+    volatile dma_descriptor_align8_t *tx = UNCACHED(s_old_desc), *rx = tx + OLD_GROUP;
+    for (int i = 0; i < OLD_GROUP; ++i) {
+        bool last = i + 1 == OLD_GROUP;
+        tx[i].buffer = (void *)((uint32_t)(s_prev + (first + 2 * i) * ROW_BYTES) & ~63u);
+        tx[i].next = last ? NULL : &s_old_desc[i + 1];
+        tx[i].dw0.size = OLD_BYTES;
+        tx[i].dw0.length = OLD_BYTES;
+        tx[i].dw0.suc_eof = last;
+        tx[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        rx[i].buffer = s_old[k] + i * OLD_BYTES;
+        rx[i].next = last ? NULL : &s_old_desc[OLD_GROUP + i + 1];
+        rx[i].dw0.size = OLD_BYTES;
+        rx[i].dw0.length = 0;
+        rx[i].dw0.suc_eof = 0;
+        rx[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+    }
+    s_old_busy[k] = true;
+    s_old_fetching = k;
+    esp_err_t err = gdma_start(s_old_rx, (intptr_t)&s_old_desc[OLD_GROUP]);
+    if (err == ESP_OK) err = gdma_start(s_old_tx, (intptr_t)&s_old_desc[0]);
+    if (err == ESP_OK) {
+        s_old_key[k] = key;
+    } else {
+        s_old_fetching = -1;
+        s_old_busy[k] = false;
+        ++s_old_errors;
+        s_old_errors_field = true;
+    }
+}
+
+static const uint8_t *old_row(int row)
+{
+    int key = old_key(row);
+    int k = s_old_key[0] == key ? 0 : s_old_key[1] == key ? 1 : -1;
+    if (k < 0) {
+        k = s_old_next;
+        s_old_next ^= 1;
+        fetch_group(k, key);
+        if (s_old_key[k] != key) return NULL;
+    }
+    if (!s_old_ready[k]) {
+        if (!wait_old(k)) {
+            ++s_old_late;
+            return NULL;
+        }
+        esp_cache_msync(s_old[k], sizeof s_old[k], ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        s_old_ready[k] = true;
+        /* Fetch the next group while this one is drawn. */
+        if (((key >> 1) + 1) * OLD_GROUP < VIDEO_HEIGHT / 2) {
+            fetch_group(k ^ 1, key + 2);
+            s_old_next = k;
+        }
+    }
+    return s_old[k] + (row >> 1) % OLD_GROUP * OLD_BYTES + (row * ROW_BYTES & 63);
+}
+
+static void forget_old(void)
+{
+    wait_old(0);
+    wait_old(1);
+    s_old_key[0] = s_old_key[1] = -1;
+    s_old_errors_field = false;
+}
+
+/* Each Y of a missing row is the median of the Ys above, below and in the previous field: where the
+ * picture is still, that is the previous field's, and where it moves, one of its neighbours. */
+void deint_row(uint8_t *out, const uint8_t *above, const uint8_t *below, const uint8_t *old, int n);
+static const uint8_t *s_above;
+static int s_above_row = -1;
+
 static void draw_line(const job_t *j)
 {
     if (j->draw) {
-        uint32_t *dst = (uint32_t *)strip_rows(j->row);
+        /* This line's row, the missing one above it, and at the bottom of an even field the last row. */
+        int row = j->row, first = row > 0 ? row - 1 : row, n = row - first + 1 + (row + 2 == VIDEO_HEIGHT);
+        uint8_t *rows = strip_rows(first, n);
+        uint32_t *dst = (uint32_t *)(rows + (row - first) * ROW_BYTES);
         const int8_t *s = line_samples(j->l, s_wrapped[0]) + PICTURE_START;
         /* The encoder reads its Y0 V Y1 U as big-endian halfwords, so in memory they are V Y0 U Y1. */
         uint32_t t0 = esp_cpu_get_cycle_count();
@@ -513,7 +665,14 @@ static void draw_line(const job_t *j)
             const uint8_t *u = (const uint8_t *)s;
             for (int x = 0; x < VIDEO_WIDTH; x += 2) dst[x / 2] = (uint32_t)map[u[x]] << 8 | (uint32_t)map[u[x + 1]] << 24 | 0x00800080u;
         }
-        memcpy(dst + VIDEO_WIDTH / 2, dst, ROW_BYTES);
+        const uint8_t *below = (const uint8_t *)dst;
+        if (row > 0) {
+            const uint8_t *old = old_row(row - 1);
+            deint_row(rows, s_above_row == row - 2 ? s_above : below, below, old ? old : below, ROW_BYTES / 16);
+        }
+        if (row + 2 == VIDEO_HEIGHT) memcpy(dst + VIDEO_WIDTH / 2, dst, ROW_BYTES);
+        s_above = below;
+        s_above_row = row;
         s_prof_pix += esp_cpu_get_cycle_count() - t0;
     }
     if (j->last) finish_field();
@@ -855,6 +1014,10 @@ static void start(const char *channel)
             say("decode: no DMA channel for the frame\n");
             return;
         }
+        if (old_dma_init() != ESP_OK) {
+            say("decode: no DMA channel for the previous field\n");
+            return;
+        }
         /* Above sync, so the gain comes down even when a clipped signal floods the sync detector. */
         xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 6, NULL, 0);
         set_thresholds();
@@ -894,7 +1057,8 @@ static void status(void)
         (unsigned long)s_finish_max_us, (unsigned long)s_draw_max_gap_us, (unsigned long)s_draw_max_run_us);
     s_draw_max_gap_us = s_draw_max_run_us = 0;
     s_draw_max_lag = s_finish_max_us = 0;
-    say("%lu waits on the frame DMA, %lu errors\n", (unsigned long)s_strip_waits, (unsigned long)s_strip_errors);
+    say("%lu waits on the frame DMA, %lu errors, %lu previous-field rows late, %lu failed\n", (unsigned long)s_strip_waits,
+        (unsigned long)s_strip_errors, (unsigned long)s_old_late, (unsigned long)s_old_errors);
     say("longest gap between ring reads since last asked %lld us, of the %lld us the ring holds\n", s_max_gap_us,
         RING_US);
     s_max_gap_us = 0;
