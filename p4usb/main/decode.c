@@ -45,7 +45,7 @@
 #define FIELD_LINES 262
 #define FIRST_ACTIVE 20
 #define ACTIVE_LINES (VIDEO_HEIGHT / 2)
-/* Broad pulses begin on line 4. */
+/* Broad pulses begin half-way through line 3 or at the start of line 4, depending on the field. */
 #define VSYNC_LINE 3
 
 /* Demodulated samples waiting for the sync task on the other core: 2.5 ms. */
@@ -373,8 +373,9 @@ static void render_line(void)
     if (s_hit) ++s_field_hits;
     s_missed = s_hit ? 0 : s_missed + 1;
     s_hit = false;
-    /* Coast through a missing vertical sync at 262.5 lines per field. */
-    if (++s_vline >= FIELD_LINES + s_parity) {
+    /* Coast through a missing vertical sync at 262.5 lines per field: an even field counts from line 4
+     * to the odd field's mid-line pulse 262.5 lines later, and an odd field from line 3. */
+    if (++s_vline >= FIELD_LINES + !s_parity) {
         s_vline = 0;
         s_parity ^= 1;
     }
@@ -414,9 +415,12 @@ static void on_pulse(uint32_t start, uint32_t width)
             int32_t into = (int32_t)(start - s_line);
             int32_t half = LINE_Q16 >> 17;
             s_parity = into > half / 2 && into < half * 3 / 2;
+
             /* The count wraps at 262 and 263 lines alternately, so one line either way is expected. */
             if (abs(s_vline - VSYNC_LINE) > 1 && s_vline < FIELD_LINES - 1) ++s_vjumps;
-            s_vline = VSYNC_LINE;
+            /* An odd field's first broad pulse starts mid-way through line 3; an even field's starts line 4,
+             * which is the line the clock has just begun. */
+            s_vline = s_parity ? VSYNC_LINE : VSYNC_LINE + 1;
             ++s_field_vsync;
         }
         s_last_broad = start;
@@ -662,6 +666,7 @@ static void status(void)
         s_last_vsync_ok ? ", vsync" : ", no vsync", (unsigned long)(s_period >> 16),
         (unsigned long)((s_period & 0xffff) * 1000 >> 16));
     say("%lu vertical corrections\n", (unsigned long)s_vjumps);
+
     say("gain %d (%s), I/Q RMS %d, %d.%d%% clipped\n", s_gain, s_agc ? "auto" : "fixed", s_rms,
         s_clip_permille / 10, s_clip_permille % 10);
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT, s_blank * KHZ_PER_UNIT,

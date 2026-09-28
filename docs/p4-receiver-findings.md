@@ -19,6 +19,10 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - The signal can degrade within minutes for reasons outside the receiver: in one session porch noise rose to 700-870 kHz at every gain from 62 to 72 and lock fell to 40-210 of 262 lines.
 - The current source (the flight controller's OSD on gray, no camera) has no colorburst: the back porch shows nothing above noise at 3.58 or 4.43 MHz, where a 40 IRE burst would stand about 20 dB clear. `iq.py burst` checks this.
 
+## Field timing
+
+- An odd field's first broad pulse starts half-way through line 3 and an even field's at the start of line 4, which the line clock has only just begun. Counting both as line 3 drew one field two rows too high, so static text alternated between positions 3 rows apart at 60 fps and every horizontal edge looked doubled. Counting the even field from line 4, and wrapping an even field after 263 lines and an odd one after 262, puts the fields 1 row apart and cut vertical corrections from about one per 10 fields to a handful per thousand.
+
 ## PARLIO RX and DMA on the P4
 
 - The receive call puts its DMA descriptor list (a VLA, 16 bytes per 4 KB) on the caller's stack, so a 2.8 MB capture needs a 20 KB task stack.
