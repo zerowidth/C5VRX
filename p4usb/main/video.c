@@ -5,6 +5,7 @@
 
 #include "driver/jpeg_encode.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -19,7 +20,12 @@
 #define JPEG_SLOT_BYTES (128 * 1024)
 /* Room in front of the encoder's output for a COM segment; a multiple of the cache line. */
 #define HEAD_ROOM 128
+/* Noise fields overflow a slot at the normal quality, so quality drops on overflow and climbs back
+ * while frames stay small. */
 #define JPEG_QUALITY 70
+#define JPEG_QUALITY_MIN 20
+#define JPEG_QUALITY_STEP 10
+#define JPEG_RAISE_AFTER 30
 #define TEXT_SCALE 3
 #define MARKER 24
 
@@ -52,6 +58,8 @@ static esp_err_t s_last_error;
 static uint32_t s_render_us;
 static uint32_t s_encode_us;
 static uint32_t s_fps_tenths;
+static int s_quality = JPEG_QUALITY;
+static int s_small_frames;
 
 #define NOTIFY_TICK 1
 #define NOTIFY_FIELD 2
@@ -140,7 +148,7 @@ static void encode(const uint8_t *raw, size_t size, bool color, uint32_t seq, in
         .height = VIDEO_HEIGHT,
         .src_type = color ? JPEG_ENCODE_IN_FORMAT_YUV422 : JPEG_ENCODE_IN_FORMAT_GRAY,
         .sub_sample = color ? JPEG_DOWN_SAMPLING_YUV422 : JPEG_DOWN_SAMPLING_GRAY,
-        .image_quality = JPEG_QUALITY,
+        .image_quality = s_quality,
     };
     int w = writable_slot();
     slot_t *s = &s_slots[w];
@@ -150,7 +158,15 @@ static void encode(const uint8_t *raw, size_t size, bool color, uint32_t seq, in
     if (err != ESP_OK) {
         ++s_errors;
         s_last_error = err;
+        if (s_quality > JPEG_QUALITY_MIN) s_quality -= JPEG_QUALITY_STEP;
+        s_small_frames = 0;
         return;
+    }
+    if (len > (s->cap - HEAD_ROOM) / 3 || s_quality >= JPEG_QUALITY) {
+        s_small_frames = 0;
+    } else if (++s_small_frames >= JPEG_RAISE_AFTER) {
+        s_quality += JPEG_QUALITY_STEP;
+        s_small_frames = 0;
     }
     const uint8_t *jpeg = add_comment(out, &len, seq, t_us);
     taskENTER_CRITICAL(&s_lock);
@@ -198,6 +214,8 @@ static void video_task(void *arg)
 
 void video_init(void)
 {
+    /* It logs every overflow, which the quality control handles. */
+    esp_log_level_set("jpeg.encoder", ESP_LOG_NONE);
     const jpeg_encode_engine_cfg_t eng = {.timeout_ms = 100};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&eng, &s_enc));
 
@@ -310,7 +328,7 @@ void video_command(int argc, char **argv)
     say("%lu frames at %lu.%lu fps, %lu errors", (unsigned long)s_frames, (unsigned long)(s_fps_tenths / 10),
         (unsigned long)(s_fps_tenths % 10), (unsigned long)s_errors);
     say(s_errors ? " (last %s)\n" : "\n", esp_err_to_name(s_last_error));
-    say("render %lu us, encode %lu us, jpeg %u bytes\n", (unsigned long)s_render_us,
-        (unsigned long)s_encode_us, (unsigned)newest_len());
+    say("render %lu us, encode %lu us, jpeg %u bytes at quality %d\n", (unsigned long)s_render_us,
+        (unsigned long)s_encode_us, (unsigned)newest_len(), s_quality);
     uvc_info();
 }
