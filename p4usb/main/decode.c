@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "driver/parlio_rx.h"
+#include "esp_async_memcpy.h"
 #include "esp_cache.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
@@ -258,8 +259,14 @@ static void set_thresholds(void)
     }
 }
 
+static void flush_strip(void);
+static void wait_strip(int k);
+
 static void emit_field(void)
 {
+    flush_strip();
+    wait_strip(0);
+    wait_strip(1);
     video_field_done();
     s_frame = video_field_buffer();
     update_levels();
@@ -271,18 +278,93 @@ static void emit_field(void)
 
 static bool s_skip_render, s_skip_detect;
 
+/* Lines are rendered, doubled, into internal RAM and DMA'd to the PSRAM frame a strip at a time: the
+ * core writing PSRAM through its cache costs several cycles a byte. */
+#define STRIP_ROWS 16
+static uint8_t s_strips[2][STRIP_ROWS * VIDEO_WIDTH] __attribute__((aligned(64)));
+static int s_strip, s_strip_rows, s_strip_row0;
+static volatile bool s_strip_busy[2];
+static async_memcpy_handle_t s_mcp;
+static uint32_t s_strip_waits, s_strip_errors;
+
+static bool IRAM_ATTR strip_done(async_memcpy_handle_t mcp, async_memcpy_event_t *e, void *arg)
+{
+    s_strip_busy[(int)arg] = false;
+    return false;
+}
+
+static void wait_strip(int k)
+{
+    if (!s_strip_busy[k]) return;
+    int64_t give_up = esp_timer_get_time() + 2000;
+    while (s_strip_busy[k] && esp_timer_get_time() < give_up) {
+    }
+    s_strip_busy[k] = false;
+}
+
+static void flush_strip(void)
+{
+    if (!s_strip_rows) return;
+    int rows = s_strip_rows;
+    if (s_strip_row0 + rows > VIDEO_HEIGHT) rows = VIDEO_HEIGHT - s_strip_row0;
+    s_strip_busy[s_strip] = true;
+    if (esp_async_memcpy(s_mcp, s_frame + s_strip_row0 * VIDEO_WIDTH, s_strips[s_strip], rows * VIDEO_WIDTH, strip_done,
+                         (void *)s_strip) != ESP_OK) {
+        s_strip_busy[s_strip] = false;
+        ++s_strip_errors;
+    }
+    s_strip ^= 1;
+    s_strip_rows = 0;
+}
+
+/* Room for rows row and row + 1 of the frame. */
+static uint8_t *strip_rows(int row)
+{
+    if (s_strip_rows && (row != s_strip_row0 + s_strip_rows || s_strip_rows == STRIP_ROWS)) flush_strip();
+    if (!s_strip_rows) {
+        s_strip_waits += s_strip_busy[s_strip];
+        wait_strip(s_strip);
+        s_strip_row0 = row;
+    }
+    uint8_t *dst = s_strips[s_strip] + s_strip_rows * VIDEO_WIDTH;
+    s_strip_rows += 2;
+    return dst;
+}
+
+/* Which sample each pixel takes, from the line's start, for four steps of the line clock's fraction. */
+#define PHASES 4
+static uint16_t s_offs[PHASES][VIDEO_WIDTH];
+#define LINE_SPAN (ACTIVE_START + US(52.66) + 2)
+static uint8_t s_wrapped[LINE_Q16 >> 16] __attribute__((aligned(4)));
+
+static void build_offsets(void)
+{
+    for (int f = 0; f < PHASES; ++f) {
+        uint32_t p = ((uint32_t)ACTIVE_START << 16) + (2 * f + 1) * 65536 / (2 * PHASES) + 0x8000;
+        for (int x = 0; x < VIDEO_WIDTH; ++x, p += STEP_Q16) s_offs[f][x] = p >> 16;
+    }
+}
+
 static void render_line(void)
 {
     int row = (s_vline - FIRST_ACTIVE) * 2 + s_parity;
     if (!s_skip_render && s_vline >= FIRST_ACTIVE && s_vline < FIRST_ACTIVE + ACTIVE_LINES && row < VIDEO_HEIGHT) {
-        uint8_t *dst = s_frame + row * VIDEO_WIDTH;
-        /* Nearest sample, rounded; interpolating costs more than the core has to spare. */
-        uint32_t p = ((uint32_t)ACTIVE_START << 16) + s_line_frac + 0x8000;
+        uint32_t *dst = (uint32_t *)strip_rows(row);
+        uint32_t start = s_line % HIST;
+        const uint8_t *src = (const uint8_t *)s_hist + start;
+        if (start + LINE_SPAN > HIST) {
+            memcpy(s_wrapped, src, HIST - start);
+            memcpy(s_wrapped + HIST - start, s_hist, LINE_SPAN - (HIST - start));
+            src = s_wrapped;
+        }
+        const uint16_t *off = s_offs[s_line_frac * PHASES >> 16];
         const uint8_t *map = s_map;
-        const int8_t *hist = s_hist;
-        const uint32_t line = s_line;
-        for (int x = 0; x < VIDEO_WIDTH; ++x, p += STEP_Q16) dst[x] = map[(uint8_t)hist[(line + (p >> 16)) % HIST]];
-        if (row + 1 < VIDEO_HEIGHT) memcpy(dst + VIDEO_WIDTH, dst, VIDEO_WIDTH);
+        /* Four pixels per store, so the loads needn't wait on the byte stores they might alias. */
+        for (int x = 0; x < VIDEO_WIDTH; x += 4) {
+            uint32_t a = src[off[x]], b = src[off[x + 1]], c = src[off[x + 2]], d = src[off[x + 3]];
+            dst[x / 4] = map[a] | map[b] << 8 | map[c] << 16 | (uint32_t)map[d] << 24;
+        }
+        memcpy(dst + VIDEO_WIDTH / 4, dst, VIDEO_WIDTH);
     }
     if (s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1) emit_field();
 
@@ -548,6 +630,12 @@ static void start(const char *channel)
             return;
         }
         build_lut(s_luts[0], 0, 0);
+        build_offsets();
+        async_memcpy_config_t mcfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+        if (esp_async_memcpy_install_gdma_axi(&mcfg, &s_mcp) != ESP_OK) {
+            say("decode: no DMA channel for the frame\n");
+            return;
+        }
         xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 1, NULL, 0);
         set_thresholds();
         s_frame = video_field_buffer();
@@ -578,6 +666,7 @@ static void status(void)
         s_clip_permille / 10, s_clip_permille % 10);
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT, s_blank * KHZ_PER_UNIT,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
+    say("%lu waits on the frame DMA, %lu errors\n", (unsigned long)s_strip_waits, (unsigned long)s_strip_errors);
     say("longest gap between ring reads since last asked %lld us, of the %lld us the ring holds\n", s_max_gap_us,
         RING_US);
     s_max_gap_us = 0;
