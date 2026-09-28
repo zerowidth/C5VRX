@@ -436,7 +436,8 @@ static void measure_burst(const int8_t *s, uint32_t l)
 static void line_chroma(const int8_t *s, uint32_t l, uint32_t *uv)
 {
     float m2 = s_burst_re * s_burst_re + s_burst_im * s_burst_im;
-    float k = 20.0f * s_saturation / 100 / m2 * 4096;
+    /* The burst is summed over several blocks, a chroma block over one. */
+    float k = 20.0f * (BURST_END - BURST_START) / MIX * s_saturation / 100 / m2 * 4096;
     float wr = s_burst_im * k, wi = s_burst_re * k;
     int32_t a1 = lrintf(2.925f * wr), a2 = lrintf(-2.925f * wi), a3 = lrintf(-2.074f * wi), a4 = lrintf(-2.074f * wr);
     const int32_t *lo = s_lo + l % LO_PERIOD;
