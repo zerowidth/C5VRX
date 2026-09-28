@@ -22,6 +22,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 ## Field timing
 
 - The line clock tracks hsyncs to about 0.12 samples, but drawing each line from its nearest whole sample added 0.29 samples rms of rounding that changes from line to line, so vertical edges looked wavy. Starting lines on the nearest half sample (averaging neighbouring luma sums) halves it.
+- A line is about 847.46 samples at 13.33 MS/s. A leading hsync edge interpolated between samples has about 0.1 samples of noise; taken to the nearest sample it has about 0.36. The line clock's 1/8 phase gain filters either down to about 0.12, so sub-sample edge detection would not improve it further.
 
 - An odd field's first broad pulse starts half-way through line 3 and an even field's at the start of line 4, which the line clock has only just begun. Counting both as line 3 drew one field two rows too high, so static text alternated between positions 3 rows apart at 60 fps and every horizontal edge looked doubled. Counting the even field from line 4, and wrapping an even field after 263 lines and an odd one after 262, puts the fields 1 row apart and cut vertical corrections from about one per 10 fields to a handful per thousand.
 
@@ -35,6 +36,8 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - Hue calibrated against SMPTE bars from a test card came within about 15° on every bar.
 - FM noise rises with frequency, so chroma is the noisiest part of the picture. Smoothing 8-sample chroma blocks 1 2 1 with their neighbours quiets it visibly at full saturation.
 - Sharp luma edges such as OSD text leak into chroma as color fringes, which the 1 2 1 smoothing spread about 24 pixels sideways. The subcarrier turns half a cycle each line, so summing two lines' demodulated chroma cancels the leak while the color adds; it cleared most of the fringing around the OSD text.
+- Chroma lines up with luma to within about a pixel, and a bar edge's chroma transition spans about 12 pixels, so horizontal chroma resolution is not what makes colors look smeared.
+- At JPEG quality 70 the encoder flattens chroma noise into 8-row blocks, which show as horizontal color bands in flat areas. Chroma noise that changes from line to line is what the blocks are made of, so averaging chroma over lines reduces them too.
 - The hardware JPEG encoder times out converting YUV 4:2:2 input to 4:2:0, so fields are encoded as 4:2:2. It reads each pixel pair from memory as V Y0 U Y1.
 
 ## PARLIO RX and DMA on the P4
@@ -57,6 +60,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - `esp_async_memcpy` from a PSRAM source cost about 40K cycles a call, writing the source back through the cache and allocating descriptors every time. A dedicated AXI-GDMA channel pair with descriptors written through the uncached alias costs a few hundred. The driver also rejects PSRAM addresses and lengths that aren't whole 64-byte cache lines, and logs each rejection, which on a per-line path saturated core 0.
 - PIE vector loads fault on the uncached internal RAM alias; scalar accesses there work.
 - Chroma mixing with PIE (`esp.vmulas.s8.xacc`, reading the running accumulator after each 8-sample half) takes about 1.5K cycles a line against about 4K for the scalar multiply-adds. Blocks sit on the absolute 8-sample grid so the ring and the subcarrier table are both 16-byte aligned (704 is a multiple of 16), and each picture block is interpolated from the two it straddles. The scalar code around it runs near one instruction per cycle whether its data is cached or not, so the remaining cost is instruction count: computing and finishing chroma for every line cost a third of a core, and was split so core 1 mixes each line and core 0 finishes each pair.
+- Per drawn line with color, core 0 spends about 10.7K cycles drawing luma and deinterlacing and about 2.2K finishing chroma, and core 1 about 4.1K mixing and interpolating it. Doing all of chroma on core 0 took it to 99.7% and dropped thousands of lines a second; doing all of it on core 1 took that to 99.6%.
 - Detecting lines after each 2016-sample DMA node, rather than after everything that has arrived, got lines to core 0 sooner but made vertical corrections jump from about one per thousand fields to one per twelve, likely from broad pulses split across calls. It was reverted.
 - Packing four pixels per word store to avoid byte-store aliasing gained little (9.4 to 7.5 cycles per sample).
 - `decode bench` varies about 15% between runs, and its small cached-buffer case runs slower than the full ring for reasons not understood. The live load figures in `decode` are the better measure.
