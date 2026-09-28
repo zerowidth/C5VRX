@@ -851,9 +851,8 @@ static void start(const char *channel)
         set_thresholds();
         s_frame = video_field_buffer();
         /* Demodulation and sync detection stream through every sample on core 1; drawing shares core 0 with
-         * the DMA interrupt, USB and the console, level with USB and below the console so an overloaded
-         * decoder can't take the console with it. */
-        xTaskCreatePinnedToCore(draw_task, "decode_draw", 4096, NULL, 5, &s_draw_task, 0);
+         * USB and the console, above them since level tasks would time-slice it 1 ms at a time. */
+        xTaskCreatePinnedToCore(draw_task, "decode_draw", 4096, NULL, 7, &s_draw_task, 0);
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
     if (!iq_start(channel, EVERY)) return;
