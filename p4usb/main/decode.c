@@ -436,14 +436,22 @@ static void measure_burst(const int8_t *s, uint32_t l)
 static void line_chroma(const int8_t *s, uint32_t l, uint32_t *uv)
 {
     float m2 = s_burst_re * s_burst_re + s_burst_im * s_burst_im;
-    /* The burst is summed over several blocks, a chroma block over one. */
-    float k = 20.0f * (BURST_END - BURST_START) / MIX * s_saturation / 100 / m2 * 4096;
+    /* The burst is summed over several blocks, and a chroma block's sum weighted 1 2 1 with its neighbours. */
+    float k = 20.0f * (BURST_END - BURST_START) / MIX / 4 * s_saturation / 100 / m2 * 4096;
     float wr = s_burst_im * k, wi = s_burst_re * k;
     int32_t a1 = lrintf(2.925f * wr), a2 = lrintf(-2.925f * wi), a3 = lrintf(-2.074f * wi), a4 = lrintf(-2.074f * wr);
     const int32_t *lo = s_lo + l % LO_PERIOD;
-    for (int j = 0; j < VIDEO_WIDTH / MIX; ++j) {
+    enum { N = VIDEO_WIDTH / MIX };
+    int32_t zr[N + 2], zi[N + 2];
+    for (int j = 0; j < N; ++j) {
         int32_t m = mixed(s + j * MIX, lo + j * MIX);
-        int32_t re = mixed_re(m), im = -(int16_t)m;
+        zr[j + 1] = mixed_re(m);
+        zi[j + 1] = -(int16_t)m;
+    }
+    zr[0] = zr[1], zi[0] = zi[1], zr[N + 1] = zr[N], zi[N + 1] = zi[N];
+    /* Chroma sits where the FM noise is strongest, so trade some color resolution for a quieter picture. */
+    for (int j = 0; j < N; ++j) {
+        int32_t re = zr[j] + 2 * zr[j + 1] + zr[j + 2], im = zi[j] + 2 * zi[j + 1] + zi[j + 2];
         int32_t cb = 128 + ((re * a1 + im * a2) >> 12), cr = 128 + ((re * a3 + im * a4) >> 12);
         cb = cb < 0 ? 0 : cb > 255 ? 255 : cb;
         cr = cr < 0 ? 0 : cr > 255 ? 255 : cr;
