@@ -47,6 +47,10 @@
 #define ACTIVE_LINES (VIDEO_HEIGHT / 2)
 /* Broad pulses begin half-way through line 3 or at the start of line 4, depending on the field. */
 #define VSYNC_LINE 3
+/* A vsync is believed only this close to where the line count expects one, until this many fields in a
+ * row have passed without one there. */
+#define VSYNC_WINDOW 6
+#define VSYNC_REACQUIRE 3
 
 /* Demodulated samples waiting for the sync task on the other core: 2.5 ms. */
 #define HIST 32768
@@ -136,6 +140,9 @@ static uint32_t s_last_hits, s_last_vsync_ok;
 static uint32_t s_overruns, s_sync_overruns;
 /* Vertical syncs that moved the line count, beyond the first. */
 static uint32_t s_vjumps;
+/* Broad pulses that fell outside the vsync window, and fields in a row without a vsync in it. */
+static uint32_t s_vsync_ignored;
+static int s_vsync_missed = VSYNC_REACQUIRE;
 typedef struct {
     uint32_t busy_cycles, permille;
     int64_t start;
@@ -264,6 +271,7 @@ static void wait_strip(int k);
 
 static void emit_field(void)
 {
+    if (!s_field_vsync && s_vsync_missed < VSYNC_REACQUIRE) ++s_vsync_missed;
     flush_strip();
     wait_strip(0);
     wait_strip(1);
@@ -411,7 +419,12 @@ static void on_pulse(uint32_t start, uint32_t width)
     } else if (width >= BROAD_MIN) {
         /* The first broad pulse of a vertical interval: it starts a whole line after an even field's
          * last hsync and half a line into the line for an odd field. */
-        if (start - s_last_broad > 4 * (LINE_Q16 >> 16)) {
+        bool expected = s_vline >= FIELD_LINES - VSYNC_WINDOW || s_vline <= VSYNC_LINE + VSYNC_WINDOW;
+        bool first = start - s_last_broad > 4 * (LINE_Q16 >> 16);
+        if (first && !expected && s_vsync_missed < VSYNC_REACQUIRE) {
+            ++s_vsync_ignored;
+        } else if (first) {
+            s_vsync_missed = 0;
             int32_t into = (int32_t)(start - s_line);
             int32_t half = LINE_Q16 >> 17;
             s_parity = into > half / 2 && into < half * 3 / 2;
@@ -665,7 +678,8 @@ static void status(void)
         s_running ? "running" : "stopped", (unsigned long)s_fields, (unsigned long)s_last_hits, FIELD_LINES,
         s_last_vsync_ok ? ", vsync" : ", no vsync", (unsigned long)(s_period >> 16),
         (unsigned long)((s_period & 0xffff) * 1000 >> 16));
-    say("%lu vertical corrections\n", (unsigned long)s_vjumps);
+    say("%lu vertical corrections, %lu broad pulses ignored outside the vsync window\n", (unsigned long)s_vjumps,
+        (unsigned long)s_vsync_ignored);
 
     say("gain %d (%s), I/Q RMS %d, %d.%d%% clipped\n", s_gain, s_agc ? "auto" : "fixed", s_rms,
         s_clip_permille / 10, s_clip_permille % 10);

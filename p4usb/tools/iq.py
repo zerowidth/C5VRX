@@ -56,7 +56,10 @@ def capture(path, cmd="iq"):
     nl = out.index(b"\n", head)
     n = int(out[head + 14 : nl].split(b"-")[0])
     data = out[nl + 1 : nl + 1 + n]
-    assert len(data) == n, (len(data), n)
+    if len(data) < n:
+        # The P4 gives up on a stalled console write, for example while the camera streams.
+        print(f"only {len(data)} of {n} bytes arrived")
+        data = data[: len(data) // 2 * 2]
     open(path, "wb").write(data)
     print(f"saved {n // 2} samples to {path}")
 

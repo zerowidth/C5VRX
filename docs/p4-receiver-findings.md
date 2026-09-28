@@ -23,6 +23,9 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 - An odd field's first broad pulse starts half-way through line 3 and an even field's at the start of line 4, which the line clock has only just begun. Counting both as line 3 drew one field two rows too high, so static text alternated between positions 3 rows apart at 60 fps and every horizontal edge looked doubled. Counting the even field from line 4, and wrapping an even field after 263 lines and an odd one after 262, puts the fields 1 row apart and cut vertical corrections from about one per 10 fields to a handful per thousand.
 
+- With a camera attached, stretches of the picture stay below the sync slicer for over 18 µs several times a field, which read as vsync and reset the line count before the field ended. Fields then stopped for seconds and the camera fell back to the test pattern. A vertical flywheel fixes it: a vsync counts only within 6 lines of where the count expects one, unless 3 fields in a row have passed without one there. In 1,545 fields it ignored 386 false broad pulses and made one correction.
+- `decode tap` dumps can stall part way while the camera streams, and the console then stops answering until the P4 is reset.
+
 ## PARLIO RX and DMA on the P4
 
 - The receive call puts its DMA descriptor list (a VLA, 16 bytes per 4 KB) on the caller's stack, so a 2.8 MB capture needs a 20 KB task stack.
