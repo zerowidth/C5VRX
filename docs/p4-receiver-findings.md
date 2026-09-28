@@ -70,7 +70,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 ## Encoding and USB
 
 - The hardware JPEG encoder takes 2.5-3.5 ms for a 720×480 grayscale frame. At quality 80 grainy fields overflowed the 128 KB slot; quality 70 gives about 60-70 KB.
-- With no signal, every field of noise overflowed the 128 KB slot at quality 70, so no frame reached the camera and it froze. At quality 20 noise fits in about 113 KB, so quality now drops 10 per overflow and climbs back after 30 frames under a third of the slot.
+- With no signal, every field of noise overflowed the 128 KB slot at quality 70, so no frame reached the camera and it froze. At quality 20 noise fits in about 113 KB, so quality now drops 10 per overflow and climbs back after 30 frames under 60% of the slot. A third was too low: normal video at quality 40 is about 45 KB, so quality stuck there after a loss and the picture stayed blocky.
 - On noise the burst's random vector adds up past the color threshold and the histogram's levels drift far from any real signal's, which drew saturated rainbow speckle. Color now needs 200 hsyncs in a field, and the picture keeps the last locked levels, so a lost signal shows as gray snow.
 - With no signal the gain control climbs to its maximum (80), and a returning signal then clips completely and doesn't lock until the gain is back near 50. Stepping down 8 at a time while more than 10% of samples clip cut that from about 8 s to 2 s.
 - On macOS, open the P4 console (303a:8000) with RTS off and DTR on: RTS high with DTR low looks like esptool's reset, and the P4 only writes to a port with DTR set.

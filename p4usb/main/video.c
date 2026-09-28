@@ -22,7 +22,7 @@
 /* Room in front of the encoder's output for a COM segment; a multiple of the cache line. */
 #define HEAD_ROOM 128
 /* Noise fields overflow a slot at the normal quality, so quality drops on overflow and climbs back
- * while frames stay small. */
+ * while frames stay under 60% of a slot, as normal video does and noise at the lowest quality doesn't. */
 #define JPEG_QUALITY 70
 #define JPEG_QUALITY_MIN 20
 #define JPEG_QUALITY_STEP 10
@@ -164,7 +164,7 @@ static void encode(const uint8_t *raw, size_t size, bool color, uint32_t seq, in
         s_small_frames = 0;
         return;
     }
-    if (len > (s->cap - HEAD_ROOM) / 3 || s_quality >= JPEG_QUALITY) {
+    if (len > (s->cap - HEAD_ROOM) * 3 / 5 || s_quality >= JPEG_QUALITY) {
         s_small_frames = 0;
     } else if (++s_small_frames >= JPEG_RAISE_AFTER) {
         s_quality += JPEG_QUALITY_STEP;
