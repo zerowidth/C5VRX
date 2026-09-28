@@ -481,15 +481,24 @@ static void draw_line(const job_t *j)
         if (j->uv) {
             const uint8_t *map4 = s_map4 + 512;
             const uint32_t *uv = j->uv;
+            /* A running 4-sample sum, 8 pixels to one chroma word. */
             int32_t p0 = s[-1], p1 = s[0], p2 = s[1];
-            for (int x = 0; x < VIDEO_WIDTH; x += 2) {
-                int32_t p3 = s[x + 2], p4 = s[x + 3];
-                int32_t a = p0 + p1 + p2 + p3, b = a - p0 + p4;
-                dst[x / 2] = (uint32_t)map4[a] << 8 | (uint32_t)map4[b] << 24 | uv[x / MIX];
-                p0 = p2;
-                p1 = p3;
-                p2 = p4;
+            int32_t sum = p0 + p1 + p2;
+            for (int x = 0; x < VIDEO_WIDTH; x += MIX, s += MIX, dst += MIX / 2) {
+                uint32_t c = *uv++;
+                int32_t q0 = s[2], q1 = s[3], q2 = s[4], q3 = s[5], q4 = s[6], q5 = s[7], q6 = s[8], q7 = s[9];
+                int32_t a0 = sum + q0, a1 = a0 - p0 + q1, a2 = a1 - p1 + q2, a3 = a2 - p2 + q3;
+                int32_t a4 = a3 - q0 + q4, a5 = a4 - q1 + q5, a6 = a5 - q2 + q6, a7 = a6 - q3 + q7;
+                dst[0] = (uint32_t)map4[a0] << 8 | (uint32_t)map4[a1] << 24 | c;
+                dst[1] = (uint32_t)map4[a2] << 8 | (uint32_t)map4[a3] << 24 | c;
+                dst[2] = (uint32_t)map4[a4] << 8 | (uint32_t)map4[a5] << 24 | c;
+                dst[3] = (uint32_t)map4[a6] << 8 | (uint32_t)map4[a7] << 24 | c;
+                p0 = q5;
+                p1 = q6;
+                p2 = q7;
+                sum = a7 - q4;
             }
+            dst -= VIDEO_WIDTH / 2;
         } else {
             const uint8_t *map = s_map;
             const uint8_t *u = (const uint8_t *)s;
