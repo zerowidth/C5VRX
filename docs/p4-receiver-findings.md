@@ -17,7 +17,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - On a good signal the back porch carries about 165 kHz RMS of noise (about 3 IRE) with an exact floating-point demodulator. It is FM noise, rising about 17 dB from 0.3 to 6.5 MHz, so a luma low-pass removes most of the visible grain.
 - The phase table's rounding matters only at low amplitude. At RMS 19 the porch noise was 241 kHz with a 6+6-bit table against 185 kHz exact; at RMS 61 it was 172 against 164. Hence the gain control now aims for RMS 40-72, and a 7+7-bit table isn't worth its 32 KB.
 - The signal can degrade within minutes for reasons outside the receiver: in one session porch noise rose to 700-870 kHz at every gain from 62 to 72 and lock fell to 40-210 of 262 lines.
-- The current source (the flight controller's OSD on gray, no camera) has no colorburst: the back porch shows nothing above noise at 3.58 or 4.43 MHz, where a 40 IRE burst would stand about 20 dB clear. `iq.py burst` checks this.
+- The OSD alone carries no colorburst: the back porch shows nothing above noise at 3.58 or 4.43 MHz, where a 40 IRE burst would stand about 20 dB clear. With a camera attached the burst is there. `iq.py burst` checks this.
 
 ## Field timing
 
@@ -25,6 +25,13 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 - With a camera attached, stretches of the picture stay below the sync slicer for over 18 µs several times a field, which read as vsync and reset the line count before the field ended. Fields then stopped for seconds and the camera fell back to the test pattern. A vertical flywheel fixes it: a vsync counts only within 6 lines of where the count expects one, unless 3 fields in a row have passed without one there. In 1,545 fields it ignored 386 false broad pulses and made one correction.
 - `decode tap` dumps can stall part way while the camera streams, and the console then stops answering until the P4 is reset.
+
+## Color
+
+- At 13.33 MS/s the NTSC subcarrier is exactly 189/704 of the sample rate, so a 704-entry table of the subcarrier repeats with no drift and the burst phase measured against the absolute sample count holds steady from line to line. Averaging it over lines (weight 1/4 per line) leaves about 4° of jitter. The transmitter's subcarrier was about 48 Hz off nominal, which the averaging follows.
+- Packing cos and sin into one 32-bit table entry (65536·cos + sin, amplitude 31) gets both products of a sample from one multiply-add.
+- Hue calibrated against SMPTE bars from a test card came within about 15° on every bar. Saturation measured off a camera filming a monitor was well under the bars' nominal level; it is not yet known how much of that is the camera and how much the decoder.
+- The hardware JPEG encoder times out converting YUV 4:2:2 input to 4:2:0, so fields are encoded as 4:2:2. It reads each pixel pair from memory as V Y0 U Y1.
 
 ## PARLIO RX and DMA on the P4
 
@@ -39,6 +46,8 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - The HP cores at 360 MHz give 27 cycles per sample at 13.33 MS/s. Loops here are instruction-bound: about one ALU operation per cycle, loads a few cycles each, and the 8 KB SPM (TCM) no faster than cached internal RAM.
 - Index arithmetic dominates the demodulator. Looking up a 16 KB table with the raw word shifted by two, instead of a 4 KB table needing five operations to build its index, took the demodulator from 68% of core 1 to 53%.
 - Writing PSRAM through the CPU cache costs about 5 cycles per byte and slows everything else on the memory path. Rendering lines into internal RAM and DMA'ing them to the PSRAM frame 16 rows at a time took core 0 from 74% to 64%, core 1 from 84% to 68% with no change to its code, and the JPEG encode from 4.6 to 2.5 ms. The AXI-GDMA async memcpy accepts a PSRAM destination at 16-byte alignment.
+- Chroma and sync cost too much to share a core with drawing, and an overloaded core 0 took USB and the console down with it. Moving sync to core 1 and drawing to its own task on core 0 fixed that. The drawing task then fell up to 60 lines behind (dropping hundreds a second) while using only 58% of the core, because USB and UVC tasks at its priority time-sliced it in 1 ms slices. Raising it above them removed every drop.
+- Unrolling the luma loop to 8 pixels from a running 4-sample sum took drawing from about 72-88% of core 0 to 58%.
 - Packing four pixels per word store to avoid byte-store aliasing gained little (9.4 to 7.5 cycles per sample).
 - `decode bench` varies about 15% between runs, and its small cached-buffer case runs slower than the full ring for reasons not understood. The live load figures in `decode` are the better measure.
 - BitScrambler can attach to PARLIO RX on the P4 and holds a 2048-entry, 32-bit table (11-bit address), so it could take the phase lookup off the CPU with a smaller index.
