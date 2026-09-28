@@ -43,6 +43,7 @@ Modern C5VRX
 | Realtime contracts and source abstraction | [realtime-iq-plan.md](realtime-iq-plan.md) |
 | Current image-quality path and proof gates | [image-quality.md](image-quality.md) |
 | Planned C5 + P4 receiver: wiring, UVC, control protocol | [p4-receiver-plan.md](p4-receiver-plan.md) |
+| C5 + P4 receiver hardware findings: I/Q levels and noise, PARLIO RX and DMA pitfalls, P4 CPU and PSRAM costs | [p4-receiver-findings.md](p4-receiver-findings.md) |
 | Corrected issue #6 winding/static measurements | [issue-6-static-analysis.md](issue-6-static-analysis.md) |
 | Static root causes, digital filtering limits, analog capacitor de-emphasis | [static-reduction-and-filtering.md](static-reduction-and-filtering.md) |
 | Issue #11 20 MS/s digital CVBS stream measurement and timing proof | [issue-11-cvbs-analysis.md](issue-11-cvbs-analysis.md) |
