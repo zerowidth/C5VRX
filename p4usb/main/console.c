@@ -6,6 +6,7 @@
 
 #include "driver/uart.h"
 #include "esp_chip_info.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +46,8 @@ static void cmd_info(int argc, char **argv)
     /* The panic dump itself only reaches the USB-C, so name the cause here. */
     say("p4usb rev v%d.%d uptime %lld ms, last reset: %s (%d)\n", chip.revision / 100, chip.revision % 100,
         esp_timer_get_time() / 1000, reason, (int)r);
+    say("internal RAM free %u (largest block %u), PSRAM free %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     bridge_info();
 }
 
