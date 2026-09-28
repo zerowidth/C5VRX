@@ -1,6 +1,7 @@
 #include "decode.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,7 @@
 #include "freertos/task.h"
 #include "soc/axi_dma_struct.h"
 
+#include "c5.h"
 #include "console.h"
 #include "iq.h"
 #include "video.h"
@@ -65,6 +67,15 @@
  * sync-to-white range, and the small table stays in the L1 cache. */
 #define LUT_SIZE (1 << 12)
 
+/* Gain keeps the I/Q RMS (in the lanes' 2v+1 units, full scale 127) in this range, which leaves the
+ * 6-bit phase table enough resolution without clipping; below it the picture gets grainy. */
+#define RMS_LOW 18
+#define RMS_HIGH 48
+#define CLIP_PERMILLE_MAX 5
+#define GAIN_MIN 30
+#define GAIN_MAX 80
+#define GAIN_STEP 2
+
 /* PARLIO RX's DMA request line on the P4's AXI-GDMA. */
 #define PARLIO_DMA_PERIPH 3
 
@@ -84,6 +95,10 @@ static uint8_t s_luts[2][LUT_SIZE];
 static const uint8_t *volatile s_lut = s_luts[0];
 static int s_lut_dc_i = 1000, s_lut_dc_q = 1000;
 static volatile int32_t s_dc_sum_i, s_dc_sum_q, s_dc_n;
+static volatile uint32_t s_dc_power, s_dc_clipped;
+static int s_gain = 60;
+static bool s_agc = true;
+static int s_rms, s_clip_permille;
 
 /* Demodulator and sync state, owned by the decode task. */
 /* Demodulated samples; the sync detector reads them four at a time. */
@@ -167,12 +182,33 @@ static void build_lut(uint8_t *lut, float dc_i, float dc_q)
     }
 }
 
-static void update_lut(void)
+static void set_gain(int gain)
+{
+    char cmd[16], reply[32];
+    snprintf(cmd, sizeof cmd, "gain %d", gain);
+    if (c5_request(cmd, reply, sizeof reply, 1000)) s_gain = gain;
+}
+
+/* Twice a second: re-center the phase table on the I/Q DC offset and steer the C5's gain. */
+static void control(void)
 {
     int32_t n = s_dc_n;
     if (n < 4096) return;
     float dc_i = (float)s_dc_sum_i / n, dc_q = (float)s_dc_sum_q / n;
+    float power = (float)s_dc_power / n;
+    uint32_t clipped = s_dc_clipped;
     s_dc_sum_i = s_dc_sum_q = s_dc_n = 0;
+    s_dc_power = s_dc_clipped = 0;
+    s_rms = (int)lrintf(sqrtf(fmaxf(power - dc_i * dc_i - dc_q * dc_q, 0)));
+    s_clip_permille = clipped * 1000 / n;
+    if (s_agc) {
+        int gain = s_gain;
+        if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
+        else if (s_rms < RMS_LOW) gain += GAIN_STEP;
+        gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
+        if (gain != s_gain) set_gain(gain);
+    }
+
     /* Quarter-LSB steps, so small drift doesn't rebuild the table every time. */
     int qi = lrintf(dc_i * 4), qq = lrintf(dc_q * 4);
     if (abs(qi - s_lut_dc_i) < 2 && abs(qq - s_lut_dc_q) < 2) return;
@@ -364,12 +400,18 @@ static void process(const uint16_t *w, uint32_t words)
         s_tap_len += n;
     }
     int32_t si = 0, sq = 0;
+    uint32_t power = 0, clipped = 0;
     for (int k = 0; k < DC_WORDS && k < (int)words; ++k) {
-        si += (int8_t)w[k];
-        sq += (int8_t)(w[k] >> 8);
+        int32_t i = (int8_t)w[k], q = (int8_t)(w[k] >> 8);
+        si += i;
+        sq += q;
+        power += i * i + q * q;
+        clipped += i >= 125 || i <= -125 || q >= 125 || q <= -125;
     }
     s_dc_sum_i += si;
     s_dc_sum_q += sq;
+    s_dc_power += power;
+    s_dc_clipped += clipped;
     s_dc_n += DC_WORDS;
 
     const uint8_t *lut = s_lut;
@@ -396,11 +438,11 @@ static void process(const uint16_t *w, uint32_t words)
 }
 
 /* Rebuilding the table takes a couple of milliseconds, too long to hold up the decode task. */
-static void lut_task(void *arg)
+static void control_task(void *arg)
 {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
-        if (s_running) update_lut();
+        if (s_running) control();
     }
 }
 
@@ -506,7 +548,7 @@ static void start(const char *channel)
             return;
         }
         build_lut(s_luts[0], 0, 0);
-        xTaskCreatePinnedToCore(lut_task, "decode_lut", 3072, NULL, 1, NULL, 0);
+        xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 1, NULL, 0);
         set_thresholds();
         s_frame = video_field_buffer();
         /* The demodulator has core 1 to itself; sync and rendering share core 0 with the DMA interrupt,
@@ -515,6 +557,7 @@ static void start(const char *channel)
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
     if (!iq_start(channel, EVERY)) return;
+    set_gain(s_gain);
     esp_err_t err = start_rx();
     if (err != ESP_OK) {
         say("decode: %s\n", esp_err_to_name(err));
@@ -531,6 +574,8 @@ static void status(void)
         s_last_vsync_ok ? ", vsync" : ", no vsync", (unsigned long)(s_period >> 16),
         (unsigned long)((s_period & 0xffff) * 1000 >> 16));
     say("%lu vertical corrections\n", (unsigned long)s_vjumps);
+    say("gain %d (%s), I/Q RMS %d, %d.%d%% clipped\n", s_gain, s_agc ? "auto" : "fixed", s_rms,
+        s_clip_permille / 10, s_clip_permille % 10);
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT, s_blank * KHZ_PER_UNIT,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
     say("longest gap between ring reads since last asked %lld us, of the %lld us the ring holds\n", s_max_gap_us,
@@ -600,6 +645,9 @@ void decode_command(int argc, char **argv)
         start(argc > 2 ? argv[2] : "R3");
     } else if (strcmp(sub, "off") == 0) {
         decode_stop();
+    } else if (strcmp(sub, "gain") == 0 && argc > 2) {
+        s_agc = strcmp(argv[2], "auto") == 0;
+        if (!s_agc) set_gain(atoi(argv[2]));
     } else if (strcmp(sub, "rx") == 0) {
         /* The ring reader alone, on whatever the C5 is already sending (for example its link counter). */
         decode_stop();
@@ -612,6 +660,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | rx | tap | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | rx | tap | bench]\n");
     }
 }
