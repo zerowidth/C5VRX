@@ -1095,24 +1095,24 @@ static esp_err_t start_rx(void)
     return parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true);
 }
 
-static void start(const char *channel)
+static bool start(const char *channel)
 {
     if (!s_ring) {
         s_ring = heap_caps_aligned_calloc(128, 1, RING_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
         if (!s_ring) {
             say("decode: no memory for the ring\n");
-            return;
+            return false;
         }
         build_lut(s_luts[0], 0, 0, false);
         build_lo();
         async_memcpy_config_t mcfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
         if (esp_async_memcpy_install_gdma_axi(&mcfg, &s_mcp) != ESP_OK) {
             say("decode: no DMA channel for the frame\n");
-            return;
+            return false;
         }
         if (old_dma_init() != ESP_OK) {
             say("decode: no DMA channel for the previous field\n");
-            return;
+            return false;
         }
         /* Above sync, so the gain comes down even when a clipped signal floods the sync detector. */
         xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 6, NULL, 0);
@@ -1124,15 +1124,16 @@ static void start(const char *channel)
         xTaskCreatePinnedToCore(draw_task, "decode_draw", 4096, NULL, 7, &s_draw_task, 0);
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
-    if (!iq_start(channel, EVERY)) return;
+    if (!iq_start(channel, EVERY)) return false;
     set_gain(s_gain);
     esp_err_t err = start_rx();
     if (err != ESP_OK) {
         say("decode: %s\n", esp_err_to_name(err));
         decode_stop();
-        return;
+        return false;
     }
     say("decoding\n");
+    return true;
 }
 
 static void status(void)
@@ -1225,12 +1226,25 @@ static void tap(void)
     say("\n-----END IQ-----\n");
 }
 
+static char s_channel[16] = "R3";
+
 void decode_start(const char *channel)
 {
-    static char last[16] = "R3";
-    if (channel) strlcpy(last, channel, sizeof last);
     decode_stop();
-    start(last);
+    if (channel && strcmp(channel, s_channel) != 0) {
+        if (start(channel)) {
+            strlcpy(s_channel, channel, sizeof s_channel);
+            return;
+        }
+        say("decode: back to %s\n", s_channel);
+        decode_stop();
+    }
+    start(s_channel);
+}
+
+const char *decode_channel(void)
+{
+    return s_channel;
 }
 
 void decode_command(int argc, char **argv)

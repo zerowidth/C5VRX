@@ -8,4 +8,6 @@ void decode_command(int argc, char **argv);
  * if the C5 doesn't answer. */
 void decode_start(const char *channel);
 bool decode_running(void);
+/* The channel decoded, or last decoded. */
+const char *decode_channel(void);
 void decode_stop(void);
