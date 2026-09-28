@@ -30,7 +30,8 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 - At 13.33 MS/s the NTSC subcarrier is exactly 189/704 of the sample rate, so a 704-entry table of the subcarrier repeats with no drift and the burst phase measured against the absolute sample count holds steady from line to line. Averaging it over lines (weight 1/4 per line) leaves about 4° of jitter. The transmitter's subcarrier was about 48 Hz off nominal, which the averaging follows.
 - Packing cos and sin into one 32-bit table entry (65536·cos + sin, amplitude 31) gets both products of a sample from one multiply-add.
-- Hue calibrated against SMPTE bars from a test card came within about 15° on every bar. Saturation measured off a camera filming a monitor was well under the bars' nominal level; it is not yet known how much of that is the camera and how much the decoder.
+- Hue calibrated against SMPTE bars from a test card came within about 15° on every bar.
+- FM noise rises with frequency, so chroma is the noisiest part of the picture. Smoothing 8-sample chroma blocks 1 2 1 with their neighbours quiets it visibly at full saturation.
 - The hardware JPEG encoder times out converting YUV 4:2:2 input to 4:2:0, so fields are encoded as 4:2:2. It reads each pixel pair from memory as V Y0 U Y1.
 
 ## PARLIO RX and DMA on the P4
@@ -48,6 +49,11 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - Writing PSRAM through the CPU cache costs about 5 cycles per byte and slows everything else on the memory path. Rendering lines into internal RAM and DMA'ing them to the PSRAM frame 16 rows at a time took core 0 from 74% to 64%, core 1 from 84% to 68% with no change to its code, and the JPEG encode from 4.6 to 2.5 ms. The AXI-GDMA async memcpy accepts a PSRAM destination at 16-byte alignment.
 - Chroma and sync cost too much to share a core with drawing, and an overloaded core 0 took USB and the console down with it. Moving sync to core 1 and drawing to its own task on core 0 fixed that. The drawing task then fell up to 60 lines behind (dropping hundreds a second) while using only 58% of the core, because USB and UVC tasks at its priority time-sliced it in 1 ms slices. Raising it above them removed every drop.
 - Unrolling the luma loop to 8 pixels from a running 4-sample sum took drawing from about 72-88% of core 0 to 58%.
+- The two HP cores share one L1 data cache. Core 0 reading the previous field from PSRAM through the cache (1.4 KB a line) took core 1 from 82% to 98%, and moving the hot code to IRAM made no difference. Fetching the rows by DMA into internal RAM instead left core 1 unaffected.
+- `esp_cache_msync` costs about 4K cycles a call around a much cheaper cache operation, since it takes a mutex and a critical section. Calling the cache HAL's invalidate directly is not safe: the cache sync unit is shared, and unlocked calls on one core collided with the other core's and corrupted the picture. The fix is fewer calls: one invalidate per eight fetched rows.
+- `esp_async_memcpy` from a PSRAM source cost about 40K cycles a call, writing the source back through the cache and allocating descriptors every time. A dedicated AXI-GDMA channel pair with descriptors written through the uncached alias costs a few hundred. The driver also rejects PSRAM addresses and lengths that aren't whole 64-byte cache lines, and logs each rejection, which on a per-line path saturated core 0.
+- PIE vector loads fault on the uncached internal RAM alias; scalar accesses there work.
+- Detecting lines after each 2016-sample DMA node, rather than after everything that has arrived, got lines to core 0 sooner but made vertical corrections jump from about one per thousand fields to one per twelve, likely from broad pulses split across calls. It was reverted.
 - Packing four pixels per word store to avoid byte-store aliasing gained little (9.4 to 7.5 cycles per sample).
 - `decode bench` varies about 15% between runs, and its small cached-buffer case runs slower than the full ring for reasons not understood. The live load figures in `decode` are the better measure.
 - BitScrambler can attach to PARLIO RX on the P4 and holds a 2048-entry, 32-bit table (11-bit address), so it could take the phase lookup off the CPU with a smaller index.
