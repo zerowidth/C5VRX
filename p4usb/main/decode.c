@@ -68,10 +68,10 @@
  * all 7 of Q. One shift per sample instead of five operations, and 16 KB still stays in the L1 cache. */
 #define LUT_SIZE (1 << 14)
 
-/* Gain keeps the I/Q RMS (in the lanes' 2v+1 units, full scale 127) in this range, which leaves the
- * 6-bit phase table enough resolution without clipping; below it the picture gets grainy. */
-#define RMS_LOW 18
-#define RMS_HIGH 48
+/* Gain keeps the I/Q RMS (in the lanes' 2v+1 units, full scale 127) in this range. Around 20 the
+ * phase table's rounding adds a third to the picture's noise; around 60 it adds almost nothing. */
+#define RMS_LOW 40
+#define RMS_HIGH 72
 #define CLIP_PERMILLE_MAX 5
 #define GAIN_MIN 30
 #define GAIN_MAX 80
