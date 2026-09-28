@@ -13,7 +13,8 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 ## The demodulated signal
 
-- One unit of 8-bit phase difference at 13.33 MS/s is about 52 kHz. Sync tip sits near −3.0 MHz and blanking near −0.85 MHz, so 40 IRE is about 2.1 MHz and 1 IRE about 52 kHz, one unit.
+- One unit of 8-bit phase difference at 13.33 MS/s is about 52 kHz. Averaged over locked lines, the sync tip sits near −2.2 MHz and the back porch near −1.0 MHz, so 40 IRE is about 1.2 MHz and 1 IRE about 30 kHz. The picture's white reaches about +2 MHz.
+- Blanking taken as the median of the level histogram 1-3 MHz above the sync tip reads about 0.45 MHz (15 IRE) high, because dark picture content falls in that band too. With the sync depth scaled from it, white was mapped about 1.45 times too far out and the darkest sixth of the picture clipped to black, which looked dim beside an FPV monitor. Averaging the sync tip and back porch of every other locked line fixed both.
 - On a good signal the back porch carries about 165 kHz RMS of noise (about 3 IRE) with an exact floating-point demodulator. It is FM noise, rising about 17 dB from 0.3 to 6.5 MHz, so a luma low-pass removes most of the visible grain.
 - The phase table's rounding matters only at low amplitude. At RMS 19 the porch noise was 241 kHz with a 6+6-bit table against 185 kHz exact; at RMS 61 it was 172 against 164. Hence the gain control now aims for RMS 40-72, and a 7+7-bit table isn't worth its 32 KB.
 - The signal can degrade within minutes for reasons outside the receiver: in one session porch noise rose to 700-870 kHz at every gain from 62 to 72 and lock fell to 40-210 of 262 lines.

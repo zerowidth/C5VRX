@@ -95,6 +95,13 @@
 #define BURST_START 72
 #define BURST_END 104
 /* Filtered burst magnitude, in mixed units, that turns color on and back off. */
+/* Samples after the sync's leading edge averaged for the sync tip, and for blanking over the burst
+ * (which cancels over lines), on every other locked line once a field has enough of them. */
+#define TIP_START 8
+#define TIP_END 56
+#define PORCH_START 72
+#define PORCH_END 112
+#define LEVEL_LINES_MIN 60
 #define COLOR_ON 700
 #define COLOR_OFF 400
 
@@ -151,7 +158,10 @@ static int s_vline;
 static int s_parity;
 static uint32_t s_last_broad;
 
-static int s_tip = -57, s_blank = -17;
+/* In sixteenths of a unit. */
+static int s_tip = -57 * 16, s_blank = -17 * 16;
+/* Sums over locked lines of the sync tip and back porch, since the histogram's picture content biases blanking up. */
+static int32_t s_tip_sum, s_porch_sum, s_level_lines;
 /* Demodulated sample, as a uint8_t, to pixel level. */
 static uint8_t s_map[256];
 /* The same for the sum of four samples, which nulls the subcarrier's dots out of luma when there is color. */
@@ -267,8 +277,8 @@ static void control(void)
     s_lut_dc_q = qq;
 }
 
-/* Levels come from each field's histogram: the sync tip is the 2nd percentile and blanking is the
- * median of what lies 1-3 MHz above it, so they work before anything is locked. */
+/* Until lines lock, levels come from each field's histogram: the sync tip is the 2nd percentile and
+ * blanking is the median of what lies 1-3 MHz above it. */
 static void set_thresholds(void);
 
 static void update_levels(void)
@@ -287,25 +297,32 @@ static void update_levels(void)
     for (uint32_t acc = 0; blank < hi && (acc += s_histogram[blank]) < band / 2; ++blank) {
     }
     memset(s_histogram, 0, sizeof s_histogram);
-    s_tip = (3 * s_tip + tip - 128) / 4;
-    s_blank = (3 * s_blank + blank - 128) / 4;
+    tip = (tip - 128) * 16;
+    blank = (blank - 128) * 16;
+    if (s_level_lines >= LEVEL_LINES_MIN) {
+        tip = s_tip_sum * 16 / (s_level_lines * (TIP_END - TIP_START));
+        blank = s_porch_sum * 16 / (s_level_lines * (PORCH_END - PORCH_START));
+    }
+    s_tip_sum = s_porch_sum = s_level_lines = 0;
+    s_tip = (3 * s_tip + tip) / 4;
+    s_blank = (3 * s_blank + blank) / 4;
     set_thresholds();
 }
 
 static void set_thresholds(void)
 {
     int span = s_blank - s_tip;
-    if (span < 8) span = 8;
-    int thr = (s_tip + s_blank) / 2, hyst = span / 8;
+    if (span < 8 * 16) span = 8 * 16;
+    int thr = (s_tip + s_blank) / 32, hyst = span / 128;
     s_thr_lo = BOX * (thr - hyst);
     s_thr_hi = BOX * (thr + hyst);
     /* White is 100 IRE above blanking, and sync 40 below. */
     for (int v = -128; v < 128; ++v) {
-        int pix = (v - s_blank) * 255 * 2 / (span * 5);
+        int pix = (v * 16 - s_blank) * 255 * 2 / (span * 5);
         s_map[(uint8_t)v] = pix < 0 ? 0 : pix > 255 ? 255 : pix;
     }
     for (int v = -512; v < 512; ++v) {
-        int pix = (v - 4 * s_blank) * 255 * 2 / (span * 20);
+        int pix = (v * 16 - 4 * s_blank) * 255 * 2 / (span * 20);
         s_map4[v + 512] = pix < 0 ? 0 : pix > 255 ? 255 : pix;
     }
 }
@@ -776,7 +793,17 @@ static void render_line(void)
 
     /* Every 13th sample of each line is plenty for the level histogram. */
     for (uint32_t i = 0; i < (LINE_Q16 >> 16); i += 13) ++s_histogram[(uint8_t)(s_hist[(s_line + i) % HIST] + 128)];
-    if (s_hit) ++s_field_hits;
+    if (s_hit) {
+        ++s_field_hits;
+        if (s_vline & 1) {
+            int32_t t = 0, b = 0;
+            for (int i = TIP_START; i < TIP_END; ++i) t += s_hist[(s_line + i) % HIST];
+            for (int i = PORCH_START; i < PORCH_END; ++i) b += s_hist[(s_line + i) % HIST];
+            s_tip_sum += t;
+            s_porch_sum += b;
+            ++s_level_lines;
+        }
+    }
     s_missed = s_hit ? 0 : s_missed + 1;
     s_hit = false;
     /* Coast through a missing vertical sync at 262.5 lines per field: an even field counts from line 4
@@ -1102,7 +1129,7 @@ static void status(void)
 
     say("gain %d (%s), I/Q RMS %d, %d.%d%% clipped\n", s_gain, s_agc ? "auto" : "fixed", s_rms,
         s_clip_permille / 10, s_clip_permille % 10);
-    say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT, s_blank * KHZ_PER_UNIT,
+    say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT / 16, s_blank * KHZ_PER_UNIT / 16,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
     say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
     say("draw: %lu stale, %lu queue full, max lag %lu samples\n", (unsigned long)s_draw_dropped, (unsigned long)s_draw_full, (unsigned long)s_draw_max_lag);
