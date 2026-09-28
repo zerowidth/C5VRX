@@ -726,12 +726,19 @@ static void tap(void)
     say("\n-----END IQ-----\n");
 }
 
+void decode_start(const char *channel)
+{
+    static char last[16] = "R3";
+    if (channel) strlcpy(last, channel, sizeof last);
+    decode_stop();
+    start(last);
+}
+
 void decode_command(int argc, char **argv)
 {
     const char *sub = argc > 1 ? argv[1] : "";
     if (strcmp(sub, "on") == 0) {
-        decode_stop();
-        start(argc > 2 ? argv[2] : "R3");
+        decode_start(argc > 2 ? argv[2] : NULL);
     } else if (strcmp(sub, "off") == 0) {
         decode_stop();
     } else if (strcmp(sub, "gain") == 0 && argc > 2) {

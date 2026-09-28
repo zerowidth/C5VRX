@@ -3,6 +3,7 @@
 #include "bridge.h"
 #include "c5.h"
 #include "console.h"
+#include "decode.h"
 #include "pins.h"
 #include "usb.h"
 #include "uvc.h"
@@ -20,7 +21,8 @@ void app_main(void)
     video_init();
     uvc_init();
     usb_init();
-    say("\np4usb ready, C5 held in reset, type help\n> ");
+    decode_start(NULL);
+    say("\np4usb ready, type help\n> ");
 
     uint8_t buf[64];
     for (;;) {

@@ -8,6 +8,7 @@
 
 #include "c5.h"
 #include "console.h"
+#include "decode.h"
 
 /* esptool's first SYNC frame starts with these bytes: SLIP end, then command 0x08. */
 static const uint8_t SYNC_PREFIX[] = {0xc0, 0x00, 0x08, 0x24, 0x00};
@@ -94,8 +95,13 @@ bool bridge_active(void)
     return s_active;
 }
 
+static bool s_resume_decode;
+
 static void start(void)
 {
+    /* The C5 stops exporting I/Q while it sits in its ROM loader. */
+    s_resume_decode = decode_running();
+    decode_stop();
     c5_download();
     c5_tx_attach();
     s_answered = false;
@@ -117,6 +123,7 @@ static void stop(const char *why)
     c5_tx_detach();
     if (s_baud != BRIDGE_BAUD) set_baud(BRIDGE_BAUD);
     say("\nbridge: %s\n> ", why);
+    if (s_resume_decode) decode_start(NULL);
 }
 
 bool bridge_host_bytes(const uint8_t *buf, size_t n)
