@@ -110,7 +110,10 @@ static void render(uint32_t seq)
     snprintf(lines[6], sizeof lines[6], "usb    %lu sent %lu skip", (unsigned long)sent, (unsigned long)skipped);
     snprintf(lines[7], sizeof lines[7], "video  no decoded fields");
     snprintf(lines[8], sizeof lines[8], "bridge %s", bridge_active() ? "active" : "idle");
-    snprintf(lines[9], sizeof lines[9], "chan   %s%s", decode_channel(), decode_running() ? "" : ", stopped");
+    unsigned mhz;
+    const char *chan = decode_channel(&mhz);
+    if (mhz) snprintf(lines[9], sizeof lines[9], "chan   %s %u MHz%s", chan, mhz, decode_running() ? "" : ", stopped");
+    else snprintf(lines[9], sizeof lines[9], "chan   %s%s", chan, decode_running() ? "" : ", stopped");
 
     memset(s_raw, 0, s_raw_size);
     for (int i = 0; i < 10; ++i) {

@@ -8,6 +8,8 @@ void iq_command(int argc, char **argv);
 /* Resets the C5 into c5rx, tunes it, starts its I/Q export with one of every `every` samples of its
  * 80 MS/s bus, and picks the P4's sampling edge. */
 bool iq_start(const char *channel, int every);
+/* The C5's name and frequency for the channel last tuned. */
+const char *iq_channel(unsigned *mhz);
 parlio_sample_edge_t iq_edge(void);
 /* A PARLIO RX unit on the C5's clock and 14 lanes: I in the low byte and Q in the high byte of each
  * 16-bit word, MSB-aligned, with lines 0 and 8 held at 1. */

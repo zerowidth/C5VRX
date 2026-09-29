@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "driver/parlio_rx.h"
 #include "esp_async_memcpy.h"
@@ -1136,10 +1137,13 @@ static bool start(const char *channel)
     return true;
 }
 
+static char s_channel[8] = "R3";
+static unsigned s_mhz;
+
 static void status(void)
 {
-    say("%s, %lu fields, last field %lu/%d hsyncs%s, line %lu.%03lu samples\n",
-        s_running ? "running" : "stopped", (unsigned long)s_fields, (unsigned long)s_last_hits, FIELD_LINES,
+    say("%s on %s (%u MHz), %lu fields, last field %lu/%d hsyncs%s, line %lu.%03lu samples\n",
+        s_running ? "running" : "stopped", s_channel, s_mhz, (unsigned long)s_fields, (unsigned long)s_last_hits, FIELD_LINES,
         s_last_vsync_ok ? ", vsync" : ", no vsync", (unsigned long)(s_period >> 16),
         (unsigned long)((s_period & 0xffff) * 1000 >> 16));
     say("%lu vertical corrections, %lu broad pulses ignored outside the vsync window\n", (unsigned long)s_vjumps,
@@ -1226,24 +1230,29 @@ static void tap(void)
     say("\n-----END IQ-----\n");
 }
 
-static char s_channel[16] = "R3";
-
-void decode_start(const char *channel)
+static bool start_on(const char *channel)
 {
-    decode_stop();
-    if (channel && strcmp(channel, s_channel) != 0) {
-        if (start(channel)) {
-            strlcpy(s_channel, channel, sizeof s_channel);
-            return;
-        }
-        say("decode: back to %s\n", s_channel);
-        decode_stop();
-    }
-    start(s_channel);
+    if (!start(channel)) return false;
+    strlcpy(s_channel, iq_channel(&s_mhz), sizeof s_channel);
+    return true;
 }
 
-const char *decode_channel(void)
+bool decode_start(const char *channel)
 {
+    decode_stop();
+    if (channel && strcasecmp(channel, s_channel) != 0) {
+        if (start_on(channel)) return true;
+        say("decode: back to %s\n", s_channel);
+        decode_stop();
+        start_on(s_channel);
+        return false;
+    }
+    return start_on(s_channel);
+}
+
+const char *decode_channel(unsigned *mhz)
+{
+    *mhz = s_mhz;
     return s_channel;
 }
 

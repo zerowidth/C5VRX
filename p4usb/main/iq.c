@@ -1,5 +1,6 @@
 #include "iq.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +42,8 @@ static size_t s_len;
 static parlio_sample_edge_t s_edge = PARLIO_SAMPLE_EDGE_POS;
 /* The C5 keeps one of every s_every samples of its 80 MS/s bus. */
 static int s_every = 2;
+static char s_tuned[8];
+static unsigned s_mhz;
 static SemaphoreHandle_t s_full;
 static size_t s_want;
 static size_t s_got;
@@ -230,8 +233,19 @@ bool iq_start(const char *channel, int every)
             return false;
         }
         say("%s\n", reply);
+        /* A bare frequency tunes with no label, so fall back to what was asked for. */
+        if (i == 0 && sscanf(reply, "ok tune %7s %u", s_tuned, &s_mhz) != 2) {
+            s_mhz = (unsigned)atoi(reply + 8);
+            strlcpy(s_tuned, channel, sizeof s_tuned);
+        }
     }
     return pick_edge();
+}
+
+const char *iq_channel(unsigned *mhz)
+{
+    *mhz = s_mhz;
+    return s_tuned;
 }
 
 parlio_sample_edge_t iq_edge(void)

@@ -65,6 +65,17 @@ static void cmd_reboot(int argc, char **argv)
     console_reboot(argc > 1 && strcmp(argv[1], "download") == 0);
 }
 
+static void cmd_channel(int argc, char **argv)
+{
+    unsigned mhz;
+    if (argc > 1 && !decode_start(argv[1])) {
+        say("err %s\n", argv[1]);
+        return;
+    }
+    const char *chan = decode_channel(&mhz);
+    say("channel %s %u\n", chan, mhz);
+}
+
 static const command_t s_commands[] = {
     {"help", cmd_help, "list commands"},
     {"info", cmd_info, "chip revision, uptime and bridge counters"},
@@ -73,6 +84,7 @@ static const command_t s_commands[] = {
     {"link", link_run, "clocked counter test on each side's lanes, optionally at one MHz"},
     {"iq", iq_command, "capture two fields of I/Q; start [channel] tunes the C5 and picks a clock edge; dump sends the capture"},
     {"decode", decode_command, "on [channel] tunes the C5 and decodes its video into the camera; off stops; alone shows lock and load; rx, tap and bench are for debugging"},
+    {"channel", cmd_channel, "channel [BAND+N | MHZ] retunes (bands R A B E F L, 5180-5885 MHz); alone prints channel and MHz"},
     {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64"},
     {"reboot", cmd_reboot, "restart the P4; reboot download enters its ROM loader"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},
