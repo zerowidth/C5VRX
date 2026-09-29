@@ -7,3 +7,6 @@ idf_component_register(SRCS "main.c" "console.c" "census.c" "c5.c" "bridge.c" "w
 # TinyUSB reads its configuration from tusb_config.h on its own include path.
 idf_component_get_property(tusb_lib espressif__tinyusb COMPONENT_LIB)
 target_include_directories(${tusb_lib} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/tusb")
+
+# usb.c keeps TinyUSB's video class from taking a new TX FIFO each time it reopens its endpoint.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=dcd_edpt_open" "-Wl,--wrap=dcd_edpt_close_all")

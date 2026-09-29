@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "device/dcd.h"
 #include "tusb.h"
 
 #include "bridge.h"
@@ -88,6 +89,30 @@ static const char *const s_strings[] = {
     [STR_CONSOLE] = "C5VRX Console",
     [STR_VIDEO] = "C5VRX Video",
 };
+
+/* The P4's high-speed DWC2 controller: each IN endpoint's DIEPCTL, whose USBAEP bit the core clears on bus reset. */
+#define DWC2_DIEPCTL(n) (*(volatile uint32_t *)(0x50000900 + 0x20 * (n)))
+#define DIEPCTL_USBAEP (1u << 15)
+
+bool __real_dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc);
+void __real_dcd_edpt_close_all(uint8_t rhport);
+
+/* The video class reopens its bulk endpoint on every SET_INTERFACE and the DWC2 port has no close, so each
+ * reopen took another TX FIFO until allocation failed; reactivate an active IN endpoint in place instead. */
+bool __wrap_dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc)
+{
+    uint8_t ep = desc->bEndpointAddress;
+    if (tu_edpt_dir(ep) == TUSB_DIR_IN && (DWC2_DIEPCTL(tu_edpt_number(ep)) & DIEPCTL_USBAEP))
+        return dcd_edpt_iso_activate(rhport, desc);
+    return __real_dcd_edpt_open(rhport, desc);
+}
+
+/* Closing all re-initializes the FIFOs, so every endpoint must allocate again. */
+void __wrap_dcd_edpt_close_all(uint8_t rhport)
+{
+    __real_dcd_edpt_close_all(rhport);
+    for (int n = 1; n < 16; ++n) DWC2_DIEPCTL(n) &= ~DIEPCTL_USBAEP;
+}
 
 static usb_phy_handle_t s_phy;
 static SemaphoreHandle_t s_rx_ready;
