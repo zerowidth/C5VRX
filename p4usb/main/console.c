@@ -51,6 +51,7 @@ static void cmd_info(int argc, char **argv)
     say("internal RAM free %u (largest block %u), PSRAM free %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     bridge_info();
+    usb_console_info();
 }
 
 void console_reboot(bool download)

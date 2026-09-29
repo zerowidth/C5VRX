@@ -160,6 +160,12 @@ void usb_init(void)
     xTaskCreate(usb_task, "usb", 4096, NULL, 5, NULL);
 }
 
+void usb_console_info(void)
+{
+    say("usb console: mounted %d, suspended %d, DTR %d, %lu bytes free to send\n", tud_mounted(), tud_suspended(),
+        tud_cdc_connected(), (unsigned long)tud_cdc_write_available());
+}
+
 bool usb_console_connected(void)
 {
     return tud_cdc_connected();
