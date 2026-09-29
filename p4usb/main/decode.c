@@ -107,8 +107,10 @@
 #define PORCH_START 72
 #define PORCH_END 112
 #define LEVEL_LINES_MIN 60
-/* Hsyncs in a field for it to count as locked, which color needs, since noise's random burst adds up. */
-#define LOCKED_HITS 200
+/* Hsyncs in a field for color to come on and stay on: noise's random burst adds up, but noise locks none,
+ * while a moving transmitter often dips below 200. */
+#define COLOR_HITS_ON 150
+#define COLOR_HITS_OFF 60
 #define COLOR_ON 700
 #define COLOR_OFF 400
 
@@ -377,7 +379,7 @@ static void emit_field(void)
 {
     if (!s_field_vsync && s_vsync_missed < VSYNC_REACQUIRE) ++s_vsync_missed;
     s_burst = (int)hypotf(s_burst_re, s_burst_im);
-    s_color = s_field_hits >= LOCKED_HITS && s_burst > (s_color ? COLOR_OFF : COLOR_ON);
+    s_color = s_field_hits >= (s_color ? COLOR_HITS_OFF : COLOR_HITS_ON) && s_burst > (s_color ? COLOR_OFF : COLOR_ON);
     update_levels();
     ++s_fields;
     s_last_hits = s_field_hits;
