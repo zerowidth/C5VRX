@@ -77,7 +77,7 @@ static const uint8_t s_config[] = {
                                         FRAME_INTERVAL, FRAME_INTERVAL, FRAME_INTERVAL, FRAME_INTERVAL),
     TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING(VIDEO_COLOR_PRIMARIES_BT709, VIDEO_COLOR_XFER_CH_BT709,
                                         VIDEO_COLOR_COEF_SMPTE170M),
-    TUD_VIDEO_DESC_EP_BULK(USB_EP_VIDEO_IN, CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE, 1),
+    TUD_VIDEO_DESC_EP_BULK(USB_EP_VIDEO_IN, 512, 1),
 };
 _Static_assert(sizeof s_config == CONFIG_LEN, "configuration descriptor length");
 

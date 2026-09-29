@@ -15,4 +15,5 @@
 
 #define CFG_TUD_VIDEO 1
 #define CFG_TUD_VIDEO_STREAMING 1
-#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 512
+/* The video class sends one payload per transfer, so 512-byte payloads cap a 64 KB frame near 38 fps. */
+#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 16384

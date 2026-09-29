@@ -13,6 +13,8 @@
 #include "video.h"
 
 #define UVC_BUFFER_BYTES (128 * 1024)
+#define PAYLOAD_HEADER 2
+#define USB_HS_PACKET 512
 /* Frames arrive every 16.7 ms, so this only runs out if the encoder fails. */
 #define NEXT_WAIT_MS 100
 /* A frame takes about 1 ms on the bus; a host that stops reading leaves it unfinished. */
@@ -61,13 +63,17 @@ static void uvc_task(void *arg)
         if (last_seq && f.seq != last_seq + 1) s_skipped += f.seq - last_seq - 1;
         last_seq = f.seq;
         size_t len = f.len;
-        if (len > UVC_BUFFER_BYTES) {
+        if (len >= UVC_BUFFER_BYTES) {
             ++s_oversize;
             video_release(VIDEO_READER_UVC);
             continue;
         }
         memcpy(s_buffer, f.jpeg, len);
         video_release(VIDEO_READER_UVC);
+        /* The class sends no zero-length packet, so a last payload filling whole packets would run into the
+         * next one; a byte after EOI ends it short, and decoders ignore it. */
+        size_t data = CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE - PAYLOAD_HEADER;
+        if (len % data && (len % data + PAYLOAD_HEADER) % USB_HS_PACKET == 0) s_buffer[len++] = 0;
         ulTaskNotifyTake(pdTRUE, 0);
         if (!tud_video_n_frame_xfer(0, 0, s_buffer, len)) continue;
         ++s_sent;
