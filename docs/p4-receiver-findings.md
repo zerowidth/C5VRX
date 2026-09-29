@@ -19,6 +19,8 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - Indices above 77 are outside the table. With no VTX, 79 clipped 3% of samples, 80 clipped 10-47% and 81-89 clipped 95-99%, so the old gain limit of 80 was itself a broken state.
 - On noise with no VTX, RMS rose from 1 below index 35 to about 23 at 77 in one run. In another, with something else on the air, it rose from 13 to 37 across RF 7's fine steps (52-57) and plateaued near 46 from 60 upward. Stage boundaries don't give an even step, so a fixed index step of 2 lands unevenly.
 
+- With no VTX on R3, V3 held the survival gain of 58, but bursts of interference with 13-18% of a window's samples clipped and a median power of 1 made it drop the gain and return about 6 times a second: 32 overloads and 65 writes in about 10 s. Depending on origin occupancy and coherence, the same window reads as no carrier or as saturation.
+
 ## The demodulated signal
 
 - One unit of 8-bit phase difference at 13.33 MS/s is about 52 kHz. Averaged over locked lines, the sync tip sits near −2.2 MHz and the back porch near −1.0 MHz, so 40 IRE is about 1.2 MHz and 1 IRE about 30 kHz. The picture's white reaches about +2 MHz.
@@ -80,5 +82,5 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - The hardware JPEG encoder takes 2.5-3.5 ms for a 720×480 grayscale frame. At quality 80 grainy fields overflowed the 128 KB slot; quality 70 gives about 60-70 KB.
 - With no signal, every field of noise overflowed the 128 KB slot at quality 70, so no frame reached the camera and it froze. At quality 20 noise fits in about 113 KB, so quality now drops 10 per overflow and climbs back after 30 frames under 60% of the slot. A third was too low: normal video at quality 40 is about 45 KB, so quality stuck there after a loss and the picture stayed blocky.
 - On noise the burst's random vector adds up past the color threshold and the histogram's levels drift far from any real signal's, which drew saturated rainbow speckle. Color now needs 200 hsyncs in a field, and the picture keeps the last locked levels, so a lost signal shows as gray snow.
-- With no signal the gain control climbs to its maximum (80), and a returning signal then clips completely and doesn't lock until the gain is back near 50. Stepping down 8 at a time while more than 10% of samples clip cut that from about 8 s to 2 s.
+- With no signal the gain control climbed to its maximum (then 80, since capped at 77), and a returning signal then clips completely and doesn't lock until the gain is back near 50. Stepping down 8 at a time while more than 10% of samples clip cut that from about 8 s to 2 s.
 - On macOS, open the P4 console (303a:8000) with RTS off and DTR on: RTS high with DTR low looks like esptool's reset, and the P4 only writes to a port with DTR set.
