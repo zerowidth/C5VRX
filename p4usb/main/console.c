@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
@@ -11,6 +12,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "soc/lp_system_reg.h"
+#include "soc/uart_pins.h"
 
 #include "bridge.h"
 #include "c5.h"
@@ -105,6 +107,8 @@ static volatile source_t s_source;
 void console_init(void)
 {
     ESP_ERROR_CHECK(uart_driver_install(HOST_UART, 4096, 4096, 0, NULL, 0));
+    /* With the USB-C unplugged the RX line floats, and its noise would steal replies from USB. */
+    gpio_set_pull_mode(U0RXD_GPIO_NUM, GPIO_PULLUP_ONLY);
 }
 
 bool host_is_uart(void)
