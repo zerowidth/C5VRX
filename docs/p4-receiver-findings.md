@@ -21,6 +21,11 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 - With no VTX on R3, V3 held the survival gain of 58, but bursts of interference with 13-18% of a window's samples clipped and a median power of 1 made it drop the gain and return about 6 times a second: 32 overloads and 65 writes in about 10 s. Depending on origin occupancy and coherence, the same window reads as no carrier or as saturation.
 
+- With a strong VTX on R3, line lock stayed at 253-254 of 262 at every fixed gain from 28 to 50, including 42-50 where 46-100% of samples clipped. FM survives hard limiting, so clipping alone is not a reason to cut gain. Lock fell only from 52 upward (205 at 52, 178 at 64).
+- V3 on that signal: from a forced gain of 58 (all samples clipped) it stepped 58, 52, 48, 47, 41, 33, 34 and held within about 85 ms. The old control takes about 2 s to come down that far. Left alone for a minute it made two fine steps and held at 254/262. Over 30 s runs both modes averaged about 220 of 262 lines while the signal was weaker, but V3 made 211-262 writes per run against none for the old control.
+- Those writes came from windows with a median power of 1 and all samples at the origin, alternating with interference bursts. V3 reads the first as no carrier and goes to 58, and reads the bursts as overloads and drops to 52, so it swings between the two. This matches the no-VTX behaviour, so the signal was probably missing or very weak during those runs.
+- At a median power of 7 the coherence at 13.33 MS/s fell to about 45%, under V3's 55% carrier test, so V3 stopped raising the gain there (gain 33). At a median power of 9 it was 79-88% and V3 stepped up normally.
+
 ## The demodulated signal
 
 - One unit of 8-bit phase difference at 13.33 MS/s is about 52 kHz. Averaged over locked lines, the sync tip sits near −2.2 MHz and the back porch near −1.0 MHz, so 40 IRE is about 1.2 MHz and 1 IRE about 30 kHz. The picture's white reaches about +2 MHz.
