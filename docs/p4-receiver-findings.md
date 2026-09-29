@@ -11,6 +11,14 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - The carrier sits within about 0.3 MHz of the tuned center. R3 is reached from Wi-Fi channel 144 with `phy_set_freq`.
 - Nothing upstream filters the video: a sync edge rises from tip to blanking within one 75 ns sample, so 3.58 MHz chroma would pass.
 
+## The C5's gain table
+
+- The IDF 6.1 PHY library (esp-phy-lib 5695f4f) keeps the gain table where main's pinned library (59c1234) does: stage spans at `phy_param+0x422` and table maxima at `+0x124..0x126`, confirmed in `phy_set_rx_gain_table`'s disassembly.
+- Read back from c5rx after tuning, the spans are 15, 13, 5, 8, 6, 1, 4, 6 and the maxima 77, 77, 83. Main's defaults assume 4 for the sixth span. The table was the same on L1, R1, R3 and 5885 MHz and after a gain write.
+- Decoded with main's `arc_gain_tuple_decode`, RF stages start at indices 15, 28, 33, 41, 47, 48, 52 and 58. Stage 8 runs 58-77 through BB banks 1, 3, 7 and 15 with six fine steps each, 5 down to 0.
+- Indices above 77 are outside the table. With no VTX, 79 clipped 3% of samples, 80 clipped 10-47% and 81-89 clipped 95-99%, so the old gain limit of 80 was itself a broken state.
+- On noise with no VTX, RMS rose from 1 below index 35 to about 23 at 77 in one run. In another, with something else on the air, it rose from 13 to 37 across RF 7's fine steps (52-57) and plateaued near 46 from 60 upward. Stage boundaries don't give an even step, so a fixed index step of 2 lands unevenly.
+
 ## The demodulated signal
 
 - One unit of 8-bit phase difference at 13.33 MS/s is about 52 kHz. Averaged over locked lines, the sync tip sits near −2.2 MHz and the back porch near −1.0 MHz, so 40 IRE is about 1.2 MHz and 1 IRE about 30 kHz. The picture's white reaches about +2 MHz.
