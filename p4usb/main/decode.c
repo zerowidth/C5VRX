@@ -79,7 +79,8 @@
 #define RMS_HIGH 72
 #define CLIP_PERMILLE_MAX 5
 #define GAIN_MIN 30
-#define GAIN_MAX 80
+/* The top of the C5's gain table; indices above it clip on noise alone. */
+#define GAIN_MAX 77
 #define GAIN_STEP 2
 /* Heavy clipping, as when a signal returns while the gain sits at its maximum, steps down faster. */
 #define CLIP_PERMILLE_HEAVY 100
