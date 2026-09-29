@@ -19,10 +19,14 @@
 #include "freertos/task.h"
 #include "soc/axi_dma_struct.h"
 
+#include "arc_phy.h"
 #include "c5.h"
 #include "console.h"
+#include "direct_gain_v3.h"
 #include "iq.h"
 #include "video.h"
+
+#include "phase8_gain_lut.h"
 
 /* The C5 sends every 6th sample of its 80 MS/s bus; the carrier plus deviation stays inside the
  * +-6.67 MHz this can follow without wrapping. */
@@ -132,8 +136,27 @@ static int s_lut_dc_i = 1000, s_lut_dc_q = 1000;
 static volatile int32_t s_dc_sum_i, s_dc_sum_q, s_dc_n;
 static volatile uint32_t s_dc_power, s_dc_clipped;
 static int s_gain = 60;
-static bool s_agc = true;
+typedef enum { GAIN_FIXED, GAIN_AUTO, GAIN_V3 } gain_mode_t;
+static volatile gain_mode_t s_gain_mode = GAIN_AUTO;
 static int s_rms, s_clip_permille;
+
+/* Main's Direct Gain V3 steering the C5 from four 64-sample windows of I/Q quantized to its Q4 cells. */
+#define V3_REGIONS 4
+#define V3_REGION_WORDS 64
+/* Main counts adjacent phase steps within 45 degrees at 40 MS/s, 5 MHz; at 13.33 MS/s that is 96 of 256. */
+#define V3_COHERENT 96
+/* A reply takes a few ms at 115200 baud, so samples this soon after a write may predate it. */
+#define V3_WRITE_GUARD_MS 3
+/* Read from the IDF 6.1 PHY's phy_param, the same on every channel. */
+static const uint8_t V3_SPANS[ARC_RX_STAGE_COUNT] = {15, 13, 5, 8, 6, 1, 4, 6, 0};
+#define V3_TABLE_MAX 77
+static arc_gain_table_t s_table;
+static direct_gain_v3_t s_v3;
+static dg3_observation_t s_v3_obs;
+static uint16_t s_v3_words[V3_REGIONS * V3_REGION_WORDS];
+static volatile bool s_v3_want, s_v3_reset = true;
+static int64_t s_v3_at;
+static TaskHandle_t s_v3_task;
 
 /* Demodulator and sync state, owned by the decode task. */
 /* Demodulated samples; the sync detector reads them four at a time. */
@@ -266,7 +289,7 @@ static void control(void)
     s_dc_power = s_dc_clipped = 0;
     s_rms = (int)lrintf(sqrtf(fmaxf(power - dc_i * dc_i - dc_q * dc_q, 0)));
     s_clip_permille = clipped * 1000 / n;
-    if (s_agc) {
+    if (s_gain_mode == GAIN_AUTO) {
         int gain = s_gain;
         if (s_clip_permille > CLIP_PERMILLE_HEAVY) gain -= GAIN_STEP_HEAVY;
         else if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
@@ -960,6 +983,14 @@ static void process(const uint16_t *w, uint32_t words)
     s_dc_power += power;
     s_dc_clipped += clipped;
     s_dc_n += DC_WORDS;
+    if (s_v3_want && words >= V3_REGIONS * V3_REGION_WORDS) {
+        uint32_t stride = words / V3_REGIONS / 4 * 4;
+        for (int r = 0; r < V3_REGIONS; ++r)
+            memcpy(s_v3_words + r * V3_REGION_WORDS, w + r * stride, V3_REGION_WORDS * 2);
+        s_v3_at = esp_timer_get_time();
+        s_v3_want = false;
+        xTaskNotifyGive(s_v3_task);
+    }
 
     const uint8_t *lut = s_lut;
     int8_t *hist = s_hist;
@@ -989,6 +1020,58 @@ static void control_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
         if (s_running) control();
+    }
+}
+
+static uint8_t to_q4(int v, int dc_quarters)
+{
+    int c = (v * 4 - dc_quarters) >> 6;
+    return (uint8_t)(c < -8 ? -8 : c > 7 ? 7 : c) & 15;
+}
+
+static dg3_observation_t v3_observe(void)
+{
+    uint8_t q4[V3_REGIONS * V3_REGION_WORDS];
+    int dc_i = s_lut_dc_i < 1000 ? s_lut_dc_i : 0, dc_q = s_lut_dc_q < 1000 ? s_lut_dc_q : 0;
+    for (int k = 0; k < (int)sizeof q4; ++k) {
+        uint16_t w = s_v3_words[k];
+        q4[k] = to_q4((int8_t)w, dc_i) << 4 | to_q4((int8_t)(w >> 8), dc_q);
+    }
+    dg3_observation_t o = direct_gain_v3_measure(q4, sizeof q4, c5vrx_phase8_gain_lut, s_v3_at);
+    unsigned coherent = 0, pairs = 0;
+    for (int r = 0; r < V3_REGIONS; ++r) {
+        for (int k = r * V3_REGION_WORDS + 1; k < (r + 1) * V3_REGION_WORDS; ++k) {
+            int i = (int8_t)(q4[k] & 0xf0) >> 4, q = (int8_t)(q4[k] << 4) >> 4;
+            ++pairs;
+            if ((2 * i + 1) * (2 * i + 1) + (2 * q + 1) * (2 * q + 1) + 2 < 32) continue;
+            int d = (int8_t)(c5vrx_phase8_gain_lut[q4[k]] - c5vrx_phase8_gain_lut[q4[k - 1]]);
+            coherent += abs(d) <= V3_COHERENT;
+        }
+    }
+    o.coherence = (uint8_t)(coherent * 100 / pairs);
+    return o;
+}
+
+static void v3_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(1);
+        if (!s_running || s_gain_mode != GAIN_V3) {
+            s_v3_reset = true;
+            continue;
+        }
+        if (s_v3_reset) {
+            direct_gain_v3_reset(&s_v3, &s_table, s_gain, arc_gain_highest_rf_stage_start(&s_table));
+            s_v3_reset = false;
+        }
+        s_v3_want = true;
+        if (!ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20))) continue;
+        s_v3_obs = v3_observe();
+        uint8_t target = direct_gain_v3_tick(&s_v3, &s_v3_obs);
+        if (target == s_gain) continue;
+        set_gain(target);
+        direct_gain_v3_sync_applied(&s_v3, s_gain, esp_timer_get_time());
+        vTaskDelay(pdMS_TO_TICKS(V3_WRITE_GUARD_MS));
     }
 }
 
@@ -1118,6 +1201,8 @@ static bool start(const char *channel)
         }
         /* Above sync, so the gain comes down even when a clipped signal floods the sync detector. */
         xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 6, NULL, 0);
+        arc_gain_table_from_bytes(&s_table, V3_SPANS, V3_TABLE_MAX);
+        xTaskCreatePinnedToCore(v3_task, "decode_gain", 3072, NULL, 6, &s_v3_task, 0);
         set_thresholds();
         set_maps();
         s_frame = video_field_buffer();
@@ -1150,8 +1235,23 @@ static void status(void)
     say("%lu vertical corrections, %lu broad pulses ignored outside the vsync window\n", (unsigned long)s_vjumps,
         (unsigned long)s_vsync_ignored);
 
-    say("gain %d (%s), I/Q RMS %d, %d.%d%% clipped\n", s_gain, s_agc ? "auto" : "fixed", s_rms,
-        s_clip_permille / 10, s_clip_permille % 10);
+    static const char *const modes[] = {"fixed", "auto", "v3"};
+    arc_gain_tuple_t t = {0};
+    arc_gain_tuple_decode(&s_table, s_gain, &t);
+    say("gain %d (%s) RF %u BB %u fine %u, I/Q RMS %d, %d.%d%% clipped\n", s_gain, modes[s_gain_mode], t.rf_stage,
+        t.bb_code, t.fine_code, s_rms, s_clip_permille / 10, s_clip_permille % 10);
+    char reply[96];
+    say("C5: %s\n", c5_request("status", reply, sizeof reply, 500) ? reply + 3 : reply);
+    if (s_gain_mode == GAIN_V3) {
+        static const char *const states[] = {"acquire", "hold", "settle", "verify"};
+        const dg3_observation_t *o = &s_v3_obs;
+        say("v3 %s, P50 %u P90 %u P95 %u, clip %u origin %u permille, coherence %u%%\n", states[s_v3.state], o->p50,
+            o->p90, o->p95, o->clip_pm, o->origin_pm, o->coherence);
+        say("v3 %lu writes, %lu holds, %lu verified, %lu learned, %lu overloads, settle %u/%u/%u us fine/BB/RF\n",
+            (unsigned long)s_v3.writes, (unsigned long)s_v3.holds, (unsigned long)s_v3.verified,
+            (unsigned long)s_v3.learned, (unsigned long)s_v3.overloads, s_v3.settle_us[DG3_FINE],
+            s_v3.settle_us[DG3_BB], s_v3.settle_us[DG3_RF]);
+    }
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT / 16, s_blank * KHZ_PER_UNIT / 16,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
     say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
@@ -1265,8 +1365,12 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "off") == 0) {
         decode_stop();
     } else if (strcmp(sub, "gain") == 0 && argc > 2) {
-        s_agc = strcmp(argv[2], "auto") == 0;
-        if (!s_agc) set_gain(atoi(argv[2]));
+        if (strcmp(argv[2], "auto") == 0) s_gain_mode = GAIN_AUTO;
+        else if (strcmp(argv[2], "v3") == 0) s_gain_mode = GAIN_V3;
+        else {
+            s_gain_mode = GAIN_FIXED;
+            set_gain(atoi(argv[2]));
+        }
     } else if (strcmp(sub, "sat") == 0 && argc > 2) {
         s_saturation = atoi(argv[2]);
     } else if (strcmp(sub, "rx") == 0) {
@@ -1281,6 +1385,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | rx | tap | bench]\n");
+        say("decode [on [channel] | off | gain auto|v3|N | sat PERCENT | rx | tap | bench]\n");
     }
 }
