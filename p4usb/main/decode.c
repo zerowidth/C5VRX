@@ -200,6 +200,13 @@ static int s_tip = -57 * 16, s_blank = -17 * 16;
 static int32_t s_tip_sum, s_porch_sum, s_level_lines;
 static uint64_t s_noise_sq;
 static uint32_t s_noise_lines;
+static uint64_t s_field_noise_sq;
+/* In sixteenths of a picture level, and what the noise reduction takes for its threshold. */
+static int s_noise_levels = 8 * 16;
+#define TNR_MIN 4
+#define TNR_MAX 32
+static bool s_tnr_auto = true;
+static int s_tnr = 8, s_tnr_mix = 8;
 /* What luma_row needs to turn samples into pixel levels: for whole and half-sample line starts, the
  * vectors it takes (see luma.S), and its shift. Two copies, so a line never draws with half of a new one. */
 typedef struct {
@@ -389,6 +396,14 @@ static void update_levels(void)
         blank = s_porch_sum * 16 / (s_level_lines * (PORCH_END - PORCH_START));
     }
     bool locked = s_level_lines >= LEVEL_LINES_MIN;
+    if (locked) {
+        /* A weak signal's noise would read as motion at a fixed threshold, so it follows a sample's noise. */
+        int span = s_blank - s_tip < 8 * 16 ? 8 * 16 : s_blank - s_tip;
+        float var = (float)s_field_noise_sq / ((float)s_level_lines * (TIP_END - TIP_START) * (TIP_END - TIP_START - 1));
+        s_noise_levels += ((int)(sqrtf(var) * 1632 * 16 / span) - s_noise_levels) / 4;
+        if (s_tnr_auto) s_tnr = s_noise_levels < TNR_MIN * 16 ? TNR_MIN : s_noise_levels > TNR_MAX * 16 ? TNR_MAX : s_noise_levels / 16;
+    }
+    s_field_noise_sq = 0;
     s_tip_sum = s_porch_sum = s_level_lines = 0;
     s_tip = (3 * s_tip + tip) / 4;
     s_blank = (3 * s_blank + blank) / 4;
@@ -894,7 +909,6 @@ void deint_row(uint8_t *out, const uint8_t *above, const uint8_t *below, const u
  * that is under s_tnr levels and by less up to twice that, past which it reads as motion. A negative
  * s_tnr filters the left half only, to compare. */
 void tnr_row(uint8_t *row, const uint8_t *before, int n, const uint8_t *k);
-static int s_tnr = 8, s_tnr_mix = 8;
 static const uint8_t *s_above;
 static int s_above_row = -1;
 
@@ -999,6 +1013,7 @@ static void render_line(void)
             }
             /* The sync tip is flat, so its scatter about each line's own mean is the demodulator's noise. */
             s_noise_sq += t2 * (TIP_END - TIP_START) - t * t;
+            s_field_noise_sq += t2 * (TIP_END - TIP_START) - t * t;
             ++s_noise_lines;
             for (int i = PORCH_START; i < PORCH_END; ++i) b += s_hist[(s_line + i) % HIST];
             s_tip_sum += t;
@@ -1493,7 +1508,9 @@ static void status(void)
         (unsigned long)s_bs_short, (unsigned long)s_bs_mixed);
     if (s_noise_lines) {
         float var = (float)s_noise_sq / ((float)s_noise_lines * (TIP_END - TIP_START) * (TIP_END - TIP_START - 1));
-        say("sync tip noise %d kHz rms over %lu lines\n", (int)lrintf(sqrtf(var) * FS_HZ / 256000), (unsigned long)s_noise_lines);
+        say("sync tip noise %d kHz rms over %lu lines, %d.%d picture levels last field; noise reduction under %d levels%s\n",
+            (int)lrintf(sqrtf(var) * FS_HZ / 256000), (unsigned long)s_noise_lines, s_noise_levels / 16, s_noise_levels % 16 * 10 / 16,
+            abs(s_tnr), s_tnr_auto ? " (auto)" : "");
         s_noise_sq = s_noise_lines = 0;
     }
     say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
@@ -1597,7 +1614,8 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "sat") == 0 && argc > 2) {
         s_saturation = atoi(argv[2]);
     } else if (strcmp(sub, "tnr") == 0 && argc > 2) {
-        s_tnr = atoi(argv[2]);
+        s_tnr_auto = strcmp(argv[2], "auto") == 0;
+        if (!s_tnr_auto) s_tnr = atoi(argv[2]);
         if (argc > 3) s_tnr_mix = atoi(argv[3]);
     } else if (strcmp(sub, "soft") == 0 && argc > 2) {
         s_soft = strcmp(argv[2], "off") != 0;
@@ -1606,6 +1624,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | soft on|off | tnr LEVELS [SIXTEENTHS] | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | soft on|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
     }
 }
