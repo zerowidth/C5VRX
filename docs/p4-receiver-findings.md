@@ -13,7 +13,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 ## C5 starts that read the lanes mid-change
 
-About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The P4 detects this and resets the C5 until it comes up clean, but what sets it is not known and nothing moves the sampling point.
+About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The C5's clock can be moved against its bus by running it a tick slow for a moment, and at each start the P4 now moves it until the lanes read steady. That search has been run on noise only; it has not yet been checked with a transmitter on.
 
 How it happens:
 
@@ -34,23 +34,31 @@ What is established:
 - Retuning 12 times, restarting the C5's clock 10 times, and running the clock at other divisors in between 10 more times all left it as it was.
 - Neither P4 edge avoids it. At one sample in six the edges are 37.5 ns apart, a whole 3 bus periods, so they read the bus at the same point.
 
+Moving the clock:
+
+- `clk slip US` on the C5 raises the PARLIO clock's divisor from 18 to 19 for about that many microseconds and puts it back. Each clock period that passes meanwhile moves the edge one 240 MHz tick (4.17 ns) later, and the bus repeats every 3 ticks. The register writes alone take a few periods, so the move is some ticks, not a chosen number.
+- It works: one slip after another, the two edges' glitch counts on noise went from 13 and 15 per thousand to 0 and 243, then 6 and 6, and so on.
+- So restarting the clock, which earlier never moved it, must restart the divider the same way each time.
+- The two P4 edges do not always read alike after a slip (6 and 6 on one, 0 and 218 on the other), so they are not exactly 3 bus periods apart as the divisor says.
+- More than three different readings turn up, on noise, so either the position has more than three steps or noise is a poor guide. It has not been mapped with a carrier.
+
 What is not known:
 
-- What sets it. The guess is how the modem's 80 MHz clock and the 240 MHz clock line up at boot: three positions 4.17 ns apart, one of them bad, which fits the rate.
-- That guess has a hole: restarting the PARLIO clock should restart its divider on any 240 MHz tick and move the phase, and 20 restarts never did. Either the restart doesn't reset the divider or the cause is something else, such as the bus changing at a different moment on those starts.
-- How much margin a clean start has. If it is small, temperature or drift could carry a session over the edge, and nothing would notice.
+- What sets the position at reset. The guess is how the modem's 80 MHz clock and the 240 MHz clock line up: three positions 4.17 ns apart, one of them bad, which fits the rate.
+- How much margin a clean position has. If it is small, temperature or drift could carry a session over the edge, and nothing would notice.
 - Whether the standalone C5 receiver, which samples the same bus on a looped PARLIO clock, has the same lottery.
 
-The workaround, in `iq_start`:
+What `iq_start` does:
 
-- It sets a gain that doesn't clip, since a clipped signal hides the glitches, then counts the samples that stand further outside their two neighbours than the lane's RMS: 1 to 4 per thousand clean, 15 to 26 mid-change. Above 8 on the better edge it resets the C5 and tries again, up to five times. In 12 starts, 3 needed one more reset and all 12 ended clean.
-- Noise glitches as often as either, so a start with no carrier (under 60% of samples near the mean power) goes unchecked. The decoder starts once more when a transmitter first locks most of a field. That path is untested.
-- A retry adds about 2 s to the start.
+- It sets a gain that doesn't clip, since a clipped signal hides the glitches, then counts on each P4 edge the samples that stand further outside their two neighbours than the lane's RMS. A clean carrier gives 1 to 4 per thousand and a lane read mid-change 15 to 26. Noise alone gives 6 to 9 read clean, as independent samples do, and 11 to 200, or none when the garbage is most of the lane's power, otherwise.
+- While either edge reads above 9 (or, on noise, below 4) it slips the clock and counts again, up to 16 times, settling for one clean edge after 8. Asking for both edges puts the one in use further from the change.
+- On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is a poorer guide. So a start with no carrier (under 60% of samples near the mean power) is marked, and the decoder starts once more when a transmitter first locks most of a field.
+- Before slipping was found, the P4 reset the C5 instead until it came up clean: with a carrier, 3 starts in 12 needed one more reset and all 12 ended clean.
 
-Ways to fix it properly:
+Still to do:
 
-1. Find something on the C5 that shifts its clock by one 4.17 ns step.
-2. Keep one sample in 5 or 7. The clock's halves are then unequal, the P4's two edges read the bus 4.17 ns apart, and one of them is clean. That changes the sample rate, which the decoder's line and subcarrier timing take to be 13.33 MS/s.
+1. Run the search with a transmitter on, and check the picture's noise after it.
+2. Map the readings against the number of slips with a carrier, for how many positions there are and how wide the clean one is.
 3. Look at the clock against a Q lane on an oscilloscope, on good and bad starts, for the margin. The Saleae's 50 MS/s is too slow.
 
 ## The C5's gain table
@@ -225,6 +233,7 @@ Simple smoothing in PIE fits the headroom there is without the offload (about 22
 - With no signal, every field of noise overflowed the 128 KB slot at quality 70, so no frame reached the camera and it froze. At quality 20 noise fits in about 113 KB, so quality now drops 10 per overflow and climbs back after 30 frames under 60% of the slot. A third was too low: normal video at quality 40 is about 45 KB, so quality stuck there after a loss and the picture stayed blocky.
 - On noise the burst's random vector adds up past the color threshold and the histogram's levels drift far from any real signal's, which drew saturated rainbow speckle. Color now needs locked lines, and the picture keeps the last locked levels, so a lost signal shows as gray snow. Noise locks no lines at all, while a transmitter being moved around often dips to 130-190 of 262 with a strong burst, so a 200-line gate dropped color needlessly. Color now comes on at 150 locked lines and stays on down to 60.
 - With no signal the gain control climbed to its maximum (then 80, since capped at 77), and a returning signal then clips completely and doesn't lock until the gain is back near 50. Stepping down 8 at a time while more than 10% of samples clip cut that from about 8 s to 2 s.
+- An esptool that gives up on the bridge leaves a queue of SYNCs in the console's input. Each one started a bridge session, waited 2 s for the C5 and started the decoder again, which kept the console from answering for minutes. The bridge now drops waiting input when a session ends. Esptool gives up when it starts while the main task is still in the decoder's start, which takes several seconds at boot.
 - On macOS, open the P4 console (303a:8000) with RTS off and DTR on: RTS high with DTR low looks like esptool's reset, and the P4 only writes to a port with DTR set.
 - TinyUSB's video class reopens its bulk endpoint on every SET_INTERFACE, including each time a host opens or closes the stream, and its DWC2 port has no endpoint close. Each reopen took another 128-word TX FIFO from the P4's 1024-word FIFO RAM (the video FIFO moved from 0x2EE to 0x26E by enumeration, then 0x1EE and 0x16E) until the allocation check refused more. Twice, after a host had opened and closed the stream, the USB console still received commands but its replies stuck in a full send buffer; the link to the leak is likely but unproven. Wrapping `dcd_edpt_open` to reactivate an already active IN endpoint in place, as TinyUSB does for isochronous ones, kept the FIFO fixed through 20 stream starts with the console polled twice a second, and no replies went missing.
 - Live video reached the host at about 38 fps while the encoder ran at 59.9: the P4 skipped 5726 of 10500 frames. TinyUSB's video class sends each UVC payload as its own transfer, sized up to `CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE`, which was 512 bytes, so a 64 KB frame took about 128 round trips through the USB task and didn't fit in 16.7 ms. With 16 KB payloads (about 4 per frame) the P4 sent 4234 frames in 70 s with none skipped, and AVFoundation received 4231. The endpoint's wMaxPacketSize has to stay 512: the class's descriptor macro took the buffer size at first, and macOS then refused the whole configuration. The class sends no zero-length packet, so a frame whose last payload fills whole packets gets one padding byte after EOI.
