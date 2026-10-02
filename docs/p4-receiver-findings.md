@@ -13,7 +13,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 ## C5 starts that read the lanes mid-change
 
-About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The C5's clock can be moved against its bus by running it a tick slow for a moment, and at each start the P4 now moves it until the lanes read steady: with a transmitter on, 14 starts in 14 ended clean.
+About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The C5's clock can be moved against its bus by running it a tick slow for a moment, and at each start the P4 now moves it until the lanes read steady: with a transmitter on, 38 starts in 38 ended clean. The clock has three positions against the bus, one of them bad, and one slip always leaves the bad one.
 
 How it happens:
 
@@ -39,31 +39,39 @@ Moving the clock:
 - `clk slip US` on the C5 raises the PARLIO clock's divisor from 18 to 19 for about that many microseconds and puts it back. Each clock period that passes meanwhile moves the edge one 240 MHz tick (4.17 ns) later, and the bus repeats every 3 ticks. The register writes alone take a few periods, so the move is some ticks, not a chosen number.
 - It works: one slip after another, the two edges' glitch counts on noise went from 13 and 15 per thousand to 0 and 243, then 6 and 6, and so on.
 - So restarting the clock, which earlier never moved it, must restart the divider the same way each time.
-- The two P4 edges do not always read alike after a slip (6 and 6 on one, 0 and 218 on the other), so they are not exactly 3 bus periods apart as the divisor says.
-- More than three different readings turn up, on noise, so either the position has more than three steps or noise is a poor guide. It has not been mapped with a carrier.
+- On noise the two P4 edges did not always read alike after a slip (6 and 6 on one, 0 and 218 on the other), and more than three different readings turned up. Noise is a poor guide: the map below, with a carrier, shows neither.
+
+The off-ring count after each of 40 slips of 1 us, with a carrier, both edges read twice:
+
+- There are two states and nothing between. In 24 positions both edges read 0 to 18 per thousand, and in 16 the rising edge read 33 to 51 and the falling 24 to 42.
+- The edges go bad together, as edges 3 bus periods apart should. Their sum separates the states better than either: 25 at most clean, 62 at least bad.
+- A bad position never followed a bad one in 39 slips, and clean followed clean 9 times. That fits three positions a tick apart, one bad, with a slip of 1 us moving one or two ticks and never three. 16 bad in 40 fits one in three.
+- So the bad window is narrower than 4.17 ns, and each clean position is one tick from it. Where the window sits inside its tick, and so the smaller margin, is not known.
+- Twice in 130 reads one edge read bad and the other clean (35 and 9, 38 and 7). The edges are captured one after the other and the received strength was moving by 10 dB, so a fade is the likely cause.
 
 What is not known:
 
-- What sets the position at reset. The guess is how the modem's 80 MHz clock and the 240 MHz clock line up: three positions 4.17 ns apart, one of them bad, which fits the rate.
-- How much margin a clean position has. If it is small, temperature or drift could carry a session over the edge, and nothing would notice.
+- What sets the position at reset. The guess is how the modem's 80 MHz clock and the 240 MHz clock line up.
+- How much margin the nearer clean position has: somewhere between 0 and 4.17 ns. If it is small, temperature or drift could carry a session over the edge, and nothing would notice.
+- Whether the two clean positions differ. The counts do not tell them apart.
 - Whether the standalone C5 receiver, which samples the same bus on a looped PARLIO clock, has the same lottery.
 
 What `iq_start` does:
 
 - It sets a gain that leaves the RMS between 30 and 80 with under 2% clipped, since a clipped signal hides what the test looks for.
-- With a carrier it counts, on each P4 edge, the samples well off the carrier's ring (under 0.35 or over 2.1 times the mean power). Clean reads give 0 to 5 per thousand and the worst 50 to 60, with steps between (9, 15, 20, 30), as if each lane crosses the change at its own point. Over 10 counts as mid-change.
+- With a carrier it counts, on each P4 edge, the samples well off the carrier's ring (under 0.35 or over 2.1 times the mean power). The two edges read the bus at the same point, so it judges their sum: over 40 per thousand counts as mid-change, between the 25 and 62 of the map above.
 - With no carrier (under 60% of samples near the mean power) there is no ring, so it counts the samples that stand further outside their two neighbours than the lane's RMS. Noise gives 6 to 9 per thousand read clean, as independent samples do, and 11 to 200, or hardly any when the garbage is most of the lane's power, otherwise.
 - That second count is a poor test with a carrier: clean reads gave 1 to 8 and bad ones 6 to 26, and a start it passed at 6 and 9 decoded with 1025 kHz of noise. That is why a carrier is judged by its ring.
-- While either edge reads mid-change it slips the clock and counts again, up to 16 times, settling for one clean edge after 8. Asking for both edges puts the one in use further from the change.
-- With a carrier, 14 starts took 1 to 4 probes each and all decoded with 151 to 249 kHz of sync tip noise. Six of the 14 came up mid-change on both edges.
+- While it reads mid-change it slips the clock and counts again, up to 16 times. On noise, where the edges are judged apart, it settles for one clean edge after 8.
+- With a carrier and each edge judged alone at 10 per thousand, 14 starts took 1 to 4 probes each and all decoded with 151 to 249 kHz of sync tip noise. Six of the 14 came up mid-change.
+- Judged on the sum, 24 starts all ended clean: 18 on the first probe, 5 after one slip and 1 after two, the second probe of that one being a 38 and 7 read. Sync tip noise after the last was 182 kHz.
 - On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is the poorer guide. So a start with no carrier is marked, and the decoder starts once more when a transmitter first locks most of a field. That restart has not been watched happening.
 - Before slipping was found, the P4 reset the C5 instead until it came up clean: with a carrier, 3 starts in 12 needed one more reset and all 12 ended clean.
 
 Still to do:
 
-1. Map the off-ring count against the number of slips, for how many positions there are and how wide the clean one is.
-2. Find how much margin the chosen position has, and whether it holds as the boards warm up.
-3. Look at the clock against a Q lane on an oscilloscope, on good and bad starts, for the margin. The Saleae's 50 MS/s is too slow.
+1. Find how much margin the chosen position has, and whether it holds as the boards warm up.
+2. Look at the clock against a Q lane on an oscilloscope, on good and bad starts, for the margin. The Saleae's 50 MS/s is too slow.
 
 ## The C5's gain table
 
