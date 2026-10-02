@@ -149,8 +149,8 @@ BITSCRAMBLER_PROGRAM(bs_phase, "bs_phase");
 #define BS_DC_STEP 1.0f
 #define BS_DC_MAX_STEP 6.0f
 /* Field lines between which a rewrite's gap falls after the broad pulses and before the picture. */
-#define BS_RELOAD_FROM 8
-#define BS_RELOAD_TO 14
+#define BS_RELOAD_BEFORE 2
+#define BS_RELOAD_AFTER 3
 static bool s_bs_want, s_bs;
 static bool s_bs_scalar;
 static bitscrambler_handle_t s_bs_handle;
@@ -346,16 +346,16 @@ static void control_bs(void)
         s_bs_since_gain = 0;
         s_bs_err_i = s_bs_err_q = 0;
         if (!s_dc_at_gain || s_dc_at_gain[s_gain][0] == DC_UNKNOWN) return;
-        if (s_dc_at_gain[s_gain][0] == s_lut_dc_i && s_dc_at_gain[s_gain][1] == s_lut_dc_q) return;
+        /* A reload costs lines, so a table within a step of this gain's offset stays. */
+        if (abs(s_dc_at_gain[s_gain][0] - s_lut_dc_i) < 4 * BS_DC_STEP && abs(s_dc_at_gain[s_gain][1] - s_lut_dc_q) < 4 * BS_DC_STEP) return;
         s_bs_dc_i = s_dc_at_gain[s_gain][0] / 4.0f;
         s_bs_dc_q = s_dc_at_gain[s_gain][1] / 4.0f;
     } else {
         if (s_bs_since_gain++ == 0 || s_rms < 4) return;
         /* How far the table's offset sits above the signal's centre, from the excess of negative signs.
-         * One half second's reading wanders a unit or two on a weak signal, so it is smoothed over about
-         * eight, except just after a gain step, when the offset may be units out. */
+         * One half second's reading wanders up to 3 units through fades, so it is smoothed over about eight. */
         float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
-        int over = s_bs_since_gain <= 3 ? 1 : 8;
+        const int over = 8;
         s_bs_err_i += (di - s_bs_err_i) / over;
         s_bs_err_q += (dq - s_bs_err_q) / over;
         if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) {
@@ -1273,7 +1273,12 @@ static void bs_reload(void)
     skip_stale(stale);
     s_bs_reload_us = s_read_us - t0;
     /* The lines that went by meanwhile, counting half a node for what the DMA had not finished. */
-    s_vline += (s_bs_reload_us + NODE_BYTES * 250000ll / FS_HZ + 32) / 64;
+    for (int k = (s_bs_reload_us + NODE_BYTES * 250000ll / FS_HZ + 32) / 64; k > 0; --k) {
+        if (++s_vline >= FIELD_LINES + !s_parity) {
+            s_vline = 0;
+            s_parity ^= 1;
+        }
+    }
     s_missed = LOST_AFTER_LINES;
     ++s_bs_rewrites;
     s_bs_pending = false;
@@ -1354,6 +1359,8 @@ static void decode_task(void *arg)
                 ++s_overruns;
                 s_read = end;
             }
+            /* Before a reload, a second pass takes what arrived during the first, so less is thrown away. */
+            for (int pass = 0; pass < (s_bs && s_bs_pending ? 2 : 1); ++pass, end = dma_offset())
             while (s_read != end) {
                 uint32_t stop = end > s_read ? end : RING_BYTES;
                 uint8_t *p = (uint8_t *)s_ring + s_read;
@@ -1367,7 +1374,8 @@ static void decode_task(void *arg)
                 s_read = stop % RING_BYTES;
             }
             s_read_us = now;
-            bool blank = s_vline >= BS_RELOAD_FROM && s_vline <= BS_RELOAD_TO;
+            /* The stop and the relock cost about 12 lines, which fit between the last picture line and the first. */
+            bool blank = s_vline >= FIELD_LINES - BS_RELOAD_BEFORE || s_vline <= BS_RELOAD_AFTER;
             if (s_bs && s_bs_pending && (blank || s_missed >= LOST_AFTER_LINES)) bs_reload();
         }
         account(&s_demod_load, t0);
