@@ -6,12 +6,12 @@
 
 void iq_command(int argc, char **argv);
 /* Resets the C5 into c5rx, tunes it, starts its I/Q export with one of every `every` samples of its
- * 80 MS/s bus, finds a gain that doesn't clip, and picks the P4's sampling edge. Resets the C5 again, a
- * few times, if it comes up with a lane read while it changes. */
+ * 80 MS/s bus, finds a gain that doesn't clip, and moves the C5's clock until the P4's sampling edge reads the
+ * lanes while they are steady. */
 bool iq_start(const char *channel, int every);
 /* The gain iq_start left the C5 at. */
 int iq_gain(void);
-/* Whether iq_start had a carrier to check the lanes against; if not, start again once there is one. */
+/* Whether iq_start had a carrier to place the clock by; if not, start again once there is one. */
 bool iq_verified(void);
 /* The C5's name and frequency for the channel last tuned. */
 const char *iq_channel(unsigned *mhz);

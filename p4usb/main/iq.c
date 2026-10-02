@@ -394,7 +394,6 @@ static void bs_capture(const char *name, size_t samples, float dc_i, float dc_q)
 #define GAIN_SAMPLES (STALE + 65536)
 #define PROBE_GAIN_MIN 22
 #define PROBE_GAIN_MAX 70
-#define START_TRIES 5
 
 static int s_probe_gain = 52;
 
@@ -437,6 +436,7 @@ static quality_t quality(size_t samples)
             if (v < lo - margin || v > hi + margin) ++count;
         }
         q.glitch[lane] = (uint32_t)((uint64_t)count * 1000 / n);
+
     }
     while ((uint64_t)(q.rms + 1) * (q.rms + 1) <= power) ++q.rms;
     uint32_t near = 0;
@@ -474,18 +474,28 @@ static bool settle_gain(void)
     return true;
 }
 
-/* A clean carrier glitches 1 to 4 times in a thousand samples and a lane read mid-change 15 to 26. Noise
- * does as often as either, so nothing can be said without a carrier. */
-#define GLITCH_MAX 8
+/* A clean carrier glitches 1 to 4 times in a thousand samples, and a lane read mid-change 15 to 26. Noise
+ * alone glitches 7 or 8 times read clean, as independent samples do, and 11 to 200 or not at all otherwise,
+ * the last when the garbage is most of the lane's power. */
+#define GLITCH_MAX 9
+#define NOISE_GLITCH_MIN 4
 #define RING_MIN 600
+
+/* Whether the last probe had a carrier to judge by; noise is a poorer guide. */
 static bool s_verified;
 
-/* Picks the edge whose worse lane glitches less, and says whether even that one is being read mid-change. */
-static bool pick_edge(bool *bad)
+static bool mid_change(const quality_t *q)
+{
+    uint32_t worst = q->glitch[0] > q->glitch[1] ? q->glitch[0] : q->glitch[1];
+    uint32_t least = q->glitch[0] < q->glitch[1] ? q->glitch[0] : q->glitch[1];
+    return worst > GLITCH_MAX || (q->ring < RING_MIN && least < NOISE_GLITCH_MIN);
+}
+
+/* Captures on each edge and keeps the one read further from the change. Reports whether each edge is clean. */
+static bool pick_edge(bool clean[2])
 {
     const parlio_sample_edge_t edges[] = {PARLIO_SAMPLE_EDGE_POS, PARLIO_SAMPLE_EDGE_NEG};
     quality_t q[2];
-    uint32_t worst[2];
     for (int e = 0; e < 2; ++e) {
         esp_err_t err = capture(s_psram, PROBE_SAMPLES, edges[e]);
         if (err != ESP_OK) {
@@ -493,16 +503,18 @@ static bool pick_edge(bool *bad)
             return false;
         }
         q[e] = quality(PROBE_SAMPLES);
-        worst[e] = q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1];
+        clean[e] = !mid_change(&q[e]);
     }
-    int e = worst[1] < worst[0];
+    uint32_t score[2];
+    for (int e = 0; e < 2; ++e) score[e] = q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1];
+    int e = clean[0] != clean[1] ? clean[1] : score[1] < score[0];
     s_edge = edges[e];
     s_verified = q[e].ring >= RING_MIN;
-    *bad = s_verified && worst[e] > GLITCH_MAX;
-    say("glitches per mille, I and Q: rise %lu %lu, fall %lu %lu, at gain %d and RMS %lu: using %s%s\n",
+    say("glitches per mille, I and Q: rise %lu %lu, fall %lu %lu; gain %d, RMS %lu%s: using %s%s\n",
         (unsigned long)q[0].glitch[0], (unsigned long)q[0].glitch[1], (unsigned long)q[1].glitch[0],
-        (unsigned long)q[1].glitch[1], s_probe_gain, (unsigned long)q[e].rms, e ? "fall" : "rise",
-        *bad ? ", which reads a lane mid-change" : s_verified ? "" : ", unchecked for want of a carrier");
+        (unsigned long)q[1].glitch[1], s_probe_gain,
+        (unsigned long)q[e].rms, q[e].ring >= RING_MIN ? "" : ", no carrier", e ? "fall" : "rise",
+        clean[e] ? "" : ", which reads a lane mid-change");
     return true;
 }
 
@@ -562,16 +574,30 @@ static bool start_c5(const char *channel, int every)
     return true;
 }
 
+/* How the C5's clock edge falls against its bus is settled at its reset and wrong about three times in
+ * ten. Running the clock a tick slow for a moment moves the edge some ticks later, so this slips it until
+ * both of the P4's edges read clean, which puts the one in use well inside the steady part. */
+#define SLIP_TRIES 16
+
 bool iq_start(const char *channel, int every)
 {
     if (!prepare()) return false;
     decode_stop();
-    for (int try = 0; try < START_TRIES; ++try) {
-        bool bad = false;
-        if (!start_c5(channel, every) || !set_probe_gain(s_probe_gain) || !settle_gain() || !pick_edge(&bad)) return false;
-        if (!bad) return true;
-        say("iq: resetting the C5 for another try\n");
+    if (!start_c5(channel, every) || !set_probe_gain(s_probe_gain) || !settle_gain()) return false;
+    bool clean[2], one_clean = false;
+    for (int try = 0; try < SLIP_TRIES; ++try) {
+        if (!pick_edge(clean)) return false;
+        if (clean[0] && clean[1]) return true;
+        /* Settle for one clean edge in the second half of the tries. */
+        one_clean = clean[0] || clean[1];
+        if (one_clean && try >= SLIP_TRIES / 2) return true;
+        char reply[64];
+        if (!c5_request("clk slip 1", reply, sizeof reply, 500)) {
+            say("iq: the C5 can't slip its clock: %s\n", reply);
+            return true;
+        }
     }
+    if (!one_clean) say("iq: no clean clock position found\n");
     return true;
 }
 
@@ -584,6 +610,7 @@ bool iq_verified(void)
 {
     return s_verified;
 }
+
 
 const char *iq_channel(unsigned *mhz)
 {
@@ -610,8 +637,8 @@ void iq_command(int argc, char **argv)
     if (strcmp(sub, "start") == 0) {
         iq_start(argc > 2 ? argv[2] : "R3", argc > 3 ? atoi(argv[3]) : 2);
     } else if (strcmp(sub, "edge") == 0) {
-        bool bad;
-        pick_edge(&bad);
+        bool clean[2];
+        pick_edge(clean);
     } else if (strcmp(sub, "dump") == 0) {
         dump();
     } else if (strcmp(sub, "bs") == 0) {

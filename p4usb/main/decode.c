@@ -1288,8 +1288,8 @@ static void control_task(void *arg)
         static bool muted;
         if (muted) mute_early_logs(false);
         muted = s_muted;
-        /* A start with no transmitter on could not check how the C5 came up, so the first one to lock
-         * most of a field gets a second start. */
+        /* A start with no transmitter on places the C5's clock by noise, so the first one to lock most of
+         * a field gets a second start. */
         static int locked;
         locked = s_running && !iq_verified() && s_last_hits > COLOR_HITS_ON ? locked + 1 : 0;
         if (locked >= 2) {
