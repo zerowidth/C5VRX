@@ -969,6 +969,22 @@ static void submit(const job_t *j)
 
 static job_t s_held;
 
+/* An FM click is a step of most of a cycle between two samples, where the sharpest picture edge is under
+ * a third of one. It rings in the chroma band as a dash of saturated color. */
+#define CLICK_JUMP 110
+static bool s_click_drop = true;
+static uint32_t s_click_lines;
+void jumps(const int8_t *s, int n, int8_t *out);
+
+static bool has_click(const int8_t *picture, uint32_t l)
+{
+    int8_t j[32] __attribute__((aligned(16)));
+    jumps(picture - (l & 15), VIDEO_WIDTH / 16 + 1, j);
+    for (int k = 0; k < 16; ++k)
+        if (j[k] > CLICK_JUMP || j[16 + k] < -CLICK_JUMP) return true;
+    return false;
+}
+
 static void render_line(void)
 {
     int row = (s_vline - FIRST_ACTIVE) * 2 + s_parity;
@@ -983,6 +999,12 @@ static void render_line(void)
             const int8_t *src = line_samples(j.l, s_wrapped);
             if (s_hit) measure_burst(src, j.l);
             j.color = s_color;
+            if (s_color && s_click_drop && has_click(src + PICTURE_START, j.l + PICTURE_START)) {
+                /* A pair of lines shares its chroma, and the first line's flag decides for both. */
+                ++s_click_lines;
+                j.color = false;
+                if (second) s_held.color = false;
+            }
             if (s_color) {
                 uint32_t t0 = esp_cpu_get_cycle_count();
                 int32_t *z = s_pair_z[s_pairs % (JOBS / 2 + 2)];
@@ -1518,7 +1540,9 @@ static void status(void)
             abs(s_tnr), s_tnr_auto ? " (auto)" : "");
         s_noise_sq = s_noise_lines = 0;
     }
-    say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
+    say("color %s, burst %d (on above %d), saturation %d%%, %lu lines with clicks since last asked%s\n", s_color ? "on" : "off", s_burst,
+        COLOR_ON, s_saturation, (unsigned long)s_click_lines, s_click_drop ? ", drawn without color" : "");
+    s_click_lines = 0;
     say("draw: %lu stale, %lu queue full, max lag %lu samples\n", (unsigned long)s_draw_dropped, (unsigned long)s_draw_full, (unsigned long)s_draw_max_lag);
     say("longest field hand-off %lu us, longest wait with 8+ lines queued %lu us, longest run %lu us\n",
         (unsigned long)s_finish_max_us, (unsigned long)s_draw_max_gap_us, (unsigned long)s_draw_max_run_us);
@@ -1622,6 +1646,8 @@ void decode_command(int argc, char **argv)
         s_tnr_auto = strcmp(argv[2], "auto") == 0;
         if (!s_tnr_auto) s_tnr = atoi(argv[2]);
         if (argc > 3) s_tnr_mix = atoi(argv[3]);
+    } else if (strcmp(sub, "clicks") == 0 && argc > 2) {
+        s_click_drop = strcmp(argv[2], "off") != 0;
     } else if (strcmp(sub, "luma") == 0 && argc > 2) {
         s_luma_kind = strcmp(argv[2], "plain") == 0 ? LUMA_PLAIN : strcmp(argv[2], "peak") == 0 ? LUMA_PEAK : LUMA_SOFT;
     } else if (strcmp(sub, "bench") == 0) {
@@ -1629,6 +1655,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | clicks on|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
     }
 }
