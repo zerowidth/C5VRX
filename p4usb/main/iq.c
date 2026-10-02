@@ -8,6 +8,7 @@
 #include "driver/bitscrambler.h"
 #include "driver/parlio_rx.h"
 #include "esp_cache.h"
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_gpio.h"
@@ -65,6 +66,10 @@ BITSCRAMBLER_PROGRAM(bs_phase_check, "bs_phase_check");
 #define BS_MAG_MAX 160.0f
 static uint16_t s_bs_lut[1024];
 static bool s_load_lut;
+/* The lane tables for a second offset, written over the first while a capture runs, for `iq bs relut`. */
+static uint16_t s_bs_lut2[256];
+static bool s_relut;
+static uint32_t s_relut_cycles;
 
 static float bs_code_scale(void)
 {
@@ -87,6 +92,7 @@ static float bs_code_centre(int code)
 
 static void build_bs_lut(float dc_i, float dc_q)
 {
+    memset(s_bs_lut, 0, sizeof s_bs_lut);
     for (int k = 0; k < 1024; ++k) {
         int angle = (int)lrintf(atan2f(bs_code_centre(k & 31), bs_code_centre(k >> 5)) * (float)(64 / M_PI_2));
         s_bs_lut[k] = (angle > 63 ? 63 : angle) << 8;
@@ -169,6 +175,16 @@ static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edg
         const parlio_receive_config_t rcfg = {.delimiter = delim, .flags.partial_rx_en = 1};
         err = parlio_rx_unit_receive(rx, s_buf, samples * 2 + margin, &rcfg);
         if (err == ESP_OK) err = parlio_rx_soft_delimiter_start_stop(rx, delim, true);
+        if (err == ESP_OK && s_relut) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            /* The LUT ignores writes while the program runs. The host sees it as 32-bit words whatever
+             * width the program reads it at. */
+            uint32_t t0 = esp_cpu_get_cycle_count();
+            bitscrambler_reset(bs);
+            bitscrambler_load_lut(bs, s_bs_lut2, sizeof s_bs_lut2);
+            bitscrambler_start(bs);
+            s_relut_cycles = esp_cpu_get_cycle_count() - t0;
+        }
         if (err == ESP_OK && xSemaphoreTake(s_full, pdMS_TO_TICKS(1000)) != pdTRUE) err = ESP_ERR_TIMEOUT;
         if (bs) s_bs_state = bitscrambler_ll_get_current_state(BITSCRAMBLER_LL_GET_HW(0), BITSCRAMBLER_DIR_RX);
         parlio_rx_soft_delimiter_start_stop(rx, delim, false);
@@ -257,36 +273,60 @@ static void phase_check(size_t bytes, float dc_i, float dc_q)
         say("too short to check: need more than %u samples\n", (unsigned)(skip / 2));
         return;
     }
-    uint32_t best = UINT32_MAX, best_off = 0, words = (bytes - skip) / 4 - 1;
+    uint32_t best = UINT32_MAX, best_off = 0, best_old = 0, best_new = 0, best_switch = 0;
+    uint32_t words = (bytes - skip) / 4 - 1;
     for (uint32_t off = 0; off < 4; ++off) {
-        uint32_t wrong = 0;
+        uint32_t wrong = 0, old = 0, new = 0, first_new = 0;
         for (uint32_t n = 0; n < words; ++n) {
             uint32_t w;
             memcpy(&w, (const uint8_t *)s_buf + skip + off + 4 * n, 4);
-            uint8_t i = s_bs_lut[(w >> 8) & 0x7f], q = s_bs_lut[128 + ((w >> 15 & 1) | (w >> 26) << 1)];
-            uint8_t want = s_bs_lut[(i & 31) << 5 | (q & 31)] >> 8 | (i & 0x20) << 1 | (q & 0x20) << 2;
-            wrong += (uint8_t)w != want;
+            int li = (w >> 8) & 0x7f, lq = 128 + ((w >> 15 & 1) | (w >> 26) << 1);
+            uint8_t want[2];
+            for (int t = 0; t < 2; ++t) {
+                uint8_t i = t ? s_bs_lut2[li] : s_bs_lut[li], q = t ? s_bs_lut2[lq] : s_bs_lut[lq];
+                want[t] = s_bs_lut[(i & 31) << 5 | (q & 31)] >> 8 | (i & 0x20) << 1 | (q & 0x20) << 2;
+            }
+            if ((uint8_t)w == want[0]) {
+                old += want[0] != want[1];
+            } else if (s_relut && (uint8_t)w == want[1]) {
+                if (!new++) first_new = n;
+            } else {
+                ++wrong;
+            }
         }
         if (wrong < best) {
             best = wrong;
             best_off = off;
+            best_old = old;
+            best_new = new;
+            best_switch = first_new;
         }
     }
     say("%lu samples around offset %d, %d: %lu phase bytes differ from the CPU's lookup, at byte offset %lu\n",
         (unsigned long)words, (int)dc_i, (int)dc_q, (unsigned long)best, (unsigned long)best_off);
+    if (s_relut) {
+        say("rewritten in a %lu-cycle halt: %lu samples match only the first table, %lu only the second, from sample %lu\n",
+            (unsigned long)s_relut_cycles, (unsigned long)best_old, (unsigned long)best_new, (unsigned long)best_switch);
+    }
 }
 
 static void bs_capture(const char *name, size_t samples, float dc_i, float dc_q)
 {
     static const char *const STATES[] = {"idle", "run", "wait", "paused", "unknown"};
-    bool half = strcmp(name, "half") == 0, check = strcmp(name, "check") == 0;
+    bool half = strcmp(name, "half") == 0, relut = strcmp(name, "relut") == 0, check = relut || strcmp(name, "check") == 0;
     if (!half && !check && strcmp(name, "pass") != 0) {
-        say("iq bs pass|half|check [samples [dc_i dc_q]]\n");
+        say("iq bs pass|half|check|relut [samples [dc_i dc_q]]\n");
         return;
     }
     s_program = half ? bs_half : check ? bs_phase_check : bs_pass;
     s_load_lut = check;
+    if (relut) {
+        build_bs_lut(dc_i + 24, dc_q - 16);
+        memcpy(s_bs_lut2, s_bs_lut, sizeof s_bs_lut2);
+    }
     if (check) build_bs_lut(dc_i, dc_q);
+    if (!relut) memcpy(s_bs_lut2, s_bs_lut, sizeof s_bs_lut2);
+    s_relut = relut;
     esp_err_t err = capture(s_psram, samples, s_edge);
     s_program = NULL;
     s_load_lut = false;
@@ -294,7 +334,9 @@ static void bs_capture(const char *name, size_t samples, float dc_i, float dc_q)
         STATES[s_bs_state]);
     if (err != ESP_OK) return;
     if (check) phase_check(samples * 2, dc_i, dc_q);
-    else if (half) byte_stats(samples * 2);
+    s_relut = false;
+    if (check) return;
+    if (half) byte_stats(samples * 2);
     else stats();
 }
 
@@ -419,6 +461,6 @@ void iq_command(int argc, char **argv)
         if (err == ESP_OK) stats();
         else say("iq: capture failed, %s\n", esp_err_to_name(err));
     } else {
-        say("iq [samples | sram | bs pass|half|check [samples [dc_i dc_q]] | start [channel [every]] | edge | dump]\n");
+        say("iq [samples | sram | bs pass|half|check|relut [samples [dc_i dc_q]] | start [channel [every]] | edge | dump]\n");
     }
 }
