@@ -21,9 +21,9 @@
 #define JPEG_SLOT_BYTES (128 * 1024)
 /* Room in front of the encoder's output for a COM segment; a multiple of the cache line. */
 #define HEAD_ROOM 128
-/* Noise fields overflow a slot at the normal quality, so quality drops on overflow and climbs back
- * while frames stay under 60% of a slot, as normal video does and noise at the lowest quality doesn't. */
-#define JPEG_QUALITY 70
+/* Noise fields overflow a slot at the normal quality, so quality drops as frames near a slot's size and
+ * climbs back while they stay under half of one: a step from 80 to 90 makes them half as large again. */
+#define JPEG_QUALITY 90
 #define JPEG_QUALITY_MIN 20
 #define JPEG_QUALITY_STEP 10
 #define JPEG_RAISE_AFTER 30
@@ -59,6 +59,7 @@ static esp_err_t s_last_error;
 static uint32_t s_render_us;
 static uint32_t s_encode_us;
 static uint32_t s_fps_tenths;
+static int s_quality_max = JPEG_QUALITY;
 static int s_quality = JPEG_QUALITY;
 static int s_small_frames;
 
@@ -167,7 +168,9 @@ static void encode(const uint8_t *raw, size_t size, bool color, uint32_t seq, in
         s_small_frames = 0;
         return;
     }
-    if (len > (s->cap - HEAD_ROOM) * 3 / 5 || s_quality >= JPEG_QUALITY) {
+    size_t room = s->cap - HEAD_ROOM;
+    if (len > room * 7 / 8 && s_quality > JPEG_QUALITY_MIN) s_quality -= JPEG_QUALITY_STEP;
+    if (len > room / 2 || s_quality >= s_quality_max) {
         s_small_frames = 0;
     } else if (++s_small_frames >= JPEG_RAISE_AFTER) {
         s_quality += JPEG_QUALITY_STEP;
@@ -328,6 +331,11 @@ void video_command(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "grab") == 0) {
         grab();
+        return;
+    }
+    if (argc > 2 && strcmp(argv[1], "quality") == 0) {
+        int q = atoi(argv[2]);
+        s_quality = s_quality_max = q < JPEG_QUALITY_MIN ? JPEG_QUALITY_MIN : q > 100 ? 100 : q;
         return;
     }
     say("%lu frames at %lu.%lu fps, %lu errors", (unsigned long)s_frames, (unsigned long)(s_fps_tenths / 10),

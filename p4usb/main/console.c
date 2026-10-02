@@ -88,7 +88,7 @@ static const command_t s_commands[] = {
     {"iq", iq_command, "capture two fields of I/Q; start [channel] tunes the C5 and picks a clock edge; dump sends the capture"},
     {"decode", decode_command, "on [channel] tunes the C5 and decodes its video into the camera; off stops; alone shows lock and load; soft on|off sets the luma low-pass and tnr LEVELS the noise reduction over fields; bench times the demodulator"},
     {"channel", cmd_channel, "channel [BAND+N | MHZ] retunes (bands R A B E F L, 5180-5885 MHz); alone prints channel and MHz"},
-    {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64"},
+    {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64; quality N sets the JPEG quality's ceiling"},
     {"reboot", cmd_reboot, "restart the P4; reboot download enters its ROM loader"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},
 };
