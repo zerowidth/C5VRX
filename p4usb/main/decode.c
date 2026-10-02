@@ -970,9 +970,10 @@ static void submit(const job_t *j)
 static job_t s_held;
 
 /* An FM click is a step of most of a cycle between two samples, where the sharpest picture edge is under
- * a third of one. It rings in the chroma band as a dash of saturated color. */
+ * a third of one. It rings in the chroma band as a dash of saturated color, so its line takes the color
+ * of the lines above, or none. */
 #define CLICK_JUMP 110
-static bool s_click_drop = true;
+static enum { CLICKS_SHOWN, CLICKS_GRAY, CLICKS_HOLD } s_clicks = CLICKS_HOLD;
 static uint32_t s_click_lines;
 void jumps(const int8_t *s, int n, int8_t *out);
 
@@ -999,13 +1000,15 @@ static void render_line(void)
             const int8_t *src = line_samples(j.l, s_wrapped);
             if (s_hit) measure_burst(src, j.l);
             j.color = s_color;
-            if (s_color && s_click_drop && has_click(src + PICTURE_START, j.l + PICTURE_START)) {
-                /* A pair of lines shares its chroma, and the first line's flag decides for both. */
+            bool click = s_color && s_clicks != CLICKS_SHOWN && has_click(src + PICTURE_START, j.l + PICTURE_START);
+            if (click) {
+                /* A pair of lines shares its chroma, and the first line decides for both: with no blocks of
+                 * its own it draws with the last pair's. */
                 ++s_click_lines;
-                j.color = false;
-                if (second) s_held.color = false;
+                if (s_clicks == CLICKS_GRAY) j.color = false;
+                if (second) s_held.z = NULL, s_held.color = j.color;
             }
-            if (s_color) {
+            if (s_color && !click) {
                 uint32_t t0 = esp_cpu_get_cycle_count();
                 int32_t *z = s_pair_z[s_pairs % (JOBS / 2 + 2)];
                 if (!second) {
@@ -1541,7 +1544,8 @@ static void status(void)
         s_noise_sq = s_noise_lines = 0;
     }
     say("color %s, burst %d (on above %d), saturation %d%%, %lu lines with clicks since last asked%s\n", s_color ? "on" : "off", s_burst,
-        COLOR_ON, s_saturation, (unsigned long)s_click_lines, s_click_drop ? ", drawn without color" : "");
+        COLOR_ON, s_saturation, (unsigned long)s_click_lines,
+        s_clicks == CLICKS_HOLD ? ", drawn in the color above" : s_clicks == CLICKS_GRAY ? ", drawn without color" : "");
     s_click_lines = 0;
     say("draw: %lu stale, %lu queue full, max lag %lu samples\n", (unsigned long)s_draw_dropped, (unsigned long)s_draw_full, (unsigned long)s_draw_max_lag);
     say("longest field hand-off %lu us, longest wait with 8+ lines queued %lu us, longest run %lu us\n",
@@ -1647,7 +1651,7 @@ void decode_command(int argc, char **argv)
         if (!s_tnr_auto) s_tnr = atoi(argv[2]);
         if (argc > 3) s_tnr_mix = atoi(argv[3]);
     } else if (strcmp(sub, "clicks") == 0 && argc > 2) {
-        s_click_drop = strcmp(argv[2], "off") != 0;
+        s_clicks = strcmp(argv[2], "off") == 0 ? CLICKS_SHOWN : strcmp(argv[2], "gray") == 0 ? CLICKS_GRAY : CLICKS_HOLD;
     } else if (strcmp(sub, "luma") == 0 && argc > 2) {
         s_luma_kind = strcmp(argv[2], "plain") == 0 ? LUMA_PLAIN : strcmp(argv[2], "peak") == 0 ? LUMA_PEAK : LUMA_SOFT;
     } else if (strcmp(sub, "bench") == 0) {
@@ -1655,6 +1659,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | clicks on|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | clicks hold|gray|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
     }
 }
