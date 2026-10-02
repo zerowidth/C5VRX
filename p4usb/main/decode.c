@@ -13,6 +13,7 @@
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_private/gdma.h"
+#include "esp_rom_sys.h"
 #include "hal/bitscrambler_peri_select.h"
 #include "hal/cache_ll.h"
 #include "hal/dma_types.h"
@@ -145,7 +146,7 @@ BITSCRAMBLER_PROGRAM(bs_phase, "bs_phase");
 #define NODES (RING_BYTES / NODE_BYTES)
 /* How far the table's offset may sit from the signal's before the table is rewritten, which stops the
  * receive for a moment. The CPU's table follows to a quarter of a step, since rebuilding it costs nothing. */
-#define BS_DC_STEP 2.0f
+#define BS_DC_STEP 1.0f
 #define BS_DC_MAX_STEP 6.0f
 /* Field lines between which a rewrite's gap falls after the broad pulses and before the picture. */
 #define BS_RELOAD_FROM 8
@@ -319,11 +320,11 @@ static void control_bs(void)
     steer_gain();
 
     /* How far the table's offset sits above the signal's centre, from the excess of negative signs. One
-     * half second's reading wanders a unit or two on a weak signal, so it is smoothed over about four. */
+     * half second's reading wanders a unit or two on a weak signal, so it is smoothed over about eight. */
     if (s_bs_pending || s_rms < 4) return;
     float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
-    s_bs_err_i += (di - s_bs_err_i) / 4;
-    s_bs_err_q += (dq - s_bs_err_q) / 4;
+    s_bs_err_i += (di - s_bs_err_i) / 8;
+    s_bs_err_q += (dq - s_bs_err_q) / 8;
     if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) return;
     s_bs_dc_i -= fminf(fmaxf(s_bs_err_i, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
     s_bs_dc_q -= fminf(fmaxf(s_bs_err_q, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
@@ -1174,15 +1175,33 @@ static void process_node(uint32_t offset)
     process_bs((const uint8_t *)s_ring + offset, len);
 }
 
+static void no_putc(char c)
+{
+}
+
+/* The driver's node interrupt finds a zero length on the first node of each receive and says so with an
+ * early log, straight to the UART at 115200 baud from the interrupt. That holds core 0's interrupts off
+ * for 6.4 ms, so no tick wakes the decode task and it loses a ring and a half. The ROM's printing is
+ * turned off from before each start until the control task's next pass. */
+static volatile bool s_muted;
+
+static void mute_early_logs(bool mute)
+{
+    if (mute) esp_rom_install_channel_putc(1, no_putc);
+    else if (s_muted) esp_rom_install_uart_printf();
+    s_muted = mute;
+}
+
 /* Until a node of a new receive is done the DMA still names a node of the last one, and the ring still
- * holds its data. Waits that out, then starts reading and the gain control's statistics from there. */
+ * holds its data. Waits that out, then starts reading the new receive from its first node, and the gain
+ * control's statistics afresh. */
 static void skip_stale(uint32_t stale)
 {
     int64_t t0 = esp_timer_get_time();
     while (AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val == stale && esp_timer_get_time() - t0 < 1000) {
     }
     memset(s_desc, 0, sizeof s_desc);
-    s_read = dma_offset();
+    s_read = 0;
     s_read_us = esp_timer_get_time();
     s_dc_n = s_dc_sum_i = s_dc_sum_q = s_neg_i = s_neg_q = 0;
     s_dc_power = s_dc_clipped = 0;
@@ -1195,6 +1214,7 @@ static void bs_reload(void)
 {
     int64_t t0 = esp_timer_get_time();
     uint32_t stale = AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
+    mute_early_logs(true);
     esp_err_t err = parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, false);
     if (err == ESP_OK) err = parlio_rx_unit_disable(s_rx);
     if (err == ESP_OK) err = bitscrambler_reset(s_bs_handle);
@@ -1224,6 +1244,10 @@ static void control_task(void *arg)
 {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
+        /* Any start is at least a node behind by now, except one in the last moment, which waits a pass. */
+        static bool muted;
+        if (muted) mute_early_logs(false);
+        muted = s_muted;
         if (s_running) control();
     }
 }
@@ -1363,6 +1387,7 @@ static esp_err_t start_rx(void)
     if ((err = parlio_rx_unit_register_event_callbacks(s_rx, &cbs, NULL)) != ESP_OK) return err;
     s_bs = s_bs_want;
     if (s_bs && (err = start_bs()) != ESP_OK) return err;
+    mute_early_logs(true);
     if ((err = parlio_rx_unit_enable(s_rx, true)) != ESP_OK) return err;
     const parlio_receive_config_t rcfg = {.delimiter = s_delim, .flags.partial_rx_en = 1};
     if ((err = parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg)) != ESP_OK) return err;
