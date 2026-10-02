@@ -524,6 +524,7 @@ static esp_err_t new_copy_channel(gdma_channel_handle_t *tx, gdma_channel_handle
  * lines, which an even number of rows from an even row is, so a strip holds one row more than it sends. */
 #define STRIP_ROWS 16
 #define ROW_BYTES (VIDEO_WIDTH * 2)
+#define BLOCKS (ROW_BYTES / 16)
 #define STRIP_NODES ((STRIP_ROWS * ROW_BYTES + NODE_BYTES - 1) / NODE_BYTES)
 static uint8_t s_strips[2][(STRIP_ROWS + 1) * ROW_BYTES] __attribute__((aligned(64)));
 static int s_strip, s_strip_rows, s_strip_row0;
@@ -746,13 +747,14 @@ static volatile uint32_t s_job_head, s_job_tail;
 static TaskHandle_t s_draw_task;
 static uint32_t s_draw_dropped, s_draw_full, s_draw_max_lag, s_draw_max_gap_us, s_draw_max_run_us;
 
-/* Rows of the previous field come in by DMA, a strip's worth at a time: read through the data cache,
- * which both cores share, PSRAM evicts core 1's tables. The DMA wants PSRAM in whole cache lines, so
- * each row's copy covers its lines. */
+/* Rows of the previous field come in by DMA, a strip's worth at a time, each with the row after it from
+ * the frame being drawn over, which is this field two back: read through the data cache, which both cores
+ * share, PSRAM evicts core 1's tables. The DMA wants PSRAM in whole cache lines, so each row's copy covers its lines. */
 #define OLD_GROUP 8
 #define OLD_BYTES (ROW_BYTES + 32)
+#define OLD_GROUP_BYTES (2 * OLD_GROUP * OLD_BYTES)
 /* From the heap after the ring, which needs the largest free block. */
-static uint8_t (*s_old)[OLD_GROUP * OLD_BYTES];
+static uint8_t *s_old[2];
 static int s_old_key[2] = {-1, -1}, s_old_next;
 static bool s_old_ready[2];
 static volatile bool s_old_busy[2];
@@ -761,7 +763,7 @@ static uint32_t s_old_late, s_old_errors;
 static bool s_old_errors_field;
 
 static gdma_channel_handle_t s_old_tx, s_old_rx;
-static dma_descriptor_align8_t s_old_desc[2 * OLD_GROUP] __attribute__((aligned(64)));
+static dma_descriptor_align8_t s_old_desc[4 * OLD_GROUP] __attribute__((aligned(64)));
 
 static bool IRAM_ATTR old_done(gdma_channel_handle_t chan, gdma_event_data_t *e, void *arg)
 {
@@ -775,9 +777,11 @@ static esp_err_t old_dma_init(void)
     esp_err_t err = new_copy_channel(&s_old_tx, &s_old_rx, old_done);
     if (err != ESP_OK) return err;
     /* No cached copy may be written back over what the DMA or the uncached alias put there. */
-    s_old = heap_caps_aligned_calloc(64, 2, sizeof *s_old, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!s_old) return ESP_ERR_NO_MEM;
-    esp_cache_msync(s_old, 2 * sizeof *s_old, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    for (int k = 0; k < 2; ++k) {
+        if (!s_old[k]) s_old[k] = heap_caps_aligned_calloc(64, 1, OLD_GROUP_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (!s_old[k]) return ESP_ERR_NO_MEM;
+        esp_cache_msync(s_old[k], OLD_GROUP_BYTES, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    }
     esp_cache_msync(s_old_desc, sizeof s_old_desc, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
     return ESP_OK;
 }
@@ -800,17 +804,19 @@ static void fetch_group(int k, int key)
     /* One copy at a time on the channel; a failed start gives up for the field. */
     if (!s_prev || s_old_errors_field || !wait_old(k) || !wait_old(k ^ 1)) return;
     int first = (key >> 1) * OLD_GROUP * 2 + (key & 1);
-    volatile dma_descriptor_align8_t *tx = UNCACHED(s_old_desc), *rx = tx + OLD_GROUP;
-    for (int i = 0; i < OLD_GROUP; ++i) {
-        bool last = i + 1 == OLD_GROUP;
-        tx[i].buffer = (void *)((uint32_t)(s_prev + (first + 2 * i) * ROW_BYTES) & ~63u);
+    volatile dma_descriptor_align8_t *tx = UNCACHED(s_old_desc), *rx = tx + 2 * OLD_GROUP;
+    for (int i = 0; i < 2 * OLD_GROUP; ++i) {
+        bool last = i + 1 == 2 * OLD_GROUP;
+        int row = first + 2 * (i % OLD_GROUP) + i / OLD_GROUP;
+        if (row >= VIDEO_HEIGHT) row = VIDEO_HEIGHT - 1;
+        tx[i].buffer = (void *)((uint32_t)((i < OLD_GROUP ? s_prev : s_frame) + row * ROW_BYTES) & ~63u);
         tx[i].next = last ? NULL : &s_old_desc[i + 1];
         tx[i].dw0.size = OLD_BYTES;
         tx[i].dw0.length = OLD_BYTES;
         tx[i].dw0.suc_eof = last;
         tx[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
         rx[i].buffer = s_old[k] + i * OLD_BYTES;
-        rx[i].next = last ? NULL : &s_old_desc[OLD_GROUP + i + 1];
+        rx[i].next = last ? NULL : &s_old_desc[2 * OLD_GROUP + i + 1];
         rx[i].dw0.size = OLD_BYTES;
         rx[i].dw0.length = 0;
         rx[i].dw0.suc_eof = 0;
@@ -818,7 +824,7 @@ static void fetch_group(int k, int key)
     }
     s_old_busy[k] = true;
     s_old_fetching = k;
-    esp_err_t err = gdma_start(s_old_rx, (intptr_t)&s_old_desc[OLD_GROUP]);
+    esp_err_t err = gdma_start(s_old_rx, (intptr_t)&s_old_desc[2 * OLD_GROUP]);
     if (err == ESP_OK) err = gdma_start(s_old_tx, (intptr_t)&s_old_desc[0]);
     if (err == ESP_OK) {
         s_old_key[k] = key;
@@ -830,7 +836,8 @@ static void fetch_group(int k, int key)
     }
 }
 
-static const uint8_t *old_row(int row)
+/* The previous field's row, and through before the row after it as it was two fields back. */
+static const uint8_t *old_row(int row, const uint8_t **before)
 {
     int key = old_key(row);
     int k = s_old_key[0] == key ? 0 : s_old_key[1] == key ? 1 : -1;
@@ -845,7 +852,7 @@ static const uint8_t *old_row(int row)
             ++s_old_late;
             return NULL;
         }
-        esp_cache_msync(s_old[k], sizeof s_old[k], ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        esp_cache_msync(s_old[k], OLD_GROUP_BYTES, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         s_old_ready[k] = true;
         /* Fetch the next group while this one is drawn. */
         if (((key >> 1) + 1) * OLD_GROUP < VIDEO_HEIGHT / 2) {
@@ -853,7 +860,9 @@ static const uint8_t *old_row(int row)
             s_old_next = k;
         }
     }
-    return s_old[k] + (row >> 1) % OLD_GROUP * OLD_BYTES + (row * ROW_BYTES & 63);
+    const uint8_t *slot = s_old[k] + (row >> 1) % OLD_GROUP * OLD_BYTES;
+    *before = slot + OLD_GROUP * OLD_BYTES + ((row + 1) * ROW_BYTES & 63);
+    return slot + (row * ROW_BYTES & 63);
 }
 
 static void forget_old(void)
@@ -881,6 +890,11 @@ static const int8_t *picture_samples(uint32_t l)
 /* Each Y of a missing row is the median of the Ys above, below and in the previous field: where the
  * picture is still, that is the previous field's, and where it moves, one of its neighbours. */
 void deint_row(uint8_t *out, const uint8_t *above, const uint8_t *below, const uint8_t *old, int n);
+/* Each byte moves towards the same field's two back, by s_tnr_mix sixteenths of their difference while
+ * that is under s_tnr levels and by less up to twice that, past which it reads as motion. A negative
+ * s_tnr filters the left half only, to compare. */
+void tnr_row(uint8_t *row, const uint8_t *before, int n, const uint8_t *k);
+static int s_tnr = 8, s_tnr_mix = 8;
 static const uint8_t *s_above;
 static int s_above_row = -1;
 
@@ -905,8 +919,10 @@ static void draw_line(const job_t *j)
         luma_row(picture_samples(j->l), (uint8_t *)dst, uv, VIDEO_WIDTH / 16, m->k[j->half], m->shift);
         const uint8_t *below = (const uint8_t *)dst;
         if (row > 0) {
-            const uint8_t *old = old_row(row - 1);
-            deint_row(rows, s_above_row == row - 2 ? s_above : below, below, old ? old : below, ROW_BYTES / 16);
+            const uint8_t *before = NULL, *old = old_row(row - 1, &before);
+            const uint8_t k[2] = {2 * abs(s_tnr), s_tnr_mix};
+            if (old && s_tnr) tnr_row((uint8_t *)dst, before, s_tnr < 0 ? BLOCKS / 2 : BLOCKS, k);
+            deint_row(rows, s_above_row == row - 2 ? s_above : below, below, old ? old : below, BLOCKS);
         }
         if (row + 2 == VIDEO_HEIGHT) memcpy(dst + VIDEO_WIDTH / 2, dst, ROW_BYTES);
         s_above = below;
@@ -1580,6 +1596,9 @@ void decode_command(int argc, char **argv)
         if (!s_agc) set_gain(atoi(argv[2]));
     } else if (strcmp(sub, "sat") == 0 && argc > 2) {
         s_saturation = atoi(argv[2]);
+    } else if (strcmp(sub, "tnr") == 0 && argc > 2) {
+        s_tnr = atoi(argv[2]);
+        if (argc > 3) s_tnr_mix = atoi(argv[3]);
     } else if (strcmp(sub, "soft") == 0 && argc > 2) {
         s_soft = strcmp(argv[2], "off") != 0;
     } else if (strcmp(sub, "bench") == 0) {
@@ -1587,6 +1606,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | soft on|off | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | soft on|off | tnr LEVELS [SIXTEENTHS] | bench]\n");
     }
 }
