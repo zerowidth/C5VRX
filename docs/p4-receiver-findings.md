@@ -9,6 +9,10 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - I carries a DC offset that grows with gain: about 20 of ±127 at gain 64 and about 32 at 68. Q's is near 0. Upper I lanes that look stuck are sign bits riding on that offset. The phase table has to be built around the measured offset, or a small signal's phase is badly distorted.
 - The gain index is steep and nonlinear. On one bench setup, index 62 gave an I/Q RMS of 19, 72 gave 61 with 0.4% clipped, and 80 gave 114 with 69% clipped.
 - The carrier sits within about 0.3 MHz of the tuned center. R3 is reached from Wi-Fi channel 144 with `phy_set_freq`.
+- About three C5 starts in ten come up with the lanes read while they change, which adds about 18 dB of noise: sync tip noise is about 1000 kHz against 100 to 160 on the same signal, and 220 of 262 lines lock against 253. The samples are wrong where a lane crosses zero, since every bit turns over there: Q read -19, -113, 45 in one capture, and 3.7% of samples sat far off a carrier's ring whose radius otherwise varied 4%. Both lanes glitch, Q more.
+- That state is fixed at the C5's reset. Retuning 12 times, restarting its clock 10 times and running the clock at other divisors in between all left it as it was, and neither P4 edge avoids it: at one sample in six the edges are 37.5 ns apart, a whole 3 bus periods, so they read the bus at the same point. Why the C5 comes up that way is not known.
+- `iq_start` now sets a gain that doesn't clip, counts the samples that stand further outside their two neighbours than the lane's RMS (1 to 4 per thousand clean, 15 to 26 mid-change), and resets the C5 again when the better edge still exceeds 8. In 12 starts, 3 needed one more reset and all 12 ended clean. Noise glitches as often as either, so a start with no carrier (under 60% of samples near the mean power) goes unchecked, and the decoder starts once more when a transmitter first locks most of a field.
+- Every measurement in this document from before this was found may have been made in either state. The weak-signal figures of about 1000 kHz and 220 lines were the bad one.
 - Nothing upstream filters the video: a sync edge rises from tip to blanking within one 75 ns sample, so 3.58 MHz chroma would pass.
 
 ## The C5's gain table
@@ -63,7 +67,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - The driver counts one DMA node per interrupt and falls behind when two nodes finish before it runs. The decoder reads the write position from the AXI-GDMA instead: the channel's `in_dscr_bf0` points at the current descriptor, whose second word is its buffer address.
 - A soft-delimiter EOF that lands mid-node ends that node early and leaves the rest of it stale, which showed up as staircase shifts in the picture. The ring (24 nodes of 4032 bytes) and the EOF period (8 nodes) are whole numbers of nodes.
 - The driver's node interrupt finds a zero length on the first node of every receive and logs "finished buffer is NULL or length is 0" with an early log, which prints straight to the UART at 115200 baud from the interrupt. That takes 6.4 ms with core 0's interrupts off, so the tick stops, the decode task on core 1 is not woken, and it loses about a ring and a half of samples (100 lines). It happened at every decoder start and retune, with or without the BitScrambler. The decoder now turns the ROM's printing off from each start until the control task's next pass.
-- The best P4 sampling edge varies; a boot check that captures on each edge and keeps the one with smaller sample-to-sample jumps works.
+- The P4's two sampling edges read the C5's bus at the same point (see [The C5's I/Q](#the-c5s-iq)), so the choice between them matters little. `iq_start` keeps the one that glitches less.
 
 ## P4 CPU and memory
 
@@ -153,9 +157,12 @@ The bipartite and companded pairs both come within 3% of the table in use across
 - The Q lane's sign can stay the same at every word the lane check looks at, which made both bytes look marked and dropped about one node a second until an ambiguous read fell back to the last known order.
 - Internal RAM is short: the decoder's ring needs a 96,768-byte block, and 5 KB of new static tables left the largest at 94,208, so the decoder failed to start at boot. The BitScrambler's tables are in PSRAM.
 
+- `table_compare.py` demodulates one raw capture with a model of each table, against an exact demodulator. On a capture through a fade, with a quarter of it clipped: at an amplitude above 64 the CPU table's error was 59 kHz and the BitScrambler's 84; from 32 to 64, 97 and 92; from 16 to 32, 159 and 102. With its offset 1 unit out the BitScrambler's was 94, 127 and 162, and 3 units out 113, 203 and 225. So the table itself is about even, and an offset that lags is what costs.
+- The offset moves about half a unit a gain step, so a fade that steps the gain left the table several units out for seconds. The decoder now remembers the offset each gain settled at (from either mode) and rewrites the table straight to it when the gain steps, and smooths over one pass instead of eight for the next three. This has not been judged on a moving transmitter yet.
+
 Not done yet:
 
-- Picture noise against the CPU's table, on a capture or by eye.
+- Judging `decode bs on` against `off` by eye through fades, now that the C5's start no longer decides how noisy either is.
 - Using the freed half of core 1. Drawing is on core 0 at 78%, so a stage has to move across, as chroma was split.
 
 What the offload was estimated to buy, before it was measured:
