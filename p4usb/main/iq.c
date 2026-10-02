@@ -284,10 +284,11 @@ static void phase_check(size_t bytes, float dc_i, float dc_q)
         say("too short to check: need more than %u samples\n", (unsigned)(skip / 2));
         return;
     }
+    uint32_t best_first = 0, best_last = 0;
     uint32_t best = UINT32_MAX, best_off = 0, best_old = 0, best_new = 0, best_switch = 0;
     uint32_t words = (bytes - skip) / 4 - 1;
     for (uint32_t off = 0; off < 4; ++off) {
-        uint32_t wrong = 0, old = 0, new = 0, first_new = 0;
+        uint32_t wrong = 0, old = 0, new = 0, first_new = 0, first = 0, last = 0;
         for (uint32_t n = 0; n < words; ++n) {
             uint32_t w;
             memcpy(&w, (const uint8_t *)s_buf + skip + off + 4 * n, 4);
@@ -302,7 +303,8 @@ static void phase_check(size_t bytes, float dc_i, float dc_q)
             } else if (s_relut && (uint8_t)w == want[1]) {
                 if (!new++) first_new = n;
             } else {
-                ++wrong;
+                if (!wrong++) first = n;
+                last = n;
             }
         }
         if (wrong < best) {
@@ -311,10 +313,13 @@ static void phase_check(size_t bytes, float dc_i, float dc_q)
             best_old = old;
             best_new = new;
             best_switch = first_new;
+            best_first = first;
+            best_last = last;
         }
     }
     say("%lu samples around offset %d, %d: %lu phase bytes differ from the CPU's lookup, at byte offset %lu\n",
         (unsigned long)words, (int)dc_i, (int)dc_q, (unsigned long)best, (unsigned long)best_off);
+    if (best) say("the first at sample %lu and the last at %lu\n", (unsigned long)best_first, (unsigned long)best_last);
     if (s_relut) {
         say("rewritten in a %lu-cycle halt: %lu samples match only the first table, %lu only the second, from sample %lu\n",
             (unsigned long)s_relut_cycles, (unsigned long)best_old, (unsigned long)best_new, (unsigned long)best_switch);
