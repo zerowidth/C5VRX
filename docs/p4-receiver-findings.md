@@ -83,7 +83,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 ## The P4's BitScrambler
 
-The BitScrambler is not used, and the demodulator stays on the CPU. It cannot hold the phase table the decoder uses, and it cannot do the arithmetic that follows the lookup. None of this section has been run on the hardware: the limits are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
+The BitScrambler can do the phase lookup in the receive path, with a smaller table than the decoder's, and nothing more. That much is proven on the hardware with `iq bs` (see [On the hardware](#on-the-hardware)); the decoder does not use it yet, and the demodulator is still on the CPU. It cannot hold the 16 KB table the decoder uses, and it cannot do the arithmetic that follows the lookup. The limits below are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
 
 Its limits:
 
@@ -91,7 +91,8 @@ Its limits:
 - There is no data-dependent add. `ADD` takes an immediate only, and `ADDCTI`, which adds routed bits to a counter, exists on the C5 and S31 but not the P4. So the P4 cannot subtract one phase from the last, sum samples, or add a correction to a table value.
 - A `set` only routes bits. There is no XOR, negate or data-dependent shift.
 - A program is at most 8 instructions.
-- ESP-IDF connects the BitScrambler to PARLIO TX and to loopback only. Using it on PARLIO RX means attaching it by hand on the AXI-GDMA, which is untried.
+- ESP-IDF connects the BitScrambler to PARLIO TX and to loopback only. On PARLIO RX it is attached by hand: create it for the RX direction on `SOC_BITSCRAMBLER_ATTACH_PARL_IO`, then enable, load, reset and start it before enabling the PARLIO unit.
+- The LUT's address is output bits 16 and up of the cycle before (16..25 at 16-bit width), as the C5 programs use it. The IDF docs' "most significant N bits" reads as bits 22..31, which looks up the wrong entries.
 
 What that rules out:
 
@@ -101,7 +102,7 @@ What that rules out:
 - Moving the lookup to the C5, which has `ADDCTI`: its PARLIO is 8 lanes wide, so it would see only 4 bits each of I and Q.
 - Anything after the lookup: the phase difference, the 4-sample sums and sync slicing all need an adder.
 
-What could still work is the lookup alone, with a smaller table, leaving the CPU to subtract. The lookup is the one step the CPU cannot vectorize, so with phase arriving in the ring the rest could become PIE vector operations. Three tables fit:
+What is left is the lookup alone, with a smaller table, leaving the CPU to subtract. The lookup is the one step the CPU cannot vectorize, so with phase arriving in the ring the rest could become PIE vector operations. Three tables fit:
 
 - A single 2048×8 table indexed by 6 bits of I and 5 of Q, writing 8 bits per sample.
 - A bipartite pair in 1024×16, packed as the high and low byte of each word the way the C5's `fm.bsasm` shares one LUT between two tables: a coarse phase from the top 5 bits of I and Q, and a correction from the top 3 and low 2 bits of each. The P4 cannot add them, so it would write both bytes and the CPU would add.
@@ -118,11 +119,24 @@ Simulated back-porch noise in kHz for each table, against an exact demodulator, 
 | 72 | 167 | 171 | 184 | 171 | 175 |
 | 90 | 167 | 170 | 178 | 170 | 174 |
 
-The bipartite and companded pairs both come within 3% of the table in use across the gain control's range (RMS 40-72), and the companded pair is quieter than it below RMS 40, because log spacing keeps the phase error from growing as the signal shrinks. The single 6+5 table is 0.6 to 1.5 dB noisier in that range. Before any of them could be used, the hardware would have to show three things:
+The bipartite and companded pairs both come within 3% of the table in use across the gain control's range (RMS 40-72), and the companded pair is quieter than it below RMS 40, because log spacing keeps the phase error from growing as the signal shrinks. The single 6+5 table is 0.6 to 1.5 dB noisier in that range.
 
-- The BitScrambler runs on PARLIO RX through the AXI-GDMA, at two instructions per sample for the bipartite pair or three for the companded one (40 million a second, the rate the C5's runs at).
-- The LUT can be rewritten while running, since the table is rebuilt around the I/Q offset twice a second.
-- The soft-delimiter EOF and the decoder's reading of the DMA write position still behave with the BitScrambler in the path, and no DMA boundary resets its state.
+### On the hardware
+
+`iq bs` runs a BitScrambler program between PARLIO RX and its DMA during a capture. `bs_phase_check.bsasm` is the companded lookup (three instructions, one per lookup) writing each sample's phase byte beside the lanes it came from, so the CPU can repeat every lookup.
+
+- The lookup is right. On live I/Q at 13.33 MS/s, all 585,487 consecutive samples of a capture matched the CPU's lookup, at each of three I/Q offsets. That is 40 million instructions a second. With the C5's counter at 40 MS/s (120 million a second), one sample in 585,487 differed.
+- It is gapless across EOFs. A 2:1 program (`bs_half.bsasm`) carried the C5's counter with no break through 36 soft-delimiter EOFs at 40 MHz, and the program stays in its run state.
+- The first EOF after each start is the exception: about 5 to 12 samples are dropped there, and a program writing 16 or 32 bits a sample comes out shifted by a byte from then on. One writing 8 bits has no alignment to lose.
+- The LUT takes writes only while the program is halted. Writes while it runs, or while it is paused, change nothing, and the driver's `bitscrambler_load_lut` on a running program corrupts a few hundred samples (it switches the LUT's width to write) and still changes nothing.
+- Halting, rewriting the 256 lane entries and restarting takes about 18,000 CPU cycles (50 µs, under one line). About 14 samples come out wrong, the samples of those 50 µs are lost, and the next EOF drops samples as a first one does. The I and Q bytes keep their order.
+- A PSRAM `iq` capture's first 64,512 bytes hold the previous capture's data, with or without the BitScrambler. Checks start after them.
+
+What is left before the decoder can use it:
+
+- The decoder takes its I/Q offset, RMS and clipping from raw words, which the phase byte doesn't carry. The offset can be steered from the balance of the sign bits. The gain control needs a magnitude, so the program has to write a second byte (the magnitude codes) or the gain has to come from somewhere else.
+- An offset change means a halt, so it should wait for the vertical interval and for a larger change than the quarter-step the CPU table rebuilds on.
+- The CPU side (unfolding the quadrant, the difference and the block sums in PIE) is not written, so the saving below is still an estimate.
 
 What the offload would buy, estimated from the load figures above and not measured:
 
