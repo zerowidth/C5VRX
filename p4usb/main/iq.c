@@ -403,6 +403,8 @@ typedef struct {
     uint32_t rms, clip;
     /* Per mille of samples within half the mean power of it: most of an FM carrier's, 4 in 10 of noise's. */
     uint32_t ring;
+    /* Per mille under 0.35 or over 2.1 times the mean power: off a carrier's ring, as garbage reads are. */
+    uint32_t off_ring;
 } quality_t;
 
 /* A lane sampled while the C5's bus is changing reads garbage where it crosses zero, since every bit turns
@@ -439,13 +441,15 @@ static quality_t quality(size_t samples)
 
     }
     while ((uint64_t)(q.rms + 1) * (q.rms + 1) <= power) ++q.rms;
-    uint32_t near = 0;
+    uint32_t near = 0, off = 0;
     for (size_t k = STALE; k < samples; ++k) {
         int i = (int8_t)s_buf[k] - means[0], v = (int8_t)(s_buf[k] >> 8) - means[1];
         uint32_t p = i * i + v * v;
         near += p > power / 2 && p < power * 3 / 2;
+        off += p * 20 < power * 7 || p * 10 > power * 21;
     }
     q.ring = (uint32_t)((uint64_t)near * 1000 / (samples - STALE));
+    q.off_ring = (uint32_t)((uint64_t)off * 1000 / (samples - STALE));
     q.clip = (uint32_t)((uint64_t)q.clip * 1000 / (samples - STALE));
     return q;
 }
@@ -465,7 +469,7 @@ static bool settle_gain(void)
         if (capture(s_psram, GAIN_SAMPLES, s_edge) != ESP_OK) return false;
         quality_t q = quality(GAIN_SAMPLES);
         int gain = s_probe_gain;
-        if (q.clip > 20) gain -= 6;
+        if (q.clip > 20 || q.rms > 80) gain -= 6;
         else if (q.rms < 30) gain += 6;
         gain = gain < PROBE_GAIN_MIN ? PROBE_GAIN_MIN : gain > PROBE_GAIN_MAX ? PROBE_GAIN_MAX : gain;
         if (gain == s_probe_gain) break;
@@ -474,11 +478,13 @@ static bool settle_gain(void)
     return true;
 }
 
-/* A clean carrier glitches 1 to 4 times in a thousand samples, and a lane read mid-change 15 to 26. Noise
- * alone glitches 7 or 8 times read clean, as independent samples do, and 11 to 200 or not at all otherwise,
- * the last when the garbage is most of the lane's power. */
-#define GLITCH_MAX 9
+/* With a carrier, a lane read mid-change puts 3 or 4 samples in a hundred well off its ring and a clean one
+ * almost none. The glitch count is a poorer test there: 1 to 8 clean and 6 to 26 not. Noise has no ring, and
+ * glitches 6 to 9 times in a thousand read clean, as independent samples do, and 11 to 200 or hardly at all
+ * otherwise, the last when the garbage is most of the lane's power. */
+#define OFF_RING_MAX 10
 #define NOISE_GLITCH_MIN 4
+#define NOISE_GLITCH_MAX 9
 #define RING_MIN 600
 
 /* Whether the last probe had a carrier to judge by; noise is a poorer guide. */
@@ -486,9 +492,10 @@ static bool s_verified;
 
 static bool mid_change(const quality_t *q)
 {
+    if (q->ring >= RING_MIN) return q->off_ring > OFF_RING_MAX;
     uint32_t worst = q->glitch[0] > q->glitch[1] ? q->glitch[0] : q->glitch[1];
     uint32_t least = q->glitch[0] < q->glitch[1] ? q->glitch[0] : q->glitch[1];
-    return worst > GLITCH_MAX || (q->ring < RING_MIN && least < NOISE_GLITCH_MIN);
+    return worst > NOISE_GLITCH_MAX || least < NOISE_GLITCH_MIN;
 }
 
 /* Captures on each edge and keeps the one read further from the change. Reports whether each edge is clean. */
@@ -506,13 +513,13 @@ static bool pick_edge(bool clean[2])
         clean[e] = !mid_change(&q[e]);
     }
     uint32_t score[2];
-    for (int e = 0; e < 2; ++e) score[e] = q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1];
+    for (int e = 0; e < 2; ++e) score[e] = q[e].off_ring * 1000 + (q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1]);
     int e = clean[0] != clean[1] ? clean[1] : score[1] < score[0];
     s_edge = edges[e];
     s_verified = q[e].ring >= RING_MIN;
-    say("glitches per mille, I and Q: rise %lu %lu, fall %lu %lu; gain %d, RMS %lu%s: using %s%s\n",
-        (unsigned long)q[0].glitch[0], (unsigned long)q[0].glitch[1], (unsigned long)q[1].glitch[0],
-        (unsigned long)q[1].glitch[1], s_probe_gain,
+    say("per mille glitching on I and Q and off the ring: rise %lu %lu %lu, fall %lu %lu %lu; gain %d, RMS %lu%s: using %s%s\n",
+        (unsigned long)q[0].glitch[0], (unsigned long)q[0].glitch[1], (unsigned long)q[0].off_ring,
+        (unsigned long)q[1].glitch[0], (unsigned long)q[1].glitch[1], (unsigned long)q[1].off_ring, s_probe_gain,
         (unsigned long)q[e].rms, q[e].ring >= RING_MIN ? "" : ", no carrier", e ? "fall" : "rise",
         clean[e] ? "" : ", which reads a lane mid-change");
     return true;
