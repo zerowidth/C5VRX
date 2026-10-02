@@ -123,6 +123,11 @@ static void stop(const char *why)
     c5_tx_detach();
     if (s_baud != BRIDGE_BAUD) set_baud(BRIDGE_BAUD);
     say("\nbridge: %s\n> ", why);
+    /* An esptool that gave up leaves a queue of SYNCs behind, each of which would start a session, wait
+     * out its timeout and start the decoder again, keeping the console busy for minutes. */
+    uint8_t stale[64];
+    while (host_read(stale, sizeof stale, 50)) {
+    }
     if (s_resume_decode) decode_start(NULL);
 }
 
