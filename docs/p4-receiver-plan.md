@@ -4,7 +4,14 @@ Plan for a self-contained receiver built from the Waveshare ESP32-C5-Zero and th
 
 This is a separate build from the standalone C5 receiver. The C5-only path, which recovers composite video onto the resistor DAC and never decodes pixels, stays as it is.
 
-Bring-up is done: the P4 resets and reflashes the C5, and every wire checks out (see [Bring-up](#bring-up)). The C5 tunes and exports live I/Q, and the P4 demodulates it and decodes NTSC in real time into the camera, in grayscale. Color, the OLED and buttons are not built yet. The open questions at the end need answers before some choices are final. What the hardware has shown so far is collected in [P4 receiver findings](p4-receiver-findings.md).
+Status: the receiver works end to end. The C5 tunes and exports live I/Q, and the P4 demodulates it and decodes NTSC in color into the camera at 59.9 fields per second, with the console on the same cable. The OLED, buttons and microSD recording are not built yet.
+
+Where to look:
+
+- [Bring-up](#bring-up) has the console commands, the Rake tasks and what has been verified on the hardware.
+- [Firmware](#firmware) describes how the C5 and P4 firmware work.
+- [Open questions](#open-questions) lists what is still undecided.
+- [P4 receiver findings](p4-receiver-findings.md) collects what the hardware has shown so far.
 
 ## System overview
 
@@ -12,7 +19,7 @@ Bring-up is done: the P4 resets and reflashes the C5, and every wire checks out 
 flowchart LR
     subgraph stick["Receiver stick enclosure"]
         ant["5.8 GHz antenna"] --> c5["ESP32-C5-Zero<br/>tuner + I/Q export"]
-        c5 -- "14 I/Q lanes + 40 MHz clock" --> p4["ESP32-P4-Pico<br/>demod, NTSC decode, JPEG"]
+        c5 -- "14 I/Q lanes + sample clock" --> p4["ESP32-P4-Pico<br/>demod, NTSC decode, JPEG"]
         p4 -- "UART: tuning, status" --> c5
         p4 -- "EN, BOOT" --> c5
         oled["I2C OLED"] --- p4
@@ -209,7 +216,7 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 
 ### C5
 
-- Route the top 7 live bits of each of Q and I from MODEM_DIAG to the 14 data pads, release GPIO 13 and 14 from USB, and output a 40 MHz sample clock divided from the same PLL as the modem, so the rate can't drift. The MODEM_DIAG bus itself changes at about 80 MS/s and the 40 MHz clock keeps every second sample, as the C5's own PARLIO RX does today.
+- Route the top 7 live bits of each of Q and I from MODEM_DIAG to the 14 data pads, release GPIO 13 and 14 from USB, and output a sample clock divided from the same PLL as the modem, so the rate can't drift. The MODEM_DIAG bus itself changes at about 80 MS/s and the clock keeps one of every N samples. The decoder uses N=6 (13.33 MS/s); N=2 (40 MS/s) is what the C5's own PARLIO RX uses and is the default for raw captures.
 - Set low drive strength on the data and clock pads.
 - Add a text command set on the USB console first, then the same parser on the UART to the P4: band, channel, frequency, status.
 - Status includes the existing `strength` score, wideband RSSI (`phy_get_rssi`), noise floor, and current gain, all already in `C5VRX_LAB_ROW`.
@@ -223,10 +230,20 @@ In the band scanner, CH− and CH+ move the cursor, a BAND tap tunes to the curs
 - At boot, run the walking-ones self-test against the planned pin map. On a mismatch, name the wire on the console, OLED and `status` (for example, "Q5: C5 3 seen on P4 31, expected 30"), then remap in firmware so the build still runs.
 - The decoder runs at 13.33 MS/s: the C5's clock keeps every 6th sample of its 80 MS/s bus, so the P4 captures only the samples it uses. The carrier plus deviation stays inside the ±6.67 MHz this rate follows without phase wrapping. At 40 MS/s the P4 spent most of its time reading words it then skipped.
 - Demodulate FM with a 16 KB phase table indexed by the raw word shifted right by two (the top 6 bits of I and all 7 of Q), giving an 8-bit phase, then subtract the previous sample's phase, where uint8 wraparound handles the 360° wrap. The table is rebuilt twice a second around the measured I/Q DC offset (about 20 of ±127 on I at gain 64), which otherwise distorts the phase of a small signal. At a working gain the table's rounding adds almost nothing to the noise, and 16-bit phase output gained nothing over 8-bit.
-- The P4's HP core runs about one ALU instruction per cycle, but each load costs about 3 cycles from cached internal memory and about 5 from the 8 KB SPM (TCM), against a 27-cycle budget per sample at 360 MHz. Core 1 runs the demodulator, sync detection (on 4-sample block sums, refined to one sample at each crossing), the line clock, the vertical flywheel, burst measurement and chroma mixing (PIE vector multiply-accumulates), at about 83% load. It queues each line to a drawing task on core 0 (about 78%), which finishes chroma, draws luma, packs pixels and deinterlaces into internal RAM; DMA copies them to the PSRAM frame 16 rows at a time, since the core writing PSRAM through its cache slowed both cores and the JPEG encoder. The drawing task runs above USB and the console, because level-priority tasks time-slice it a millisecond at a time and it then falls behind the ring. BitScrambler can attach to PARLIO RX on the P4 and could take the table lookup off the CPU if more headroom is needed.
+- The work is split across the two HP cores, and neither overruns:
+  - The budget is 27 cycles per sample at 360 MHz. The core runs about one ALU instruction per cycle, but each load costs about 3 cycles from cached internal memory and about 5 from the 8 KB SPM (TCM).
+  - Core 1 runs the demodulator, sync detection (on 4-sample block sums, refined to one sample at each crossing), the line clock, the vertical flywheel, burst measurement and chroma mixing (PIE vector multiply-accumulates), at about 83% load.
+  - Core 1 queues each line to a drawing task on core 0 (about 78%), which finishes chroma, draws luma, packs pixels and deinterlaces into internal RAM. DMA copies them to the PSRAM frame 16 rows at a time, since the core writing PSRAM through its cache slowed both cores and the JPEG encoder.
+  - The drawing task runs above USB and the console, because level-priority tasks time-slice it a millisecond at a time and it then falls behind the ring.
+- The demodulator stays on the CPU. The P4's BitScrambler can't hold the 16 KB phase table (its LUT is 2 KB) and can't subtract phases (it has no data-dependent add), so it is not used. See [findings](p4-receiver-findings.md#the-p4s-bitscrambler) for its limits and the untested smaller-table route.
 - The decoder reads the DMA's write position from the AXI-GDMA's descriptor registers rather than trusting the driver's one-callback-per-node count, which falls behind when two nodes finish before the interrupt runs. The ring is 24 whole 4032-byte DMA nodes and the soft-delimiter EOF comes every 8 nodes, because an EOF that lands mid-node ends that node early and leaves the rest of it stale.
 - A slow control loop keeps the I/Q RMS between 40 and 72 (of ±127, around the DC offset) with under 0.5% clipping by stepping the C5's gain index by 2. Below that range the phase table's rounding adds visibly to the grain.
-- Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb. Built so far: sync tip and blanking come from each field's level histogram until lines lock and then from averages of locked lines' sync tips and back porches, a line clock steers on hsyncs within 3 µs and coasts otherwise, broad pulses reset the line count and give field parity, and each field's 240 active lines are drawn from the line clock's nearest half sample into 720×480 at the field's offset. Each missing row takes its luma from the median of the rows above and below and the previous field's row there (fetched from its PSRAM frame by DMA, eight rows at a time), so still areas keep full vertical detail and moving ones fall back to a neighbouring line; its chroma is the line below's. Color is decoded against the burst: the burst phase is averaged over lines, chroma is demodulated in 8-sample blocks, summed over each pair of lines (a two-line comb that cancels luma leaking into chroma) and smoothed 1 2 1 across blocks, and a color killer drops to monochrome when the burst fades or lines stop locking. When the signal goes, the camera keeps streaming noise as gray snow (JPEG quality drops to fit it) and relocks when it returns; the test pattern, which names the channel, appears only when the decoder stops.
+- Decode NTSC fields: adaptive sync threshold, per-line resampling, burst-locked color, three-line comb. Built so far:
+  - Levels: sync tip and blanking come from each field's level histogram until lines lock and then from averages of locked lines' sync tips and back porches.
+  - Timing: a line clock steers on hsyncs within 3 µs and coasts otherwise, broad pulses reset the line count and give field parity, and each field's 240 active lines are drawn from the line clock's nearest half sample into 720×480 at the field's offset.
+  - Deinterlacing: each missing row takes its luma from the median of the rows above and below and the previous field's row there (fetched from its PSRAM frame by DMA, eight rows at a time), so still areas keep full vertical detail and moving ones fall back to a neighbouring line; its chroma is the line below's.
+  - Color is decoded against the burst: the burst phase is averaged over lines, chroma is demodulated in 8-sample blocks, summed over each pair of lines (a two-line comb that cancels luma leaking into chroma) and smoothed 1 2 1 across blocks, and a color killer drops to monochrome when the burst fades or lines stop locking.
+  - Signal loss: the camera keeps streaming noise as gray snow (JPEG quality drops to fit it) and relocks when the signal returns; the test pattern, which names the channel, appears only when the decoder stops.
 - Never stop or blank the output on weak or lost sync. Field and line timing coast at their last lock (or nominal NTSC) and every field is decoded regardless, so noise shows as static, frames keep arriving at about 59.94 fps, and the picture relocks without flashing, as an analog monitor does. The JPEG stamp can carry a lock flag and sync quality without changing the picture.
 - Encode JPEG with the hardware encoder and serve a composite USB device: UVC plus CDC-ACM serial (TinyUSB, with our own descriptors).
 - Put per-frame metadata in a JPEG COM segment written after SOI: frame counter, field-sync timestamp (esp_timer µs), C5 signal level, gain changes tagged with IQ sample index, and sync and noise quality. The metadata survives only if the host keeps the compressed MJPEG (libuvc, or ffmpeg with `-c:v copy`); OS webcam APIs that hand over decoded frames drop it. UVC payload headers also carry a device-clock PTS per frame, as a cross-check.
@@ -258,7 +275,7 @@ A Web Serial page with band and channel buttons, the current frequency, and a li
 ## Open questions
 
 - Does the camera capture 60 images per second, or 30 split across fields? Capture a moving scene and compare the two fields of one frame.
-- Would motion-adaptive deinterlacing fit? It needs the previous field kept in place and a per-pixel choice between weaving and interpolating, about 350K pixels per field, which leaves no room on either core without SIMD or taking the demodulator's table lookup off the CPU.
+- Would motion-adaptive deinterlacing fit? It needs the previous field kept in place and a per-pixel choice between weaving and interpolating, about 350K pixels per field, which leaves no room on either core as things stand. The demodulator is the largest single cost on core 1 (about half of it), and the only way found to shrink it is the untested BitScrambler route in [findings](p4-receiver-findings.md#the-p4s-bitscrambler).
 - The counter test passes at 40 MHz on either P4 clock edge but fails at 80 MHz, with one error every 16 samples on bits 5-7 of both sides. Is that the C5's PARLIO TX or the P4's RX? It matters only if the link ever runs faster than 40 MHz.
 - Each kept sample is valid for about 12.5 ns. How much of that window is left after the C5 and P4 GPIO matrices, wire skew and the low drive strength, and is the modem-to-divider phase the same on every boot? If the margin is thin, can the C5 output an 80 MHz clock so the P4 can choose which half-cycle to keep?
 
@@ -286,7 +303,15 @@ The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset
 - `info` shows the P4's chip revision, uptime and bridge counters.
 - `video` shows the test-pattern pipeline's frame rate, render and encode times, JPEG size, and USB state. `video grab` prints the newest JPEG as base64 over the console, for checking frames without the high-speed port.
 - Gain control runs on the P4 twice a second on its RMS and clipping, stepping the index by 2 (8 under heavy clipping) within 30-77, and writes it to the C5 with `gain N`. Main's Direct Gain V3 was tried on the P4 and backed out: it matched this control's line lock, recovered from overload faster, but swung between gains with no signal and needed its coherence test rescaled for 13.33 MS/s (see findings).
-- The P4 starts decoding R3 at boot. A bridge session stops the decoder while the C5 is in its ROM loader and restarts it on the last channel afterwards. `decode on [channel]` resets the C5, tunes it (default the last channel), starts the I/Q export at 13.33 MS/s, picks the clock edge and decodes into the camera; the test pattern returns 100 ms after decoding stops. `channel R5` does the same for a lap timer or recorder and replies `channel R5 5806`, or `err R5` if the C5 refuses it and the last channel resumes; `channel` alone replies with the current one. Bands R, A, B, E, F and L and bare MHz work within the C5's 5180-5885 MHz window, so R8 (5917 MHz) is refused. A retune takes about 1.5 s since it resets the C5. `decode` alone starts with the channel and its MHz, then shows lock, levels, gain, load and overruns, `decode gain auto|N` sets the gain control, and the status includes the C5's own `status` reply, `decode sat N` sets the saturation, `decode tap` sends the decoder's own input words for `iq.py`, `decode rx` runs only the ring reader (for the link counter), and `decode bench` prices each stage in cycles per sample. `iq.py burst` looks for an NTSC or PAL colorburst in a capture.
+- The P4 starts decoding R3 at boot. A bridge session stops the decoder while the C5 is in its ROM loader and restarts it on the last channel afterwards.
+- `decode on [channel]` resets the C5, tunes it (default the last channel), starts the I/Q export at 13.33 MS/s, picks the clock edge and decodes into the camera; the test pattern returns 100 ms after decoding stops.
+- `channel R5` does the same for a lap timer or recorder and replies `channel R5 5806`, or `err R5` if the C5 refuses it and the last channel resumes; `channel` alone replies with the current one. Bands R, A, B, E, F and L and bare MHz work within the C5's 5180-5885 MHz window, so R8 (5917 MHz) is refused. A retune takes about 1.5 s since it resets the C5.
+- `decode` alone starts with the channel and its MHz, then shows lock, levels, gain, load and overruns, and includes the C5's own `status` reply. Its subcommands:
+  - `decode gain auto|N` sets the gain control.
+  - `decode sat N` sets the saturation.
+  - `decode tap` sends the decoder's own input words for `iq.py`; `iq.py burst` looks for an NTSC or PAL colorburst in a capture.
+  - `decode rx` runs only the ring reader (for the link counter).
+  - `decode bench` prices each stage in cycles per sample.
 - `iq start [channel [every]]` resets the C5, tunes it (default R3), starts the I/Q export keeping one of every `every` bus samples (default 2, so 40 MS/s) and picks the P4's clock edge. `iq` captures two fields (1.4 M samples, 35 ms) into PSRAM and prints I/Q statistics, and `iq dump` sends the raw 16-bit words. `p4usb/tools/iq.py` runs the capture and dump from the Mac and has offline checks: `lanes` shows each lane's activity and `field` FM-demodulates the capture into an image of lines. It needs numpy, pillow and pyserial.
 - `c5 send <command>` reaches `c5rx`'s own commands: `tune R3` (or a frequency in MHz) starts the radio on first use and tunes it, `gain N` forces the RX gain index (default 52), `status` reports channel, gain, RSSI and noise floor, and `iq on [every]` routes MODEM_DIAG bits 9-3 (Q) and 19-13 (I) to the lanes with a PARLIO TX clock on GPIO 0 that keeps one of every `every` samples of the 80 MS/s bus (default 2, 40 MHz). `iq on every Q I` routes other DIAG bits, with Q and I naming the top one on each side. The radio setup follows `main/rf.c`: BW40, promiscuous receive with the MAC TX queues disabled, the vendor AGC off, and fixed gain.
 
@@ -309,7 +334,7 @@ Verified on the hardware:
 ## Build order
 
 1. C5 command set on its USB console, and the Web Serial page against the C5 directly.
-2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video. Power, UART, EN and BOOT, bridged flashing and the wire check are done.
+2. When the P4 arrives: power, UART, EN and BOOT, OLED and buttons. Channel control and status work end to end, with no video. Power, UART, EN and BOOT, bridged flashing and the wire check are done. The OLED and buttons are not started.
 3. C5 clock output and I/Q export. Capture on the P4, check the link with the counter pattern, run the clock-edge check on live data, and compare samples with a host-side decode offline. Done: the offline decode shows the transmitter's picture.
-4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside. Done in grayscale: live video from R3 at 59.9 fps with the console on the same cable. Color is next.
+4. Demodulation and NTSC decode on the P4, then JPEG and UVC with the serial port alongside. Done, in color: live video from R3 at 59.9 fps with the console on the same cable.
 5. Optional: microSD recording.
