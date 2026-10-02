@@ -250,6 +250,8 @@ Estimated cost of further picture processing, as a share of one core:
 
 Simple smoothing in PIE fits the headroom there is without the offload (about 22% of core 0 and 17% of core 1). Scalar per-pixel motion-adaptive deinterlacing does not, and does with it.
 
+Motion-adaptive deinterlacing of the missing rows was tried and dropped. It compared each 8-pixel block's mean luma with the same field two back and, where nothing moved, took the previous field's pixels outright. Split-screen frames against the median showed no difference, since the median already weaves still detail that appears in both fields, and detail one row thin flickers when woven. It took core 0 from 43% to 61%, with the block means in PSRAM because internal RAM had no 43 KB free.
+
 ## Encoding and USB
 
 - The hardware JPEG encoder takes 2.5-3.5 ms for a 720×480 grayscale frame. At quality 80 grainy fields overflowed the 128 KB slot; quality 70 gives about 60-70 KB.
