@@ -20,3 +20,4 @@ bool radio_noise_floor(int *dbm);
  * so 9 and 19 give the top 7 bits of each. */
 esp_err_t radio_iq_start(int every, int q_top, int i_top);
 void radio_iq_stop(void);
+void radio_clock_slip(uint32_t us);

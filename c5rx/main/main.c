@@ -83,6 +83,9 @@ static void run_command(char *line)
     } else if (strcmp(argv[0], "iq") == 0 && argc == 2 && strcmp(argv[1], "off") == 0) {
         radio_iq_stop();
         reply("ok iq off");
+    } else if (strcmp(argv[0], "clk") == 0 && argc == 3 && strcmp(argv[1], "slip") == 0) {
+        radio_clock_slip(atoi(argv[2]));
+        reply("ok clk slip %d", atoi(argv[2]));
     } else if (strcmp(argv[0], "status") == 0) {
         int rssi = 0, noise = 0;
         bool have_rssi = radio_rssi(&rssi), have_noise = radio_noise_floor(&noise);

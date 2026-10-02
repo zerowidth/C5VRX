@@ -8,11 +8,14 @@
 #include "driver/parlio_tx.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "hal/misc.h"
 #include "esp_netif.h"
 #include "esp_rom_gpio.h"
+#include "esp_rom_sys.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "soc/gpio_sig_map.h"
+#include "soc/pcr_struct.h"
 
 #include "lanes.h"
 
@@ -280,6 +283,17 @@ esp_err_t radio_iq_start(int every, int q_top, int i_top)
     esp_err_t err = start_clock(BUS_HZ / every);
     if (err != ESP_OK) radio_iq_stop();
     return err;
+}
+
+/* Runs the clock one tick of its 240 MHz slow for a while, which moves its edge a tick later against the
+ * bus for each period that passes. The bus changes every 3 ticks, and where the edge falls against it is
+ * settled at reset; the P4 slips it until it reads the lanes steady. */
+void radio_clock_slip(uint32_t us)
+{
+    uint32_t div = PCR.parl_clk_tx_conf.parl_clk_tx_div_num;
+    HAL_FORCE_MODIFY_U32_REG_FIELD(PCR.parl_clk_tx_conf, parl_clk_tx_div_num, div + 1);
+    if (us) esp_rom_delay_us(us);
+    HAL_FORCE_MODIFY_U32_REG_FIELD(PCR.parl_clk_tx_conf, parl_clk_tx_div_num, div);
 }
 
 void radio_iq_stop(void)
