@@ -215,7 +215,7 @@ typedef struct {
 } __attribute__((aligned(16))) luma_t;
 static luma_t s_lumas[2];
 static const luma_t *volatile s_luma = &s_lumas[0];
-static bool s_soft = true;
+static enum { LUMA_PLAIN, LUMA_SOFT, LUMA_PEAK } s_luma_kind = LUMA_SOFT;
 static uint8_t *s_frame, *s_prev;
 
 /* Per-field counters for the status line. */
@@ -428,13 +428,14 @@ static void set_maps(void)
     luma_t *m = s_luma == &s_lumas[0] ? &s_lumas[1] : &s_lumas[0];
     /* White is 100 IRE above blanking, and sync 40 below: a pixel is 408 / span times the sum of four
      * samples above blanking. The weights' sum carries that gain, as large as int8 weights allow. */
-    int shift = 0, sum = 0;
+    static const int sum_max[3] = {496, 496, 328};
+    int shift = 0, sum = 0, max = sum_max[s_luma_kind];
     for (int k = 12; k >= 0; --k) {
         sum = (1632 << k) / span;
         shift = k;
-        if (sum <= 496) break;
+        if (sum <= max) break;
     }
-    if (sum > 496) sum = 496;
+    if (sum > max) sum = max;
     /* Blanking, and the 128 levels that centre the result for the signed clamp, come off each sample in
      * whole units, and the rest, with the rounding, off the sum. */
     int bias = (128 << shift) - (shift ? 1 << (shift - 1) : 0);
@@ -448,13 +449,15 @@ static void set_maps(void)
     }
     /* The sum of four samples nulls the subcarrier's dots out of luma, and a line starting half a sample
      * late is the mean of two such sums. Smoothing 1 2 1 on top takes about 5 dB off the noise, which rises
-     * with frequency, and evens it out between the two kinds of line. */
-    static const int8_t kernels[2][2][7] = {
+     * with frequency, and evens it out between the two kinds of line. Peaking -1 4 -1 instead brings back
+     * detail a sample or two wide, such as an OSD's outline beside a stem, for twice the noise. */
+    static const int8_t kernels[3][2][7] = {
         {{0, 1, 1, 1, 1, 0, 0}, {0, 1, 2, 2, 2, 1, 0}},
         {{1, 3, 4, 4, 3, 1, 0}, {1, 4, 7, 8, 7, 4, 1}},
+        {{-1, 3, 2, 2, 3, -1, 0}, {-1, 2, 5, 4, 5, 2, -1}},
     };
     for (int h = 0; h < 2; ++h) {
-        const int8_t *kernel = kernels[s_soft][h];
+        const int8_t *kernel = kernels[s_luma_kind][h];
         int total = 0, w[7], given = 0;
         for (int t = 0; t < 7; ++t) total += kernel[t];
         for (int t = 0; t < 7; ++t) given += w[t] = sum * kernel[t] / total;
@@ -1619,13 +1622,13 @@ void decode_command(int argc, char **argv)
         s_tnr_auto = strcmp(argv[2], "auto") == 0;
         if (!s_tnr_auto) s_tnr = atoi(argv[2]);
         if (argc > 3) s_tnr_mix = atoi(argv[3]);
-    } else if (strcmp(sub, "soft") == 0 && argc > 2) {
-        s_soft = strcmp(argv[2], "off") != 0;
+    } else if (strcmp(sub, "luma") == 0 && argc > 2) {
+        s_luma_kind = strcmp(argv[2], "plain") == 0 ? LUMA_PLAIN : strcmp(argv[2], "peak") == 0 ? LUMA_PEAK : LUMA_SOFT;
     } else if (strcmp(sub, "bench") == 0) {
         bench();
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | soft on|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
     }
 }
