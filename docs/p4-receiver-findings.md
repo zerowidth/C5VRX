@@ -13,7 +13,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 ## C5 starts that read the lanes mid-change
 
-About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The C5's clock can be moved against its bus by running it a tick slow for a moment, and at each start the P4 now moves it until the lanes read steady. That search has been run on noise only; it has not yet been checked with a transmitter on.
+About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The C5's clock can be moved against its bus by running it a tick slow for a moment, and at each start the P4 now moves it until the lanes read steady: with a transmitter on, 14 starts in 14 ended clean.
 
 How it happens:
 
@@ -50,15 +50,19 @@ What is not known:
 
 What `iq_start` does:
 
-- It sets a gain that doesn't clip, since a clipped signal hides the glitches, then counts on each P4 edge the samples that stand further outside their two neighbours than the lane's RMS. A clean carrier gives 1 to 4 per thousand and a lane read mid-change 15 to 26. Noise alone gives 6 to 9 read clean, as independent samples do, and 11 to 200, or none when the garbage is most of the lane's power, otherwise.
-- While either edge reads above 9 (or, on noise, below 4) it slips the clock and counts again, up to 16 times, settling for one clean edge after 8. Asking for both edges puts the one in use further from the change.
-- On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is a poorer guide. So a start with no carrier (under 60% of samples near the mean power) is marked, and the decoder starts once more when a transmitter first locks most of a field.
+- It sets a gain that leaves the RMS between 30 and 80 with under 2% clipped, since a clipped signal hides what the test looks for.
+- With a carrier it counts, on each P4 edge, the samples well off the carrier's ring (under 0.35 or over 2.1 times the mean power). Clean reads give 0 to 5 per thousand and the worst 50 to 60, with steps between (9, 15, 20, 30), as if each lane crosses the change at its own point. Over 10 counts as mid-change.
+- With no carrier (under 60% of samples near the mean power) there is no ring, so it counts the samples that stand further outside their two neighbours than the lane's RMS. Noise gives 6 to 9 per thousand read clean, as independent samples do, and 11 to 200, or hardly any when the garbage is most of the lane's power, otherwise.
+- That second count is a poor test with a carrier: clean reads gave 1 to 8 and bad ones 6 to 26, and a start it passed at 6 and 9 decoded with 1025 kHz of noise. That is why a carrier is judged by its ring.
+- While either edge reads mid-change it slips the clock and counts again, up to 16 times, settling for one clean edge after 8. Asking for both edges puts the one in use further from the change.
+- With a carrier, 14 starts took 1 to 4 probes each and all decoded with 151 to 249 kHz of sync tip noise. Six of the 14 came up mid-change on both edges.
+- On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is the poorer guide. So a start with no carrier is marked, and the decoder starts once more when a transmitter first locks most of a field. That restart has not been watched happening.
 - Before slipping was found, the P4 reset the C5 instead until it came up clean: with a carrier, 3 starts in 12 needed one more reset and all 12 ended clean.
 
 Still to do:
 
-1. Run the search with a transmitter on, and check the picture's noise after it.
-2. Map the readings against the number of slips with a carrier, for how many positions there are and how wide the clean one is.
+1. Map the off-ring count against the number of slips, for how many positions there are and how wide the clean one is.
+2. Find how much margin the chosen position has, and whether it holds as the boards warm up.
 3. Look at the clock against a Q lane on an oscilloscope, on good and bad starts, for the margin. The Saleae's 50 MS/s is too slow.
 
 ## The C5's gain table
