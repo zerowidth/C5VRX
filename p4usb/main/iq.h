@@ -13,6 +13,8 @@ bool iq_start(const char *channel, int every);
 int iq_gain(void);
 /* Whether iq_start had a carrier to place the clock by; if not, start again once there is one. */
 bool iq_verified(void);
+/* The I/Q offset iq_start measured at that gain, in the lanes' 2v+1 units. */
+void iq_dc(float *i, float *q);
 /* The C5's name and frequency for the channel last tuned. */
 const char *iq_channel(unsigned *mhz);
 parlio_sample_edge_t iq_edge(void);

@@ -67,7 +67,7 @@ def load(path):
 
 
 def cpu_phase(dc_i, dc_q):
-    """decode.c's build_lut: the top 6 bits of I as the midpoint of the dropped one, and all 7 of Q."""
+    """A 16 KB table a CPU could look up: the top 6 bits of I as the midpoint of the dropped one, and all 7 of Q."""
     dc_i, dc_q = round(dc_i * 4) / 4, round(dc_q * 4) / 4
     table = {}
 

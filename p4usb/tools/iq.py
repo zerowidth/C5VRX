@@ -1,7 +1,6 @@
 """Capture I/Q from the P4 console and look at it offline.
 
-    iq.py capture out.bin [sram|tap] capture two fields (or what fits in internal RAM, or the running decoder's
-                                input) and save the raw words
+    iq.py capture out.bin [sram] capture two fields (or what fits in internal RAM) and save the raw words
     iq.py lanes in.bin         per-lane toggle rates and I/Q statistics
     iq.py field in.bin out.png FM-demodulate and draw the samples as NTSC lines
     iq.py gaps in.bin [every]  find hsync spacings that aren't whole lines, which mean lost samples
@@ -45,13 +44,9 @@ def run(s, cmd, until, timeout):
 
 def capture(path, cmd="iq"):
     s = console()
-    if cmd == "iq tap":
-        # The running decoder's own input, as it processed it.
-        out = run(s, "decode tap", b"-----END IQ-----", 40)
-    else:
-        text = run(s, cmd, b"\n> ", 5).decode(errors="replace")
-        print(text.strip())
-        out = run(s, "iq dump", b"-----END IQ-----", 30)
+    text = run(s, cmd, b"\n> ", 5).decode(errors="replace")
+    print(text.strip())
+    out = run(s, "iq dump", b"-----END IQ-----", 30)
     head = out.index(b"-----BEGIN IQ ")
     nl = out.index(b"\n", head)
     n = int(out[head + 14 : nl].split(b"-")[0])

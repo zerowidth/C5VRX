@@ -410,6 +410,7 @@ typedef struct {
     uint32_t ring;
     /* Per mille under 0.35 or over 2.1 times the mean power: off a carrier's ring, as garbage reads are. */
     uint32_t off_ring;
+    int mean[2];
 } quality_t;
 
 /* A lane sampled while the C5's bus is changing reads garbage where it crosses zero, since every bit turns
@@ -421,7 +422,7 @@ static quality_t quality(size_t samples)
     quality_t q = {0};
     size_t n = samples - STALE - 2;
     uint64_t power = 0;
-    int means[2];
+    int *means = q.mean;
     for (int lane = 0; lane < 2; ++lane) {
         int shift = lane * 8;
         int64_t sum = 0, sq = 0;
@@ -494,6 +495,7 @@ static bool settle_gain(void)
 
 /* Whether the last probe had a carrier to judge by; noise is a poorer guide. */
 static bool s_verified;
+static int s_dc[2];
 
 static bool mid_change(const quality_t *q)
 {
@@ -526,6 +528,8 @@ static bool pick_edge(bool clean[2])
     int e = clean[0] != clean[1] ? clean[1] : score[1] < score[0];
     s_edge = edges[e];
     s_verified = q[e].ring >= RING_MIN;
+    s_dc[0] = q[e].mean[0];
+    s_dc[1] = q[e].mean[1];
     say("per mille glitching on I and Q and off the ring: rise %lu %lu %lu, fall %lu %lu %lu; gain %d, RMS %lu%s: using %s%s\n",
         (unsigned long)q[0].glitch[0], (unsigned long)q[0].glitch[1], (unsigned long)q[0].off_ring,
         (unsigned long)q[1].glitch[0], (unsigned long)q[1].glitch[1], (unsigned long)q[1].off_ring, s_probe_gain,
@@ -627,6 +631,11 @@ bool iq_verified(void)
     return s_verified;
 }
 
+void iq_dc(float *i, float *q)
+{
+    *i = s_dc[0];
+    *q = s_dc[1];
+}
 
 const char *iq_channel(unsigned *mhz)
 {
