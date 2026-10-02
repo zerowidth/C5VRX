@@ -203,11 +203,12 @@ static uint32_t s_noise_lines;
 /* What luma_row needs to turn samples into pixel levels: for whole and half-sample line starts, the
  * vectors it takes (see luma.S), and its shift. Two copies, so a line never draws with half of a new one. */
 typedef struct {
-    int8_t k[2][9][16];
+    int8_t k[2][11][16];
     int shift;
 } __attribute__((aligned(16))) luma_t;
 static luma_t s_lumas[2];
 static const luma_t *volatile s_luma = &s_lumas[0];
+static bool s_soft = true;
 static uint8_t *s_frame, *s_prev;
 
 /* Per-field counters for the status line. */
@@ -416,9 +417,9 @@ static void set_maps(void)
     for (int k = 12; k >= 0; --k) {
         sum = (1632 << k) / span;
         shift = k;
-        if (sum <= 504) break;
+        if (sum <= 496) break;
     }
-    if (sum > 504) sum = 504;
+    if (sum > 496) sum = 496;
     /* Blanking, and the 128 levels that centre the result for the signed clamp, come off each sample in
      * whole units, and the rest, with the rounding, off the sum. */
     int bias = (128 << shift) - (shift ? 1 << (shift - 1) : 0);
@@ -430,15 +431,22 @@ static void set_maps(void)
         int q = (rest + (rest < 0 ? -k / 2 : k / 2)) / k;
         if (abs(q) <= 127 && abs(q * k - rest) < best) best = abs(q * k - rest), a = q, b = k;
     }
-    /* The sum of four samples nulls the subcarrier's dots out of luma. A line starting half a sample late
-     * is the mean of two such sums, which is five samples weighted 1 2 2 2 1. */
-    int w[2][5] = {{sum / 4, (sum + 2) / 4, (sum + 3) / 4, (sum + 1) / 4, 0}};
-    int ends = sum / 8, mid = sum - 2 * ends;
-    w[1][0] = w[1][4] = ends;
-    w[1][1] = mid / 3, w[1][2] = (mid + 2) / 3, w[1][3] = (mid + 1) / 3;
+    /* The sum of four samples nulls the subcarrier's dots out of luma, and a line starting half a sample
+     * late is the mean of two such sums. Smoothing 1 2 1 on top takes about 5 dB off the noise, which rises
+     * with frequency, and evens it out between the two kinds of line. */
+    static const int8_t kernels[2][2][7] = {
+        {{0, 1, 1, 1, 1, 0, 0}, {0, 1, 2, 2, 2, 1, 0}},
+        {{1, 3, 4, 4, 3, 1, 0}, {1, 4, 7, 8, 7, 4, 1}},
+    };
     for (int h = 0; h < 2; ++h) {
-        const int v[9] = {whole, w[h][1], w[h][2], w[h][3], w[h][4], a, b, w[h][0], 0x80};
-        for (int k = 0; k < 9; ++k) memset(m->k[h][k], v[k], 16);
+        const int8_t *kernel = kernels[s_soft][h];
+        int total = 0, w[7], given = 0;
+        for (int t = 0; t < 7; ++t) total += kernel[t];
+        for (int t = 0; t < 7; ++t) given += w[t] = sum * kernel[t] / total;
+        /* What rounding down left over goes to the middle. */
+        for (int t = 3; given < sum; t = t == 3 ? 2 : t == 2 ? 4 : 3) ++w[t], ++given;
+        const int v[11] = {whole, w[1], w[2], w[3], a, b, w[0], w[4], w[5], w[6], 0x80};
+        for (int k = 0; k < 11; ++k) memset(m->k[h][k], v[k], 16);
     }
     m->shift = shift;
     s_luma = m;
@@ -858,11 +866,11 @@ static void forget_old(void)
 
 void luma_row(const int8_t *s, uint8_t *dst, const uint64_t *uv, int n, const int8_t (*k)[16], int shift);
 
-/* A line's picture samples from one before the first, at a 16-byte boundary for luma_row. */
+/* A line's picture samples from two before the first, at a 16-byte boundary for luma_row. */
 static const int8_t *picture_samples(uint32_t l)
 {
     static int8_t copy[VIDEO_WIDTH + 32] __attribute__((aligned(16)));
-    uint32_t start = (l + PICTURE_START - 1) % HIST, n = VIDEO_WIDTH + 16;
+    uint32_t start = (l + PICTURE_START - 2) % HIST, n = VIDEO_WIDTH + 16;
     if (start % 16 == 0 && start + n <= HIST) return s_hist + start;
     uint32_t first = HIST - start < n ? HIST - start : n;
     memcpy(copy, s_hist + start, first);
@@ -1572,11 +1580,13 @@ void decode_command(int argc, char **argv)
         if (!s_agc) set_gain(atoi(argv[2]));
     } else if (strcmp(sub, "sat") == 0 && argc > 2) {
         s_saturation = atoi(argv[2]);
+    } else if (strcmp(sub, "soft") == 0 && argc > 2) {
+        s_soft = strcmp(argv[2], "off") != 0;
     } else if (strcmp(sub, "bench") == 0) {
         bench();
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | soft on|off | bench]\n");
     }
 }
