@@ -101,25 +101,26 @@ What that rules out:
 - Moving the lookup to the C5, which has `ADDCTI`: its PARLIO is 8 lanes wide, so it would see only 4 bits each of I and Q.
 - Anything after the lookup: the phase difference, the 4-sample sums and sync slicing all need an adder.
 
-What could still work is the lookup alone, with a smaller table, leaving the CPU to subtract. The lookup is the one step the CPU cannot vectorize, so with phase arriving in the ring the rest could become PIE vector operations. Two tables fit:
+What could still work is the lookup alone, with a smaller table, leaving the CPU to subtract. The lookup is the one step the CPU cannot vectorize, so with phase arriving in the ring the rest could become PIE vector operations. Three tables fit:
 
 - A single 2048×8 table indexed by 6 bits of I and 5 of Q, writing 8 bits per sample.
 - A bipartite pair in 1024×16, packed as the high and low byte of each word the way the C5's `fm.bsasm` shares one LUT between two tables: a coarse phase from the top 5 bits of I and Q, and a correction from the top 3 and low 2 bits of each. The P4 cannot add them, so it would write both bytes and the CPU would add.
+- A companded pair, also in 1024×16 (1280 bytes used). A 128-entry table per lane turns each of I and Q into a sign and a 5-bit log-spaced magnitude around its offset, and a 1024-entry table turns the two magnitudes into a 6-bit first-quadrant angle. It writes one byte per sample (the angle and both signs), and the CPU unfolds the quadrant. It takes three lookups per sample, and only the 256 per-lane entries change with the I/Q offset.
 
-Simulated back-porch noise in kHz for each table, against an exact demodulator. The model is a constant-envelope carrier with an I offset of 20 and noise set to the measured exact figure, and it reproduces the measured 6+6 results above (241 against 185 at RMS 19).
+Simulated back-porch noise in kHz for each table, against an exact demodulator, from [phase_table_sim.py](../p4usb/tools/phase_table_sim.py). The model is a constant-envelope carrier with an I offset of 20 and noise set to the measured exact figure, and it reproduces the measured 6+6 results above (241 against 185 at RMS 19).
 
-| I/Q RMS | Exact | 6+7 (in use, 16 KB) | 6+5 (2048×8) | Bipartite (1024×16) |
-|---|---|---|---|---|
-| 20 | 187 | 216 | 303 | 258 |
-| 30 | 175 | 189 | 251 | 198 |
-| 40 | 171 | 181 | 216 | 180 |
-| 60 | 168 | 173 | 190 | 172 |
-| 72 | 167 | 171 | 184 | 171 |
-| 90 | 167 | 170 | 178 | 170 |
+| I/Q RMS | Exact | 6+7 (in use, 16 KB) | 6+5 (2048×8) | Bipartite (1024×16) | Companded (1024×16) |
+|---|---|---|---|---|---|
+| 20 | 187 | 216 | 303 | 258 | 190 |
+| 30 | 175 | 189 | 251 | 198 | 182 |
+| 40 | 171 | 181 | 216 | 180 | 179 |
+| 60 | 168 | 173 | 190 | 172 | 176 |
+| 72 | 167 | 171 | 184 | 171 | 175 |
+| 90 | 167 | 170 | 178 | 170 | 174 |
 
-The bipartite pair matches the table in use across the gain control's range (RMS 40-72), and the single 6+5 table is 0.6 to 1.5 dB noisier there. Before either could be used, the hardware would have to show three things:
+The bipartite and companded pairs both come within 3% of the table in use across the gain control's range (RMS 40-72), and the companded pair is quieter than it below RMS 40, because log spacing keeps the phase error from growing as the signal shrinks. The single 6+5 table is 0.6 to 1.5 dB noisier in that range. Before any of them could be used, the hardware would have to show three things:
 
-- The BitScrambler runs on PARLIO RX through the AXI-GDMA, at two instructions per sample for the bipartite pair.
+- The BitScrambler runs on PARLIO RX through the AXI-GDMA, at two instructions per sample for the bipartite pair or three for the companded one (40 million a second, the rate the C5's runs at).
 - The LUT can be rewritten while running, since the table is rebuilt around the I/Q offset twice a second.
 - The soft-delimiter EOF and the decoder's reading of the DMA write position still behave with the BitScrambler in the path, and no DMA boundary resets its state.
 
