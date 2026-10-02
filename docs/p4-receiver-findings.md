@@ -105,7 +105,6 @@ Still to do:
 - An odd field's first broad pulse starts half-way through line 3 and an even field's at the start of line 4, which the line clock has only just begun. Counting both as line 3 drew one field two rows too high, so static text alternated between positions 3 rows apart at 60 fps and every horizontal edge looked doubled. Counting the even field from line 4, and wrapping an even field after 263 lines and an odd one after 262, puts the fields 1 row apart and cut vertical corrections from about one per 10 fields to a handful per thousand.
 
 - With a camera attached, stretches of the picture stay below the sync slicer for over 18 µs several times a field, which read as vsync and reset the line count before the field ended. Fields then stopped for seconds and the camera fell back to the test pattern. A vertical flywheel fixes it: a vsync counts only within 6 lines of where the count expects one, unless 3 fields in a row have passed without one there. In 1,545 fields it ignored 386 false broad pulses and made one correction.
-- `decode tap` dumps can stall part way while the camera streams, and the console then stops answering until the P4 is reset.
 
 ## Color
 
@@ -147,7 +146,7 @@ Still to do:
 
 ## The P4's BitScrambler
 
-The BitScrambler can do the phase lookup in the receive path, with a smaller table than the CPU's, and nothing more. `decode bs on` decodes that way: core 1's load falls from 83% to 41% at the same line lock (see [In the decoder](#in-the-decoder)). It is off by default until the picture has been compared by eye and by noise. The BitScrambler cannot hold the 16 KB table the CPU uses, and it cannot do the arithmetic that follows the lookup. The limits below are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
+The BitScrambler does the phase lookup in the receive path, with a smaller table than a CPU can use, and nothing more. The decoder runs that way: core 1's load fell from 83% to 41% at the same line lock (see [In the decoder](#in-the-decoder)). The 16 KB table the CPU looked up before, and the `decode bs on|off` switch between the two, have been removed, so the comparisons below against the CPU's table can no longer be run. The BitScrambler cannot hold that 16 KB table, and it cannot do the arithmetic that follows the lookup. The limits below are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
 
 Its limits:
 
@@ -200,31 +199,33 @@ The bipartite and companded pairs both come within 3% of the table in use across
 
 ### In the decoder
 
-`decode bs on` switches the running decoder to `bs_phase.bsasm`, and `decode bs off` back to the CPU's table.
+The decoder runs `bs_phase.bsasm` on PARLIO RX.
 
 - The program takes four cycles a sample (53 million instructions a second). Three are lookups: I's lane, Q's lane, then the pair. The fourth is a branch that swaps the two magnitude codes in the odd quadrants, so the table's angle is always measured on from the start of the quadrant and the output byte is the whole phase, 256 to a turn, with no arithmetic.
 - It writes 16 bits a sample: the phase, and a byte for the gain control holding I's magnitude code and both clipped flags.
-- The CPU's part (`demod.S`) is PIE: split the two bytes, subtract each phase from the one before, and sum each four differences for the sync detector. It checks itself against a C version at each start.
+- The CPU's part (`demod.S`) is PIE: split the two bytes, subtract each phase from the one before, and sum each four differences for the sync detector. It matched a C version on every test at each start while both existed.
 - On one steady signal, 40 s each way: 253.4 of 262 lines locked at 83.5% of core 1 with the CPU's table, and 252.5 at 40.7% with the BitScrambler, with no vertical corrections against one. Core 0 was unchanged at 76-77%, and sync tip, blanking and RMS read the same.
 - `decode` reports the sync tip's noise (its scatter about each line's own mean). The simulation puts the two tables 2% apart there. An offset error adds more: d units off at an RMS of r adds a ripple of d/r times the carrier's frequency, which is largest at the sync tip.
 - I/Q power comes from I's magnitude code alone (doubled), and the offset from the balance of the sign bits, since a carrier circling its centre spends half its time on each side. It settled within a unit of the CPU's mean-based estimate.
 - A new offset means a new table, which stops the receive for 133 µs. The decoder waits for the field's last 2 lines or its first 4, reads what the DMA wrote meanwhile, then lets the line clock take the next hsync and moves the line count on by the lines that passed. It first waited for lines 8 to 14, but it only checks after working through a batch of nodes, so the gap ran into the top of the picture.
 - Each rewrite at first cost about 100 lines, not 3: the next vsync fell outside its window and was ignored, and vertical sync was lost for a few fields. The cause was the PARLIO driver's warning at each start (see [PARLIO RX and DMA on the P4](#parlio-rx-and-dma-on-the-p4)), which is now muted.
-- The table is rewritten when the offset, smoothed over about 4 s, has moved 1 unit (the CPU's follows to a quarter). One half second's reading wanders a unit or two on a weak signal, and unsmoothed it rewrote the table about once a second there. On a weak signal (220 of 262 lines) that is 6 to 10 rewrites in 40 s.
+- The table is rewritten when the offset, smoothed over about 4 s, has moved 1 unit (the CPU's followed to a quarter). One half second's reading wanders a unit or two on a weak signal, and unsmoothed it rewrote the table about once a second there. On a weak signal (220 of 262 lines) that is 6 to 10 rewrites in 40 s.
 - On that weak signal, 40 s each way, twice: 217.3 and 217.6 lines locked with the BitScrambler against 216.6 and 214.4 with the CPU's table, the same number of fields, no overruns, and sync tip noise of 994 and 943 kHz against 982 and 1005. With the table 2 units off and unsmoothed, before these fixes, a strong signal's sync tip noise was 122 kHz against the CPU table's 106; that has not been measured again at 1 unit.
 - At a start the DMA still names a node of the last receive until the first new one is done, so the decoder read a ring of old data as new. As BitScrambler bytes that was garbage: it sent the offset as far as -29 and stepped the gain down 2, and once left the decoder stopped. Each start now waits for the DMA to move, and clears the gain control's sums.
 - The Q lane's sign can stay the same at every word the lane check looks at, which made both bytes look marked and dropped about one node a second until an ambiguous read fell back to the last known order.
 - Internal RAM is short: the decoder's ring needs a 96,768-byte block, and 5 KB of new static tables left the largest at 94,208, so the decoder failed to start at boot. The BitScrambler's tables are in PSRAM.
 
 - `table_compare.py` demodulates one raw capture with a model of each table, against an exact demodulator. On a capture through a fade, with a quarter of it clipped: at an amplitude above 64 the CPU table's error was 59 kHz and the BitScrambler's 84; from 32 to 64, 97 and 92; from 16 to 32, 159 and 102. With its offset 1 unit out the BitScrambler's was 94, 127 and 162, and 3 units out 113, 203 and 225. So the table itself is about even, and an offset that lags is what costs.
-- The offset moves about half a unit a gain step, so a fade that steps the gain left the table several units out for seconds. The decoder now remembers the offset each gain settled at (from either mode) and rewrites the table straight to it when the gain steps, but only when the table is a unit or more from it.
+- The offset moves about half a unit a gain step, so a fade that steps the gain left the table several units out for seconds. The decoder now remembers the offset each gain settled at and rewrites the table straight to it when the gain steps, but only when the table is a unit or more from it.
 - On a moving transmitter that scheme rewrote the table 24 times in 32 s. Smoothing over one pass after a gain step swung the offset 3 units either way (4.0 to 7.0 to 1.25 on I at one gain), and three of the rewrites left 23 to 40 lines undrawn. The reading is now always smoothed over eight passes. This has not been judged on a moving transmitter yet.
 - The white and black lines seen across the picture with the BitScrambler were mostly not these rewrites but nodes read before the DMA had finished them (see PARLIO RX and DMA).
 - The tables themselves are not the difference. At fixed low gains the BitScrambler's gave less sync tip noise than the CPU's (250 against 288 kHz at RMS 12, 403 against 533 at RMS 8, 532 against 686 at RMS 4), and a capture scaled down to RMS 6, 3 and 1.5 with noise added drew alike through both.
 
+- With the CPU's table gone, the first table is built around the mean of the start's raw probe capture, which is taken at the gain the decoder starts with. Starting from zero instead, the sign balance closes an eighth of the error each half second and rewrites the table each time. Three starts from the probe's offset needed no rewrite in the 20 to 30 s after, at 40.8 to 41.0% of core 1.
+- By eye on a moving transmitter the BitScrambler's picture was good enough to drop the CPU's table.
+
 Not done yet:
 
-- Judging `decode bs on` against `off` by eye through fades, now that the C5's start no longer decides how noisy either is.
 - Using the freed half of core 1. Drawing is on core 0 at 78%, so a stage has to move across, as chroma was split.
 
 What the offload was estimated to buy, before it was measured:
