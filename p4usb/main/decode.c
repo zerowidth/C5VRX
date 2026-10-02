@@ -6,12 +6,14 @@
 #include <string.h>
 #include <strings.h>
 
+#include "driver/bitscrambler.h"
 #include "driver/parlio_rx.h"
 #include "esp_async_memcpy.h"
 #include "esp_cache.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_private/gdma.h"
+#include "hal/bitscrambler_peri_select.h"
 #include "hal/cache_ll.h"
 #include "hal/dma_types.h"
 #include "esp_timer.h"
@@ -137,6 +139,28 @@ static int s_gain = 60;
 static bool s_agc = true;
 static int s_rms, s_clip_permille;
 
+/* With `decode bs on` the BitScrambler looks each sample's phase up (bs_phase.bsasm), and the ring holds
+ * its two bytes a sample instead of raw words: the folded phase, then a magnitude code and clipped flags. */
+BITSCRAMBLER_PROGRAM(bs_phase, "bs_phase");
+#define NODES (RING_BYTES / NODE_BYTES)
+/* How far the table's offset may sit from the signal's before the table is rewritten, which stops the
+ * receive for a moment. The CPU's table follows to a quarter of a step, since rebuilding it costs nothing. */
+#define BS_DC_STEP 2.0f
+/* Field lines between which a rewrite's gap falls after the broad pulses and before the picture. */
+#define BS_RELOAD_FROM 8
+#define BS_RELOAD_TO 14
+static bool s_bs_want, s_bs;
+static bool s_bs_scalar;
+static bitscrambler_handle_t s_bs_handle;
+static uint16_t *s_bs_lut;
+static float s_bs_dc_i, s_bs_dc_q;
+/* Twice the square of each magnitude code's centre: I/Q power from I's code alone. */
+static uint32_t s_bs_power[32];
+static const dma_descriptor_align8_t *s_desc[NODES];
+static volatile int32_t s_neg_i, s_neg_q;
+static volatile bool s_bs_pending;
+static uint32_t s_bs_short, s_bs_mixed, s_bs_rewrites, s_bs_reload_us;
+
 /* Demodulator and sync state, owned by the decode task. */
 /* Demodulated samples; the sync detector reads them four at a time. */
 static int8_t s_hist[HIST] __attribute__((aligned(16)));
@@ -256,9 +280,50 @@ static void set_gain(int gain)
     if (c5_request(cmd, reply, sizeof reply, 1000)) s_gain = gain;
 }
 
+static void steer_gain(void)
+{
+    if (!s_agc) return;
+    int gain = s_gain;
+    if (s_clip_permille > CLIP_PERMILLE_HEAVY) gain -= GAIN_STEP_HEAVY;
+    else if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
+    else if (s_rms < RMS_LOW) gain += GAIN_STEP;
+    gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
+    if (gain != s_gain) set_gain(gain);
+}
+
+/* The BitScrambler's bytes carry no raw I/Q. Power comes from I's magnitude code, and the offset from the
+ * balance of the sign bits: a carrier circling its centre spends half its time on each side. */
+static void control_bs(void)
+{
+    int32_t n = s_dc_n;
+    if (n < 4096) return;
+    float power = (float)s_dc_power / n, neg_i = (float)s_neg_i / n, neg_q = (float)s_neg_q / n;
+    uint32_t clipped = s_dc_clipped;
+    s_dc_n = s_neg_i = s_neg_q = 0;
+    s_dc_power = s_dc_clipped = 0;
+    s_rms = (int)lrintf(sqrtf(power));
+    s_clip_permille = clipped * 1000 / n;
+    steer_gain();
+
+    /* How far the table's offset sits above the signal's centre, from the excess of negative signs. */
+    float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
+    if (s_bs_pending || s_rms < 4 || (fabsf(di) < BS_DC_STEP && fabsf(dq) < BS_DC_STEP)) return;
+    s_bs_dc_i = fminf(fmaxf(s_bs_dc_i - 0.7f * di, -64), 64);
+    s_bs_dc_q = fminf(fmaxf(s_bs_dc_q - 0.7f * dq, -64), 64);
+    iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
+    /* The decode task loads it, in the vertical interval. */
+    s_bs_pending = true;
+    s_lut_dc_i = lrintf(s_bs_dc_i * 4);
+    s_lut_dc_q = lrintf(s_bs_dc_q * 4);
+}
+
 /* Twice a second: re-center the phase table on the I/Q DC offset and steer the C5's gain. */
 static void control(void)
 {
+    if (s_bs) {
+        control_bs();
+        return;
+    }
     int32_t n = s_dc_n;
     if (n < 4096) return;
     float dc_i = (float)s_dc_sum_i / n, dc_q = (float)s_dc_sum_q / n;
@@ -268,14 +333,7 @@ static void control(void)
     s_dc_power = s_dc_clipped = 0;
     s_rms = (int)lrintf(sqrtf(fmaxf(power - dc_i * dc_i - dc_q * dc_q, 0)));
     s_clip_permille = clipped * 1000 / n;
-    if (s_agc) {
-        int gain = s_gain;
-        if (s_clip_permille > CLIP_PERMILLE_HEAVY) gain -= GAIN_STEP_HEAVY;
-        else if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
-        else if (s_rms < RMS_LOW) gain += GAIN_STEP;
-        gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
-        if (gain != s_gain) set_gain(gain);
-    }
+    steer_gain();
 
     /* Quarter-LSB steps, so small drift doesn't rebuild the table every time. */
     int qi = lrintf(dc_i * 4), qq = lrintf(dc_q * 4);
@@ -985,6 +1043,140 @@ static void process(const uint16_t *w, uint32_t words)
     if (!s_skip_detect) detect(n);
 }
 
+void bs_demod(const uint8_t *src, int8_t *dst, int16_t *blocks, uint32_t n, uint8_t *prev, int odd);
+
+/* What bs_demod does, to check it against. */
+static void bs_demod_c(const uint8_t *src, int8_t *dst, int16_t *blocks, uint32_t n, uint8_t *prev, int odd)
+{
+    uint8_t last = *prev;
+    for (uint32_t k = 0; k < 16 * n; ++k) {
+        uint8_t phase = src[2 * k + odd];
+        dst[k] = (int8_t)(phase - last);
+        last = phase;
+        if (k % 4 == 3) blocks[k / 4] = dst[k] + dst[k - 1] + dst[k - 2] + dst[k - 3];
+    }
+    *prev = last;
+}
+
+static bool bs_demod_ok(void)
+{
+    static uint8_t src[2][128] __attribute__((aligned(16)));
+    static int8_t dst[2][64] __attribute__((aligned(16)));
+    static int16_t blocks[2][16];
+    for (int k = 0; k < 128; ++k) src[0][k] = src[1][k] = (uint8_t)(k * 151 + (k * k >> 3) + 77 * (k % 5));
+    for (int odd = 0; odd < 2; ++odd) {
+        uint8_t prev[2] = {200, 200};
+        bs_demod_c(src[0], dst[0], blocks[0], 4, &prev[0], odd);
+        bs_demod(src[1], dst[1], blocks[1], 4, &prev[1], odd);
+        if (memcmp(dst[0], dst[1], 64) || memcmp(blocks[0], blocks[1], 32) || prev[0] != prev[1]) return false;
+    }
+    return true;
+}
+
+/* Which byte of each word has its top bit always set, over 16 words spread across a run: 1 for the even
+ * addresses, 2 for the odd. The other byte's top bit is Q's sign, which turns with the carrier. */
+static int marked_lanes(const uint8_t *b, uint32_t words)
+{
+    int lanes = 3;
+    for (uint32_t k = 0; k < words; k += words / 16) lanes &= (b[2 * k] >> 7) | (b[2 * k + 1] >> 7) << 1;
+    return lanes;
+}
+
+/* The same for the BitScrambler's two bytes a sample; bytes is what the DMA wrote of a node. The marked
+ * byte is on the even addresses from the first EOF after a start, and on the odd ones before it and from
+ * each halt to the next EOF. */
+static void process_bs(const uint8_t *b, uint32_t bytes)
+{
+    uint32_t words = (bytes / 2) & ~15u;
+    if (!words) return;
+    /* Q can keep one sign at every word looked at, which leaves both bytes looking marked. */
+    static int lane = 1;
+    int first = marked_lanes(b, words / 2), last = marked_lanes(b + words, words / 2);
+    if (first == 3) first = last == 3 ? lane : last;
+    if (last == 3) last = first;
+    if (first != last || (first != 1 && first != 2)) {
+        ++s_bs_mixed;
+        return;
+    }
+    lane = first;
+    const bool odd = first == 1;
+    uint32_t power = 0, clipped = 0, neg_i = 0, neg_q = 0;
+    for (uint32_t k = 0; k < DC_WORDS && k < words - 1; ++k) {
+        /* Past the marked byte, the phase that follows belongs to the next sample, which is as good. */
+        uint32_t phase = b[2 * k + odd], info = b[2 * k + 1 + odd];
+        power += s_bs_power[info & 31];
+        clipped += (info & 0x60) != 0;
+        neg_i += (phase >> 6 ^ phase >> 7) & 1;
+        neg_q += phase >> 7;
+    }
+    s_dc_power += power;
+    s_dc_clipped += clipped;
+    s_neg_i += neg_i;
+    s_neg_q += neg_q;
+    s_dc_n += DC_WORDS;
+
+    uint32_t n = s_n;
+    for (uint32_t done = 0; done < words;) {
+        uint32_t at = n % HIST, run = words - done < HIST - at ? words - done : HIST - at;
+        (s_bs_scalar ? bs_demod_c : bs_demod)(b + 2 * done, s_hist + at, s_blocks + at / 4, run / 16, &s_prev_phase, odd);
+        done += run;
+        n += run;
+    }
+    __atomic_store_n(&s_n, n, __ATOMIC_RELEASE);
+    if (!s_skip_detect) detect(n);
+}
+
+/* The driver's descriptor for each node of the ring, found by walking its circular list. */
+static void map_descriptors(void)
+{
+    const dma_descriptor_align8_t *d = (const dma_descriptor_align8_t *)AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
+    for (int k = 0; k < NODES && d; ++k) {
+        const volatile dma_descriptor_align8_t *u = UNCACHED(d);
+        uint32_t off = (uint32_t)u->buffer - (uint32_t)s_ring;
+        if (off < RING_BYTES && off % NODE_BYTES == 0) s_desc[off / NODE_BYTES] = d;
+        d = u->next;
+    }
+}
+
+/* An EOF that reaches the DMA mid-node ends the node early. Behind the BitScrambler that happens at the
+ * first EOF after each start or halt, since the EOF overtakes the bytes still inside it. */
+static void process_node(uint32_t offset)
+{
+    const dma_descriptor_align8_t *d = s_desc[offset / NODE_BYTES];
+    uint32_t len = d ? ((const volatile dma_descriptor_align8_t *)UNCACHED(d))->dw0.length : NODE_BYTES;
+    if (len == 0 || len > NODE_BYTES) len = NODE_BYTES;
+    if (len < NODE_BYTES) ++s_bs_short;
+    process_bs((const uint8_t *)s_ring + offset, len);
+}
+
+/* The LUT takes writes only while the program is halted, and a halt alone leaves the DMA racing through
+ * nodes for milliseconds afterwards. So the receive stops and starts again around the write, as at a
+ * start, and the line clock takes the next hsync it sees. */
+static void bs_reload(void)
+{
+    int64_t t0 = esp_timer_get_time();
+    uint32_t stale = AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
+    parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, false);
+    parlio_rx_unit_disable(s_rx);
+    bitscrambler_reset(s_bs_handle);
+    bitscrambler_load_lut(s_bs_handle, s_bs_lut, 512 * sizeof *s_bs_lut);
+    bitscrambler_start(s_bs_handle);
+    parlio_rx_unit_enable(s_rx, true);
+    const parlio_receive_config_t rcfg = {.delimiter = s_delim, .flags.partial_rx_en = 1};
+    parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg);
+    parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true);
+    /* Until a node of the new receive is done, the DMA still names the old one. */
+    while (AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val == stale && esp_timer_get_time() - t0 < 1000) {
+    }
+    memset(s_desc, 0, sizeof s_desc);
+    s_read = dma_offset();
+    s_read_us = esp_timer_get_time();
+    s_bs_reload_us = s_read_us - t0;
+    s_missed = LOST_AFTER_LINES;
+    ++s_bs_rewrites;
+    s_bs_pending = false;
+}
+
 /* Rebuilding the table takes a couple of milliseconds, too long to hold up the decode task. */
 static void control_task(void *arg)
 {
@@ -1051,10 +1243,17 @@ static void decode_task(void *arg)
                 uint32_t stop = end > s_read ? end : RING_BYTES;
                 uint8_t *p = (uint8_t *)s_ring + s_read;
                 esp_cache_msync(p, stop - s_read, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-                process((const uint16_t *)p, (stop - s_read) / 2);
+                if (s_bs) {
+                    if (!s_desc[0]) map_descriptors();
+                    for (uint32_t o = s_read; o < stop; o += NODE_BYTES) process_node(o);
+                } else {
+                    process((const uint16_t *)p, (stop - s_read) / 2);
+                }
                 s_read = stop % RING_BYTES;
             }
             s_read_us = now;
+            bool blank = s_vline >= BS_RELOAD_FROM && s_vline <= BS_RELOAD_TO;
+            if (s_bs && s_bs_pending && (blank || s_missed >= LOST_AFTER_LINES)) bs_reload();
         }
         account(&s_demod_load, t0);
     }
@@ -1075,6 +1274,30 @@ void decode_stop(void)
     parlio_del_rx_unit(s_rx);
     s_rx = NULL;
     s_delim = NULL;
+    if (s_bs_handle) {
+        bitscrambler_disable(s_bs_handle);
+        bitscrambler_free(s_bs_handle);
+        s_bs_handle = NULL;
+    }
+}
+
+static esp_err_t start_bs(void)
+{
+    s_bs_scalar = !bs_demod_ok();
+    for (int c = 0; c < 32; ++c) s_bs_power[c] = (uint32_t)lrintf(2 * iq_bs_code_centre(c) * iq_bs_code_centre(c));
+    /* In PSRAM: only the control task touches it, and internal RAM is short. */
+    if (!s_bs_lut) s_bs_lut = heap_caps_malloc(1024 * sizeof *s_bs_lut, MALLOC_CAP_SPIRAM);
+    if (!s_bs_lut) return ESP_ERR_NO_MEM;
+    iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
+    memset(s_desc, 0, sizeof s_desc);
+    const bitscrambler_config_t cfg = {.dir = BITSCRAMBLER_DIR_RX, .attach_to = SOC_BITSCRAMBLER_ATTACH_PARL_IO};
+    esp_err_t err = bitscrambler_new(&cfg, &s_bs_handle);
+    if (err == ESP_OK) err = bitscrambler_enable(s_bs_handle);
+    if (err == ESP_OK) err = bitscrambler_load_program(s_bs_handle, bs_phase);
+    if (err == ESP_OK) err = bitscrambler_load_lut(s_bs_handle, s_bs_lut, 1024 * sizeof *s_bs_lut);
+    if (err == ESP_OK) err = bitscrambler_reset(s_bs_handle);
+    if (err == ESP_OK) err = bitscrambler_start(s_bs_handle);
+    return err;
 }
 
 static esp_err_t start_rx(void)
@@ -1089,6 +1312,8 @@ static esp_err_t start_rx(void)
     if (err != ESP_OK) return err;
     if ((err = parlio_new_rx_soft_delimiter(&dcfg, &s_delim)) != ESP_OK) return err;
     if ((err = parlio_rx_unit_register_event_callbacks(s_rx, &cbs, NULL)) != ESP_OK) return err;
+    s_bs = s_bs_want;
+    if (s_bs && (err = start_bs()) != ESP_OK) return err;
     if ((err = parlio_rx_unit_enable(s_rx, true)) != ESP_OK) return err;
     const parlio_receive_config_t rcfg = {.delimiter = s_delim, .flags.partial_rx_en = 1};
     if ((err = parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg)) != ESP_OK) return err;
@@ -1158,6 +1383,11 @@ static void status(void)
     say("C5: %s\n", c5_request("status", reply, sizeof reply, 500) ? reply + 3 : reply);
     say("sync tip %d kHz, blanking %d kHz, I/Q DC %d.%02d %d.%02d\n", s_tip * KHZ_PER_UNIT / 16, s_blank * KHZ_PER_UNIT / 16,
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
+    if (s_bs) {
+        if (s_bs_scalar) say("the PIE demodulator failed its check; using the C one\n");
+        say("phase from the BitScrambler: %lu table rewrites (the last took %lu us), %lu short nodes, %lu nodes dropped for mixed bytes\n",
+            (unsigned long)s_bs_rewrites, (unsigned long)s_bs_reload_us, (unsigned long)s_bs_short, (unsigned long)s_bs_mixed);
+    }
     say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
     say("draw: %lu stale, %lu queue full, max lag %lu samples\n", (unsigned long)s_draw_dropped, (unsigned long)s_draw_full, (unsigned long)s_draw_max_lag);
     say("longest field hand-off %lu us, longest wait with 8+ lines queued %lu us, longest run %lu us\n",
@@ -1273,6 +1503,11 @@ void decode_command(int argc, char **argv)
         if (!s_agc) set_gain(atoi(argv[2]));
     } else if (strcmp(sub, "sat") == 0 && argc > 2) {
         s_saturation = atoi(argv[2]);
+    } else if (strcmp(sub, "bs") == 0 && argc > 2) {
+        bool was = s_running;
+        decode_stop();
+        s_bs_want = strcmp(argv[2], "on") == 0;
+        if (was) start_rx();
     } else if (strcmp(sub, "rx") == 0) {
         /* The ring reader alone, on whatever the C5 is already sending (for example its link counter). */
         decode_stop();
@@ -1285,6 +1520,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | rx | tap | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | bs on|off | rx | tap | bench]\n");
     }
 }

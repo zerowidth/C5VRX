@@ -59,15 +59,17 @@ static bitscrambler_state_t s_bs_state;
 BITSCRAMBLER_PROGRAM(bs_pass, "bs_pass");
 BITSCRAMBLER_PROGRAM(bs_half, "bs_half");
 BITSCRAMBLER_PROGRAM(bs_phase_check, "bs_phase_check");
+BITSCRAMBLER_PROGRAM(bs_phase, "bs_phase");
 
-/* The companded phase table bs_phase.bsasm looks up: 32 log-spaced magnitude codes a lane. */
+/* The companded phase table bs_phase.bsasm looks up (its layout is there): 32 log-spaced magnitude codes a lane. */
 #define BS_CODES 32
 #define BS_KNEE 6.0f
 #define BS_MAG_MAX 160.0f
-static uint16_t s_bs_lut[1024];
+/* In PSRAM: internal RAM is short by the time the decoder allocates its ring. */
+static uint16_t *s_bs_lut;
 static bool s_load_lut;
 /* The lane tables for a second offset, written over the first while a capture runs, for `iq bs relut`. */
-static uint16_t s_bs_lut2[256];
+static uint16_t *s_bs_lut2;
 static bool s_relut;
 static uint32_t s_relut_cycles;
 
@@ -81,26 +83,35 @@ static uint8_t bs_lane_entry(int bits, float dc)
 {
     float v = 2 * ((int8_t)(bits << 1) >> 1) + 1 - dc;
     int code = (int)(bs_code_scale() * log2f(1 + fabsf(v) / BS_KNEE));
-    return (code >= BS_CODES ? BS_CODES - 1 : code) | (v < 0 ? 0x20 : 0);
+    int raw = 2 * ((int8_t)(bits << 1) >> 1) + 1;
+    return (code >= BS_CODES ? BS_CODES - 1 : code) | (v < 0 ? 0x20 : 0) | (raw >= 125 || raw <= -125 ? 0x40 : 0);
 }
 
-static float bs_code_centre(int code)
+float iq_bs_code_centre(int code)
 {
     float lo = BS_KNEE * (exp2f(code / bs_code_scale()) - 1), hi = BS_KNEE * (exp2f((code + 1) / bs_code_scale()) - 1);
     return (lo + hi) / 2;
 }
 
+void iq_bs_build_lut(uint16_t *lut, float dc_i, float dc_q)
+{
+    for (int k = 0; k < 1024; ++k) {
+        int angle = (int)lrintf(atan2f(iq_bs_code_centre(k & 31), iq_bs_code_centre(k >> 5)) * (float)(64 / M_PI_2));
+        lut[k] = (angle > 63 ? 63 : angle) << 8;
+    }
+    /* Q's table comes twice, for I positive and negative: bit 5 is set where the signs differ (the odd
+     * quadrants) and bit 7 is Q's sign. */
+    for (int k = 0; k < 128; ++k) {
+        uint8_t q = bs_lane_entry(k, dc_q), neg = q & 0x20;
+        lut[k] |= bs_lane_entry(k, dc_i);
+        lut[128 + k] |= q | neg << 2;
+        lut[384 + k] |= (q ^ 0x20) | neg << 2;
+    }
+}
+
 static void build_bs_lut(float dc_i, float dc_q)
 {
-    memset(s_bs_lut, 0, sizeof s_bs_lut);
-    for (int k = 0; k < 1024; ++k) {
-        int angle = (int)lrintf(atan2f(bs_code_centre(k & 31), bs_code_centre(k >> 5)) * (float)(64 / M_PI_2));
-        s_bs_lut[k] = (angle > 63 ? 63 : angle) << 8;
-    }
-    for (int k = 0; k < 128; ++k) {
-        s_bs_lut[k] |= bs_lane_entry(k, dc_i);
-        s_bs_lut[128 + k] |= bs_lane_entry(k, dc_q);
-    }
+    iq_bs_build_lut(s_bs_lut, dc_i, dc_q);
 }
 
 static bool IRAM_ATTR on_partial(parlio_rx_unit_handle_t rx, const parlio_rx_event_data_t *e, void *arg)
@@ -166,7 +177,7 @@ static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edg
         err = bitscrambler_new(&bcfg, &bs);
         if (err == ESP_OK) err = bitscrambler_enable(bs);
         if (err == ESP_OK) err = bitscrambler_load_program(bs, s_program);
-        if (err == ESP_OK && s_load_lut) err = bitscrambler_load_lut(bs, s_bs_lut, sizeof s_bs_lut);
+        if (err == ESP_OK && s_load_lut) err = bitscrambler_load_lut(bs, s_bs_lut, 1024 * sizeof *s_bs_lut);
         if (err == ESP_OK) err = bitscrambler_reset(bs);
         if (err == ESP_OK) err = bitscrambler_start(bs);
     }
@@ -181,7 +192,7 @@ static esp_err_t capture(uint16_t *buf, size_t samples, parlio_sample_edge_t edg
              * width the program reads it at. */
             uint32_t t0 = esp_cpu_get_cycle_count();
             bitscrambler_reset(bs);
-            bitscrambler_load_lut(bs, s_bs_lut2, sizeof s_bs_lut2);
+            bitscrambler_load_lut(bs, s_bs_lut2, 256 * sizeof *s_bs_lut2);
             bitscrambler_start(bs);
             s_relut_cycles = esp_cpu_get_cycle_count() - t0;
         }
@@ -310,22 +321,59 @@ static void phase_check(size_t bytes, float dc_i, float dc_q)
     }
 }
 
+/* Where bs_phase's marked byte changes lane, which is where the DMA's buffer has a hole. */
+static void phase_frames(size_t bytes)
+{
+    const uint8_t *b = (const uint8_t *)s_buf;
+    int lane = -1, changes = 0;
+    say("marker lane by byte offset:");
+    for (size_t n = SKIP; n + 64 <= bytes; n += 2) {
+        int odd = 0, even = 0;
+        for (int k = 0; k < 64; k += 2) {
+            even += b[n + k] >> 7;
+            odd += b[n + k + 1] >> 7;
+        }
+        int now = odd == 32 && even < 32 ? 1 : even == 32 && odd < 32 ? 0 : -1;
+        if (now >= 0 && now != lane) {
+            if (changes++ < 12) say(" %u:%d", (unsigned)n, now);
+            lane = now;
+        }
+    }
+    say(", %d changes\n", changes);
+}
+
 static void bs_capture(const char *name, size_t samples, float dc_i, float dc_q)
 {
     static const char *const STATES[] = {"idle", "run", "wait", "paused", "unknown"};
     bool half = strcmp(name, "half") == 0, relut = strcmp(name, "relut") == 0, check = relut || strcmp(name, "check") == 0;
+    bool phase = strncmp(name, "phase", 5) == 0;
+    if (phase) {
+        relut = name[5] == 'h';
+        s_program = bs_phase;
+        s_load_lut = true;
+        build_bs_lut(dc_i + 24, dc_q - 16);
+        memcpy(s_bs_lut2, s_bs_lut, 256 * sizeof *s_bs_lut2);
+        build_bs_lut(dc_i, dc_q);
+        s_relut = relut;
+        esp_err_t err = capture(s_psram, samples, s_edge);
+        s_program = NULL;
+        s_load_lut = s_relut = false;
+        say("bitscrambler %s: capture %s, DMA wrote %u bytes\n", name, esp_err_to_name(err), (unsigned)s_got);
+        if (err == ESP_OK) phase_frames(samples * 2);
+        return;
+    }
     if (!half && !check && strcmp(name, "pass") != 0) {
-        say("iq bs pass|half|check|relut [samples [dc_i dc_q]]\n");
+        say("iq bs pass|half|check|relut|phase [samples [dc_i dc_q]]\n");
         return;
     }
     s_program = half ? bs_half : check ? bs_phase_check : bs_pass;
     s_load_lut = check;
     if (relut) {
         build_bs_lut(dc_i + 24, dc_q - 16);
-        memcpy(s_bs_lut2, s_bs_lut, sizeof s_bs_lut2);
+        memcpy(s_bs_lut2, s_bs_lut, 256 * sizeof *s_bs_lut2);
     }
     if (check) build_bs_lut(dc_i, dc_q);
-    if (!relut) memcpy(s_bs_lut2, s_bs_lut, sizeof s_bs_lut2);
+    if (!relut) memcpy(s_bs_lut2, s_bs_lut, 256 * sizeof *s_bs_lut2);
     s_relut = relut;
     esp_err_t err = capture(s_psram, samples, s_edge);
     s_program = NULL;
@@ -376,7 +424,9 @@ static bool prepare(void)
     if (!s_psram) {
         s_psram = heap_caps_aligned_calloc(128, 1, CAPTURE_BYTES + PSRAM_MARGIN_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
         s_full = xSemaphoreCreateBinary();
-        if (!s_psram) {
+        s_bs_lut = heap_caps_malloc(1280 * sizeof *s_bs_lut, MALLOC_CAP_SPIRAM);
+        s_bs_lut2 = s_bs_lut ? s_bs_lut + 1024 : NULL;
+        if (!s_psram || !s_bs_lut) {
             say("iq: no memory\n");
             return false;
         }
@@ -461,6 +511,6 @@ void iq_command(int argc, char **argv)
         if (err == ESP_OK) stats();
         else say("iq: capture failed, %s\n", esp_err_to_name(err));
     } else {
-        say("iq [samples | sram | bs pass|half|check|relut [samples [dc_i dc_q]] | start [channel [every]] | edge | dump]\n");
+        say("iq [samples | sram | bs pass|half|check|relut|phase [samples [dc_i dc_q]] | start [channel [every]] | edge | dump]\n");
     }
 }
