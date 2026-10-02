@@ -1,6 +1,6 @@
 # P4 receiver findings
 
-What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exporting MODEM_DIAG I/Q to the P4-Pico, which demodulates FM, decodes NTSC and serves a UVC camera. The build itself is described in [P4 receiver plan](p4-receiver-plan.md). Numbers are from one transmitter on R3 (5732 MHz) on the bench unless noted.
+What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exporting MODEM_DIAG I/Q to the P4-Pico, which demodulates FM, decodes NTSC and serves a UVC camera. The build itself is described in [P4 receiver plan](p4-receiver-plan.md). Numbers are from one transmitter on R3 (5732 MHz) on the bench unless noted. Sections follow the signal path, from the C5's I/Q through demodulation, timing and color to the P4's own limits and USB.
 
 ## The C5's I/Q
 
@@ -31,7 +31,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - One unit of 8-bit phase difference at 13.33 MS/s is about 52 kHz. Averaged over locked lines, the sync tip sits near −2.2 MHz and the back porch near −1.0 MHz, so 40 IRE is about 1.2 MHz and 1 IRE about 30 kHz. The picture's white reaches about +2 MHz.
 - Blanking taken as the median of the level histogram 1-3 MHz above the sync tip reads about 0.45 MHz (15 IRE) high, because dark picture content falls in that band too. With the sync depth scaled from it, white was mapped about 1.45 times too far out and the darkest sixth of the picture clipped to black, which looked dim beside an FPV monitor. Averaging the sync tip and back porch of every other locked line fixed both.
 - On a good signal the back porch carries about 165 kHz RMS of noise (about 3 IRE) with an exact floating-point demodulator. It is FM noise, rising about 17 dB from 0.3 to 6.5 MHz, so a luma low-pass removes most of the visible grain.
-- The phase table's rounding matters only at low amplitude. At RMS 19 the porch noise was 241 kHz with a 6+6-bit table against 185 kHz exact; at RMS 61 it was 172 against 164. Hence the gain control now aims for RMS 40-72, and a 7+7-bit table isn't worth its 32 KB.
+- The phase table's rounding matters only at low amplitude. At RMS 19 the porch noise was 241 kHz with a 6+6-bit table against 185 kHz exact; at RMS 61 it was 172 against 164. Hence the gain control now aims for RMS 40-72, and a 7+7-bit table isn't worth its 32 KB. The table now in use keeps 6 bits of I and all 7 of Q in 16 KB, since indexing by the raw word brought the seventh Q bit for free.
 - The signal can degrade within minutes for reasons outside the receiver: in one session porch noise rose to 700-870 kHz at every gain from 62 to 72 and lock fell to 40-210 of 262 lines.
 - The OSD alone carries no colorburst: the back porch shows nothing above noise at 3.58 or 4.43 MHz, where a 40 IRE burst would stand about 20 dB clear. With a camera attached the burst is there. `iq.py burst` checks this.
 
@@ -80,7 +80,48 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - Detecting lines after each 2016-sample DMA node, rather than after everything that has arrived, got lines to core 0 sooner but made vertical corrections jump from about one per thousand fields to one per twelve, likely from broad pulses split across calls. It was reverted.
 - Packing four pixels per word store to avoid byte-store aliasing gained little (9.4 to 7.5 cycles per sample).
 - `decode bench` varies about 15% between runs, and its small cached-buffer case runs slower than the full ring for reasons not understood. The live load figures in `decode` are the better measure.
-- BitScrambler can attach to PARLIO RX on the P4 and holds a 2048-entry, 32-bit table (11-bit address), so it could take the phase lookup off the CPU with a smaller index.
+
+## The P4's BitScrambler
+
+The BitScrambler is not used, and the demodulator stays on the CPU. It cannot hold the phase table the decoder uses, and it cannot do the arithmetic that follows the lookup. None of this section has been run on the hardware: the limits are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
+
+Its limits:
+
+- The LUT is 2048 bytes in total: 2048×8, 1024×16 or 512×32. The widest address is 11 bits. The decoder's table is 16 KB (14-bit address), so it is 8 times too big, and a 16-bit table would be 32 times too big.
+- There is no data-dependent add. `ADD` takes an immediate only, and `ADDCTI`, which adds routed bits to a counter, exists on the C5 and S31 but not the P4. So the P4 cannot subtract one phase from the last, sum samples, or add a correction to a table value.
+- A `set` only routes bits. There is no XOR, negate or data-dependent shift.
+- A program is at most 8 instructions.
+- ESP-IDF connects the BitScrambler to PARLIO TX and to loopback only. Using it on PARLIO RX means attaching it by hand on the AXI-GDMA, which is untried.
+
+What that rules out:
+
+- CORDIC. It needs about three data-dependent add or subtracts per iteration over 7 to 8 iterations, with conditional negation. It suits hardware with adders and no memory, and the BitScrambler is the opposite.
+- The C5 Golden program's method of looking up the difference from the previous and current phase. Both phases have to fit one address, so each gets 5 bits, and a 5-bit phase step is 417 kHz at 13.33 MS/s, about 14 IRE.
+- The C5 `fm_phase8_hr_live` program's 8-bit subtraction in a counter, which needs `ADDCTI`.
+- Moving the lookup to the C5, which has `ADDCTI`: its PARLIO is 8 lanes wide, so it would see only 4 bits each of I and Q.
+- Anything after the lookup: the phase difference, the 4-sample sums and sync slicing all need an adder.
+
+What could still work is the lookup alone, with a smaller table, leaving the CPU to subtract. The lookup is the one step the CPU cannot vectorize, so with phase arriving in the ring the rest could become PIE vector operations. Two tables fit:
+
+- A single 2048×8 table indexed by 6 bits of I and 5 of Q, writing 8 bits per sample.
+- A bipartite pair in 1024×16, packed as the high and low byte of each word the way the C5's `fm.bsasm` shares one LUT between two tables: a coarse phase from the top 5 bits of I and Q, and a correction from the top 3 and low 2 bits of each. The P4 cannot add them, so it would write both bytes and the CPU would add.
+
+Simulated back-porch noise in kHz for each table, against an exact demodulator. The model is a constant-envelope carrier with an I offset of 20 and noise set to the measured exact figure, and it reproduces the measured 6+6 results above (241 against 185 at RMS 19).
+
+| I/Q RMS | Exact | 6+7 (in use, 16 KB) | 6+5 (2048×8) | Bipartite (1024×16) |
+|---|---|---|---|---|
+| 20 | 187 | 216 | 303 | 258 |
+| 30 | 175 | 189 | 251 | 198 |
+| 40 | 171 | 181 | 216 | 180 |
+| 60 | 168 | 173 | 190 | 172 |
+| 72 | 167 | 171 | 184 | 171 |
+| 90 | 167 | 170 | 178 | 170 |
+
+The bipartite pair matches the table in use across the gain control's range (RMS 40-72), and the single 6+5 table is 0.6 to 1.5 dB noisier there. Before either could be used, the hardware would have to show three things:
+
+- The BitScrambler runs on PARLIO RX through the AXI-GDMA, at two instructions per sample for the bipartite pair.
+- The LUT can be rewritten while running, since the table is rebuilt around the I/Q offset twice a second.
+- The soft-delimiter EOF and the decoder's reading of the DMA write position still behave with the BitScrambler in the path, and no DMA boundary resets its state.
 
 ## Encoding and USB
 
