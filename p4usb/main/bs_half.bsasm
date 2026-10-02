@@ -1,0 +1,11 @@
+# Keeps the low byte (I) of each 16-bit PARLIO RX word, to show a 2:1 reduction reaches the DMA.
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 0
+cfg lut_width_bits 8
+
+loop:
+    set 0..7 0..7,
+    read 16,
+    write 8,
+    jmp loop
