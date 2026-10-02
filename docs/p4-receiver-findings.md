@@ -124,6 +124,23 @@ The bipartite and companded pairs both come within 3% of the table in use across
 - The LUT can be rewritten while running, since the table is rebuilt around the I/Q offset twice a second.
 - The soft-delimiter EOF and the decoder's reading of the DMA write position still behave with the BitScrambler in the path, and no DMA boundary resets its state.
 
+What the offload would buy, estimated from the load figures above and not measured:
+
+- The demodulator costs about 14 cycles per sample (53% of core 1, about 190M cycles a second). With the lookup in the BitScrambler and the rest in PIE it should cost 2 to 3.
+- That frees about 150M cycles a second, 42% of a core, and takes core 1 from 83% to roughly 40%. Spread over the 20.7M pixels output each second (720×480 at 59.94 fields), it is about 7 cycles a pixel, which is what drawing and the median deinterlace cost now (7.4).
+- The freed time is on core 1 and drawing is on core 0 at 78%, so using it means moving a stage across, as chroma was split.
+
+Estimated cost of further picture processing, as a share of one core:
+
+| Work | Pixels a second | Scalar | PIE |
+|---|---|---|---|
+| Luma 1 2 1 low-pass | 20.7M | 11% | 3-6% |
+| Temporal noise reduction, blending with the previous frame | 20.7M | 17-23% | 6% |
+| Motion-adaptive deinterlacing of the missing rows | 10.4M | 15-25% | under 10% |
+| Motion-adaptive deinterlacing of every pixel | 20.7M | 30-45% | 10-15% |
+
+Simple smoothing in PIE fits the headroom there is now (about 22% of core 0 and 17% of core 1). Scalar per-pixel motion-adaptive deinterlacing does not, and would after the offload.
+
 ## Encoding and USB
 
 - The hardware JPEG encoder takes 2.5-3.5 ms for a 720×480 grayscale frame. At quality 80 grainy fields overflowed the 128 KB slot; quality 70 gives about 60-70 KB.
