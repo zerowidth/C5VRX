@@ -591,7 +591,9 @@ static void wait_strip(int k)
     s_strip_busy[k] = false;
 }
 
-static uint32_t s_prof_flush, s_prof_pix, s_prof_chroma, s_prof_lines, s_prof_chroma1;
+/* Cycle sums pass 32 bits in under half a minute. */
+static uint64_t s_prof_flush, s_prof_pix, s_prof_chroma, s_prof_chroma1;
+static uint32_t s_prof_lines;
 
 /* Sends the strip's whole pairs of rows. With more to come, an odd last row starts the next strip;
  * otherwise an odd row at either end is left out. */
