@@ -482,7 +482,7 @@ static bool settle_gain(void)
  * almost none. The glitch count is a poorer test there: 1 to 8 clean and 6 to 26 not. Noise has no ring, and
  * glitches 6 to 9 times in a thousand read clean, as independent samples do, and 11 to 200 or hardly at all
  * otherwise, the last when the garbage is most of the lane's power. */
-#define OFF_RING_MAX 10
+#define OFF_RING_MAX 20
 #define NOISE_GLITCH_MIN 4
 #define NOISE_GLITCH_MAX 9
 #define RING_MIN 600
@@ -511,6 +511,10 @@ static bool pick_edge(bool clean[2])
         }
         q[e] = quality(PROBE_SAMPLES);
         clean[e] = !mid_change(&q[e]);
+    }
+    /* The edges are 3 bus periods apart and read the bus at the same point, so a carrier is judged on both. */
+    if (q[0].ring >= RING_MIN && q[1].ring >= RING_MIN) {
+        clean[0] = clean[1] = q[0].off_ring + q[1].off_ring <= 2 * OFF_RING_MAX;
     }
     uint32_t score[2];
     for (int e = 0; e < 2; ++e) score[e] = q[e].off_ring * 1000 + (q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1]);
