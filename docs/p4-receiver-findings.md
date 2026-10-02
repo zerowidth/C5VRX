@@ -83,7 +83,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 
 ## The P4's BitScrambler
 
-The BitScrambler can do the phase lookup in the receive path, with a smaller table than the decoder's, and nothing more. That much is proven on the hardware with `iq bs` (see [On the hardware](#on-the-hardware)); the decoder does not use it yet, and the demodulator is still on the CPU. It cannot hold the 16 KB table the decoder uses, and it cannot do the arithmetic that follows the lookup. The limits below are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
+The BitScrambler can do the phase lookup in the receive path, with a smaller table than the CPU's, and nothing more. `decode bs on` decodes that way: core 1's load falls from 83% to 41% at the same line lock (see [In the decoder](#in-the-decoder)). It is off by default until the picture has been compared by eye and by noise. The BitScrambler cannot hold the 16 KB table the CPU uses, and it cannot do the arithmetic that follows the lookup. The limits below are read from ESP-IDF 6.1 (the BitScrambler docs, `tools/bsasm.py` and `bsasm_targets/esp32p4.json`), and the noise figures are simulated.
 
 Its limits:
 
@@ -106,7 +106,7 @@ What is left is the lookup alone, with a smaller table, leaving the CPU to subtr
 
 - A single 2048×8 table indexed by 6 bits of I and 5 of Q, writing 8 bits per sample.
 - A bipartite pair in 1024×16, packed as the high and low byte of each word the way the C5's `fm.bsasm` shares one LUT between two tables: a coarse phase from the top 5 bits of I and Q, and a correction from the top 3 and low 2 bits of each. The P4 cannot add them, so it would write both bytes and the CPU would add.
-- A companded pair, also in 1024×16 (1280 bytes used). A 128-entry table per lane turns each of I and Q into a sign and a 5-bit log-spaced magnitude around its offset, and a 1024-entry table turns the two magnitudes into a 6-bit first-quadrant angle. It writes one byte per sample (the angle and both signs), and the CPU unfolds the quadrant. It takes three lookups per sample, and only the 256 per-lane entries change with the I/Q offset.
+- A companded pair, also in 1024×16. A 128-entry table per lane turns each of I and Q into a sign and a 5-bit log-spaced magnitude around its offset, and a 1024-entry table turns the two magnitudes into a 6-bit first-quadrant angle. It takes three lookups per sample, and only the lane entries change with the I/Q offset. This is the one the decoder uses.
 
 Simulated back-porch noise in kHz for each table, against an exact demodulator, from [phase_table_sim.py](../p4usb/tools/phase_table_sim.py). The model is a constant-envelope carrier with an I offset of 20 and noise set to the measured exact figure, and it reproduces the measured 6+6 results above (241 against 185 at RMS 19).
 
@@ -123,26 +123,39 @@ The bipartite and companded pairs both come within 3% of the table in use across
 
 ### On the hardware
 
-`iq bs` runs a BitScrambler program between PARLIO RX and its DMA during a capture. `bs_phase_check.bsasm` is the companded lookup (three instructions, one per lookup) writing each sample's phase byte beside the lanes it came from, so the CPU can repeat every lookup.
+`iq bs` runs a BitScrambler program between PARLIO RX and its DMA during a capture. `bs_phase_check.bsasm` is the companded lookup writing each sample's phase byte beside the lanes it came from, so the CPU can repeat every lookup.
 
 - The lookup is right. On live I/Q at 13.33 MS/s, all 585,487 consecutive samples of a capture matched the CPU's lookup, at each of three I/Q offsets. That is 40 million instructions a second. With the C5's counter at 40 MS/s (120 million a second), one sample in 585,487 differed.
 - It is gapless across EOFs. A 2:1 program (`bs_half.bsasm`) carried the C5's counter with no break through 36 soft-delimiter EOFs at 40 MHz, and the program stays in its run state.
-- The first EOF after each start is the exception: about 5 to 12 samples are dropped there, and a program writing 16 or 32 bits a sample comes out shifted by a byte from then on. One writing 8 bits has no alignment to lose.
+- The first EOF after a start ends its DMA node early, because the EOF passes straight through while a few bytes are still inside the BitScrambler: 9 bytes for a program writing 16 bits a sample, 19 for one writing 32. Nothing is lost, but the node is short, and 9 is odd, so from then on each word's second byte sits on the even addresses. Later EOFs land on node boundaries.
+- The decoder reads each node's length from its DMA descriptor, and tells the two bytes apart by a bit the program always sets in one of them.
 - The LUT takes writes only while the program is halted. Writes while it runs, or while it is paused, change nothing, and the driver's `bitscrambler_load_lut` on a running program corrupts a few hundred samples (it switches the LUT's width to write) and still changes nothing.
-- Halting, rewriting the 256 lane entries and restarting takes about 18,000 CPU cycles (50 µs, under one line). About 14 samples come out wrong, the samples of those 50 µs are lost, and the next EOF drops samples as a first one does. The I and Q bytes keep their order.
+- A halt, rewrite and restart takes about 18,000 CPU cycles (50 µs), but in the running decoder the DMA then raced through nodes about five times faster than real time for several milliseconds, twice. Stopping the PARLIO unit, rewriting, and starting the receive again takes 133 µs and comes back clean.
+- PIE takes its integer operands from a0..a5 only, and its 8-bit subtract saturates, so wrapped phase differences are taken in 16-bit lanes.
 - A PSRAM `iq` capture's first 64,512 bytes hold the previous capture's data, with or without the BitScrambler. Checks start after them.
 
-What is left before the decoder can use it:
+### In the decoder
 
-- The decoder takes its I/Q offset, RMS and clipping from raw words, which the phase byte doesn't carry. The offset can be steered from the balance of the sign bits. The gain control needs a magnitude, so the program has to write a second byte (the magnitude codes) or the gain has to come from somewhere else.
-- An offset change means a halt, so it should wait for the vertical interval and for a larger change than the quarter-step the CPU table rebuilds on.
-- The CPU side (unfolding the quadrant, the difference and the block sums in PIE) is not written, so the saving below is still an estimate.
+`decode bs on` switches the running decoder to `bs_phase.bsasm`, and `decode bs off` back to the CPU's table.
 
-What the offload would buy, estimated from the load figures above and not measured:
+- The program takes four cycles a sample (53 million instructions a second). Three are lookups: I's lane, Q's lane, then the pair. The fourth is a branch that swaps the two magnitude codes in the odd quadrants, so the table's angle is always measured on from the start of the quadrant and the output byte is the whole phase, 256 to a turn, with no arithmetic.
+- It writes 16 bits a sample: the phase, and a byte for the gain control holding I's magnitude code and both clipped flags.
+- The CPU's part (`demod.S`) is PIE: split the two bytes, subtract each phase from the one before, and sum each four differences for the sync detector. It checks itself against a C version at each start.
+- On one signal, switching back and forth: 253-254 of 262 lines locked at 83.4% of core 1 with the CPU's table, and 250-253 at 40.8% with the BitScrambler. Core 0 was unchanged at 76-77%, and sync tip, blanking and RMS read the same. Picture noise has not been measured.
+- I/Q power comes from I's magnitude code alone (doubled), and the offset from the balance of the sign bits, since a carrier circling its centre spends half its time on each side. It settled within a unit of the CPU's mean-based estimate.
+- A new offset means a new table, which stops the receive for 133 µs. The decoder waits for field lines 8 to 14, after the broad pulses and before the picture, and lets the line clock take the next hsync. The table is rewritten only when the offset has moved 2 units (the CPU's follows to a quarter), which took 3 or 4 rewrites to settle after a start and none in the 20 s after.
+- The Q lane's sign can stay the same at every word the lane check looks at, which made both bytes look marked and dropped about one node a second until an ambiguous read fell back to the last known order.
+- Internal RAM is short: the decoder's ring needs a 96,768-byte block, and 5 KB of new static tables left the largest at 94,208, so the decoder failed to start at boot. The BitScrambler's tables are in PSRAM.
+
+Not done yet:
+
+- Picture noise against the CPU's table, on a capture or by eye.
+- Using the freed half of core 1. Drawing is on core 0 at 78%, so a stage has to move across, as chroma was split.
+
+What the offload was estimated to buy, before it was measured:
 
 - The demodulator costs about 14 cycles per sample (53% of core 1, about 190M cycles a second). With the lookup in the BitScrambler and the rest in PIE it should cost 2 to 3.
-- That frees about 150M cycles a second, 42% of a core, and takes core 1 from 83% to roughly 40%. Spread over the 20.7M pixels output each second (720×480 at 59.94 fields), it is about 7 cycles a pixel, which is what drawing and the median deinterlace cost now (7.4).
-- The freed time is on core 1 and drawing is on core 0 at 78%, so using it means moving a stage across, as chroma was split.
+- That frees about 150M cycles a second, 42% of a core, and takes core 1 from 83% to roughly 40%. The measured 40.8% bears this out. Spread over the 20.7M pixels output each second (720×480 at 59.94 fields), it is about 7 cycles a pixel, which is what drawing and the median deinterlace cost now (7.4).
 
 Estimated cost of further picture processing, as a share of one core:
 
@@ -153,7 +166,7 @@ Estimated cost of further picture processing, as a share of one core:
 | Motion-adaptive deinterlacing of the missing rows | 10.4M | 15-25% | under 10% |
 | Motion-adaptive deinterlacing of every pixel | 20.7M | 30-45% | 10-15% |
 
-Simple smoothing in PIE fits the headroom there is now (about 22% of core 0 and 17% of core 1). Scalar per-pixel motion-adaptive deinterlacing does not, and would after the offload.
+Simple smoothing in PIE fits the headroom there is without the offload (about 22% of core 0 and 17% of core 1). Scalar per-pixel motion-adaptive deinterlacing does not, and does with it.
 
 ## Encoding and USB
 
