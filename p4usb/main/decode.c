@@ -146,6 +146,7 @@ BITSCRAMBLER_PROGRAM(bs_phase, "bs_phase");
 /* How far the table's offset may sit from the signal's before the table is rewritten, which stops the
  * receive for a moment. The CPU's table follows to a quarter of a step, since rebuilding it costs nothing. */
 #define BS_DC_STEP 2.0f
+#define BS_DC_MAX_STEP 6.0f
 /* Field lines between which a rewrite's gap falls after the broad pulses and before the picture. */
 #define BS_RELOAD_FROM 8
 #define BS_RELOAD_TO 14
@@ -158,7 +159,9 @@ static float s_bs_dc_i, s_bs_dc_q;
 static uint32_t s_bs_power[32];
 static const dma_descriptor_align8_t *s_desc[NODES];
 static volatile int32_t s_neg_i, s_neg_q;
-static volatile bool s_bs_pending;
+static volatile bool s_bs_pending, s_bs_broken;
+static uint32_t s_bs_reload_errors;
+static float s_bs_err_i, s_bs_err_q;
 static uint32_t s_bs_short, s_bs_mixed, s_bs_rewrites, s_bs_reload_us;
 
 /* Demodulator and sync state, owned by the decode task. */
@@ -195,6 +198,8 @@ static uint32_t s_last_broad;
 static int s_tip = -57 * 16, s_blank = -17 * 16;
 /* Sums over locked lines of the sync tip and back porch, since the histogram's picture content biases blanking up. */
 static int32_t s_tip_sum, s_porch_sum, s_level_lines;
+static uint64_t s_noise_sq;
+static uint32_t s_noise_lines;
 /* Demodulated sample, as a uint8_t, to pixel level. */
 static uint8_t s_map[256];
 /* The same for the sum of four samples, which nulls the subcarrier's dots out of luma when there is color. */
@@ -291,10 +296,18 @@ static void steer_gain(void)
     if (gain != s_gain) set_gain(gain);
 }
 
+static esp_err_t start_rx(void);
+
 /* The BitScrambler's bytes carry no raw I/Q. Power comes from I's magnitude code, and the offset from the
  * balance of the sign bits: a carrier circling its centre spends half its time on each side. */
 static void control_bs(void)
 {
+    if (s_bs_broken) {
+        s_bs_broken = s_bs_pending = false;
+        decode_stop();
+        start_rx();
+        return;
+    }
     int32_t n = s_dc_n;
     if (n < 4096) return;
     float power = (float)s_dc_power / n, neg_i = (float)s_neg_i / n, neg_q = (float)s_neg_q / n;
@@ -305,11 +318,16 @@ static void control_bs(void)
     s_clip_permille = clipped * 1000 / n;
     steer_gain();
 
-    /* How far the table's offset sits above the signal's centre, from the excess of negative signs. */
+    /* How far the table's offset sits above the signal's centre, from the excess of negative signs. One
+     * half second's reading wanders a unit or two on a weak signal, so it is smoothed over about four. */
+    if (s_bs_pending || s_rms < 4) return;
     float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
-    if (s_bs_pending || s_rms < 4 || (fabsf(di) < BS_DC_STEP && fabsf(dq) < BS_DC_STEP)) return;
-    s_bs_dc_i = fminf(fmaxf(s_bs_dc_i - 0.7f * di, -64), 64);
-    s_bs_dc_q = fminf(fmaxf(s_bs_dc_q - 0.7f * dq, -64), 64);
+    s_bs_err_i += (di - s_bs_err_i) / 4;
+    s_bs_err_q += (dq - s_bs_err_q) / 4;
+    if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) return;
+    s_bs_dc_i -= fminf(fmaxf(s_bs_err_i, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
+    s_bs_dc_q -= fminf(fmaxf(s_bs_err_q, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
+    s_bs_err_i = s_bs_err_q = 0;
     iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
     /* The decode task loads it, in the vertical interval. */
     s_bs_pending = true;
@@ -874,8 +892,15 @@ static void render_line(void)
     if (s_hit) {
         ++s_field_hits;
         if (s_vline & 1) {
-            int32_t t = 0, b = 0;
-            for (int i = TIP_START; i < TIP_END; ++i) t += s_hist[(s_line + i) % HIST];
+            int32_t t = 0, b = 0, t2 = 0;
+            for (int i = TIP_START; i < TIP_END; ++i) {
+                int32_t v = s_hist[(s_line + i) % HIST];
+                t += v;
+                t2 += v * v;
+            }
+            /* The sync tip is flat, so its scatter about each line's own mean is the demodulator's noise. */
+            s_noise_sq += t2 * (TIP_END - TIP_START) - t * t;
+            ++s_noise_lines;
             for (int i = PORCH_START; i < PORCH_END; ++i) b += s_hist[(s_line + i) % HIST];
             s_tip_sum += t;
             s_porch_sum += b;
@@ -1149,6 +1174,20 @@ static void process_node(uint32_t offset)
     process_bs((const uint8_t *)s_ring + offset, len);
 }
 
+/* Until a node of a new receive is done the DMA still names a node of the last one, and the ring still
+ * holds its data. Waits that out, then starts reading and the gain control's statistics from there. */
+static void skip_stale(uint32_t stale)
+{
+    int64_t t0 = esp_timer_get_time();
+    while (AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val == stale && esp_timer_get_time() - t0 < 1000) {
+    }
+    memset(s_desc, 0, sizeof s_desc);
+    s_read = dma_offset();
+    s_read_us = esp_timer_get_time();
+    s_dc_n = s_dc_sum_i = s_dc_sum_q = s_neg_i = s_neg_q = 0;
+    s_dc_power = s_dc_clipped = 0;
+}
+
 /* The LUT takes writes only while the program is halted, and a halt alone leaves the DMA racing through
  * nodes for milliseconds afterwards. So the receive stops and starts again around the write, as at a
  * start, and the line clock takes the next hsync it sees. */
@@ -1156,22 +1195,25 @@ static void bs_reload(void)
 {
     int64_t t0 = esp_timer_get_time();
     uint32_t stale = AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
-    parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, false);
-    parlio_rx_unit_disable(s_rx);
-    bitscrambler_reset(s_bs_handle);
-    bitscrambler_load_lut(s_bs_handle, s_bs_lut, 512 * sizeof *s_bs_lut);
-    bitscrambler_start(s_bs_handle);
-    parlio_rx_unit_enable(s_rx, true);
+    esp_err_t err = parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, false);
+    if (err == ESP_OK) err = parlio_rx_unit_disable(s_rx);
+    if (err == ESP_OK) err = bitscrambler_reset(s_bs_handle);
+    if (err == ESP_OK) err = bitscrambler_load_lut(s_bs_handle, s_bs_lut, 512 * sizeof *s_bs_lut);
+    if (err == ESP_OK) err = bitscrambler_start(s_bs_handle);
+    if (err == ESP_OK) err = parlio_rx_unit_enable(s_rx, true);
     const parlio_receive_config_t rcfg = {.delimiter = s_delim, .flags.partial_rx_en = 1};
-    parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg);
-    parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true);
-    /* Until a node of the new receive is done, the DMA still names the old one. */
-    while (AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val == stale && esp_timer_get_time() - t0 < 1000) {
+    if (err == ESP_OK) err = parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg);
+    if (err == ESP_OK) err = parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true);
+    if (err != ESP_OK) {
+        /* The control task starts the receive over. */
+        ++s_bs_reload_errors;
+        s_bs_broken = true;
+        return;
     }
-    memset(s_desc, 0, sizeof s_desc);
-    s_read = dma_offset();
-    s_read_us = esp_timer_get_time();
+    skip_stale(stale);
     s_bs_reload_us = s_read_us - t0;
+    /* The lines that went by meanwhile, counting half a node for what the DMA had not finished. */
+    s_vline += (s_bs_reload_us + NODE_BYTES * 250000ll / FS_HZ + 32) / 64;
     s_missed = LOST_AFTER_LINES;
     ++s_bs_rewrites;
     s_bs_pending = false;
@@ -1288,6 +1330,13 @@ static esp_err_t start_bs(void)
     /* In PSRAM: only the control task touches it, and internal RAM is short. */
     if (!s_bs_lut) s_bs_lut = heap_caps_malloc(1024 * sizeof *s_bs_lut, MALLOC_CAP_SPIRAM);
     if (!s_bs_lut) return ESP_ERR_NO_MEM;
+    /* The CPU's table has been following the offset, if it ran. */
+    if (!s_bs_rewrites && s_lut_dc_i != 1000) {
+        s_bs_dc_i = s_lut_dc_i / 4.0f;
+        s_bs_dc_q = s_lut_dc_q / 4.0f;
+    }
+    s_bs_err_i = s_bs_err_q = 0;
+    s_bs_pending = false;
     iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
     memset(s_desc, 0, sizeof s_desc);
     const bitscrambler_config_t cfg = {.dir = BITSCRAMBLER_DIR_RX, .attach_to = SOC_BITSCRAMBLER_ATTACH_PARL_IO};
@@ -1318,10 +1367,11 @@ static esp_err_t start_rx(void)
     const parlio_receive_config_t rcfg = {.delimiter = s_delim, .flags.partial_rx_en = 1};
     if ((err = parlio_rx_unit_receive(s_rx, s_ring, RING_BYTES, &rcfg)) != ESP_OK) return err;
     if ((s_dma_ch = find_dma_channel()) < 0) return ESP_ERR_NOT_FOUND;
-    s_read = 0;
-    s_read_us = esp_timer_get_time();
+    uint32_t stale = AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
+    if ((err = parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true)) != ESP_OK) return err;
+    skip_stale(stale);
     s_running = true;
-    return parlio_rx_soft_delimiter_start_stop(s_rx, s_delim, true);
+    return ESP_OK;
 }
 
 static bool start(const char *channel)
@@ -1385,8 +1435,14 @@ static void status(void)
         s_lut_dc_i / 4, abs(s_lut_dc_i % 4) * 25, s_lut_dc_q / 4, abs(s_lut_dc_q % 4) * 25);
     if (s_bs) {
         if (s_bs_scalar) say("the PIE demodulator failed its check; using the C one\n");
-        say("phase from the BitScrambler: %lu table rewrites (the last took %lu us), %lu short nodes, %lu nodes dropped for mixed bytes\n",
-            (unsigned long)s_bs_rewrites, (unsigned long)s_bs_reload_us, (unsigned long)s_bs_short, (unsigned long)s_bs_mixed);
+        say("phase from the BitScrambler: %lu table rewrites (the last took %lu us, %lu failed), %lu short nodes, %lu nodes dropped for mixed bytes\n",
+            (unsigned long)s_bs_rewrites, (unsigned long)s_bs_reload_us, (unsigned long)s_bs_reload_errors,
+            (unsigned long)s_bs_short, (unsigned long)s_bs_mixed);
+    }
+    if (s_noise_lines) {
+        float var = (float)s_noise_sq / ((float)s_noise_lines * (TIP_END - TIP_START) * (TIP_END - TIP_START - 1));
+        say("sync tip noise %d kHz rms over %lu lines\n", (int)lrintf(sqrtf(var) * FS_HZ / 256000), (unsigned long)s_noise_lines);
+        s_noise_sq = s_noise_lines = 0;
     }
     say("color %s, burst %d (on above %d), saturation %d%%\n", s_color ? "on" : "off", s_burst, COLOR_ON, s_saturation);
     say("draw: %lu stale, %lu queue full, max lag %lu samples\n", (unsigned long)s_draw_dropped, (unsigned long)s_draw_full, (unsigned long)s_draw_max_lag);
