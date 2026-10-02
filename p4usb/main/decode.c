@@ -8,7 +8,6 @@
 
 #include "driver/bitscrambler.h"
 #include "driver/parlio_rx.h"
-#include "esp_async_memcpy.h"
 #include "esp_cache.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
@@ -451,7 +450,7 @@ static int s_burst;
 static bool s_color;
 static int s_saturation = 100;
 
-static void flush_strip(void);
+static void flush_strip(bool more);
 static void wait_strip(int k);
 static void forget_old(void);
 
@@ -461,7 +460,7 @@ static uint32_t s_finish_max_us;
 static void finish_field(void)
 {
     int64_t t0 = esp_timer_get_time();
-    flush_strip();
+    flush_strip(false);
     wait_strip(0);
     wait_strip(1);
     video_field_done();
@@ -487,20 +486,76 @@ static void emit_field(void)
 
 static bool s_skip_render, s_skip_detect;
 
+#define UNCACHED(p) ((void *)CACHE_LL_L2MEM_NON_CACHE_ADDR(p))
+
+/* A memory-to-memory AXI-GDMA channel pair that can reach PSRAM. Descriptors are written uncached and
+ * reused: the async memcpy driver builds its lists anew on every call, some 46K cycles for a strip. */
+static esp_err_t new_copy_channel(gdma_channel_handle_t *tx, gdma_channel_handle_t *rx, gdma_event_callback_t done)
+{
+    gdma_channel_alloc_config_t ccfg = {0};
+    esp_err_t err = gdma_new_axi_channel(&ccfg, tx, rx);
+    if (err != ESP_OK) return err;
+    gdma_trigger_t m2m = GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_M2M, 0);
+    uint32_t free_ids = 0;
+    gdma_get_free_m2m_trig_id_mask(*tx, &free_ids);
+    m2m.instance_id = __builtin_ctz(free_ids);
+    gdma_connect(*rx, m2m);
+    gdma_connect(*tx, m2m);
+    gdma_strategy_config_t strategy = {.owner_check = true, .auto_update_desc = true, .eof_till_data_popped = true};
+    gdma_apply_strategy(*tx, &strategy);
+    gdma_apply_strategy(*rx, &strategy);
+    gdma_transfer_config_t xfer = {.max_data_burst_size = 64, .access_ext_mem = true};
+    gdma_config_transfer(*tx, &xfer);
+    gdma_config_transfer(*rx, &xfer);
+    gdma_rx_event_callbacks_t cbs = {.on_recv_eof = done};
+    return gdma_register_rx_event_callbacks(*rx, &cbs, NULL);
+}
+
 /* Lines are rendered, doubled, into internal RAM and DMA'd to the PSRAM frame a strip at a time: the
- * core writing PSRAM through its cache costs several cycles a byte. */
+ * core writing PSRAM through its cache costs several cycles a byte. The DMA writes PSRAM in whole cache
+ * lines, which an even number of rows from an even row is, so a strip holds one row more than it sends. */
 #define STRIP_ROWS 16
 #define ROW_BYTES (VIDEO_WIDTH * 2)
-static uint8_t s_strips[2][STRIP_ROWS * ROW_BYTES] __attribute__((aligned(64)));
+#define STRIP_NODES ((STRIP_ROWS * ROW_BYTES + NODE_BYTES - 1) / NODE_BYTES)
+static uint8_t s_strips[2][(STRIP_ROWS + 1) * ROW_BYTES] __attribute__((aligned(64)));
 static int s_strip, s_strip_rows, s_strip_row0;
 static volatile bool s_strip_busy[2];
-static async_memcpy_handle_t s_mcp;
+/* The strip being copied and the one waiting for it, or -1. */
+static volatile int s_strip_copying = -1, s_strip_next = -1;
+static portMUX_TYPE s_strip_lock = portMUX_INITIALIZER_UNLOCKED;
+static gdma_channel_handle_t s_strip_tx, s_strip_rx;
+static dma_descriptor_align8_t s_strip_desc[2][2 * STRIP_NODES] __attribute__((aligned(64)));
 static uint32_t s_strip_waits, s_strip_errors;
 
-static bool IRAM_ATTR strip_done(async_memcpy_handle_t mcp, async_memcpy_event_t *e, void *arg)
+static void IRAM_ATTR start_strip(int k)
 {
-    s_strip_busy[(int)arg] = false;
+    s_strip_copying = k;
+    esp_err_t err = gdma_start(s_strip_rx, (intptr_t)&s_strip_desc[k][STRIP_NODES]);
+    if (err == ESP_OK) err = gdma_start(s_strip_tx, (intptr_t)&s_strip_desc[k][0]);
+    if (err != ESP_OK) {
+        s_strip_copying = -1;
+        s_strip_busy[k] = false;
+        ++s_strip_errors;
+    }
+}
+
+static bool IRAM_ATTR strip_done(gdma_channel_handle_t chan, gdma_event_data_t *e, void *arg)
+{
+    portENTER_CRITICAL_ISR(&s_strip_lock);
+    if (s_strip_copying >= 0) s_strip_busy[s_strip_copying] = false;
+    int next = s_strip_next;
+    s_strip_copying = s_strip_next = -1;
+    if (next >= 0) start_strip(next);
+    portEXIT_CRITICAL_ISR(&s_strip_lock);
     return false;
+}
+
+static esp_err_t strip_dma_init(void)
+{
+    esp_err_t err = new_copy_channel(&s_strip_tx, &s_strip_rx, strip_done);
+    /* No cached copy may be written back over what the uncached alias put there. */
+    if (err == ESP_OK) err = esp_cache_msync(s_strip_desc, sizeof s_strip_desc, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    return err;
 }
 
 static void wait_strip(int k)
@@ -513,27 +568,62 @@ static void wait_strip(int k)
 }
 
 static uint32_t s_prof_flush, s_prof_pix, s_prof_chroma, s_prof_lines, s_prof_chroma1;
-static void flush_strip(void)
+
+/* Sends the strip's whole pairs of rows. With more to come, an odd last row starts the next strip;
+ * otherwise an odd row at either end is left out. */
+static void flush_strip(bool more)
 {
     if (!s_strip_rows) return;
     uint32_t t0 = esp_cpu_get_cycle_count();
-    int rows = s_strip_rows;
-    if (s_strip_row0 + rows > VIDEO_HEIGHT) rows = VIDEO_HEIGHT - s_strip_row0;
-    s_strip_busy[s_strip] = true;
-    if (esp_async_memcpy(s_mcp, s_frame + s_strip_row0 * ROW_BYTES, s_strips[s_strip], rows * ROW_BYTES, strip_done,
-                         (void *)s_strip) != ESP_OK) {
-        s_strip_busy[s_strip] = false;
-        ++s_strip_errors;
-    }
+    int k = s_strip, row0 = s_strip_row0, rows = s_strip_rows;
+    const uint8_t *src = s_strips[k];
+    if (row0 + rows > VIDEO_HEIGHT) rows = VIDEO_HEIGHT - row0;
+    if (row0 & 1) ++row0, --rows, src += ROW_BYTES;
+    bool carry = more && (rows & 1);
+    rows &= ~1;
     s_strip ^= 1;
     s_strip_rows = 0;
+    if (carry) {
+        wait_strip(s_strip);
+        memcpy(s_strips[s_strip], src + rows * ROW_BYTES, ROW_BYTES);
+        s_strip_row0 = row0 + rows;
+        s_strip_rows = 1;
+    }
+    if (rows > 0) {
+        uint32_t bytes = rows * ROW_BYTES;
+        esp_cache_msync((void *)src, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+        volatile dma_descriptor_align8_t *tx = UNCACHED(s_strip_desc[k]), *rx = tx + STRIP_NODES;
+        uint8_t *dst = s_frame + row0 * ROW_BYTES;
+        for (uint32_t i = 0, at = 0; at < bytes; ++i, at += NODE_BYTES) {
+            uint32_t n = bytes - at < NODE_BYTES ? bytes - at : NODE_BYTES;
+            bool last = at + n == bytes;
+            tx[i].buffer = (void *)(src + at);
+            tx[i].next = last ? NULL : &s_strip_desc[k][i + 1];
+            tx[i].dw0.size = n;
+            tx[i].dw0.length = n;
+            tx[i].dw0.suc_eof = last;
+            tx[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+            rx[i].buffer = dst + at;
+            rx[i].next = last ? NULL : &s_strip_desc[k][STRIP_NODES + i + 1];
+            rx[i].dw0.size = n;
+            rx[i].dw0.length = 0;
+            rx[i].dw0.suc_eof = 0;
+            rx[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        }
+        s_strip_busy[k] = true;
+        portENTER_CRITICAL(&s_strip_lock);
+        if (s_strip_copying < 0) start_strip(k);
+        else s_strip_next = k;
+        portEXIT_CRITICAL(&s_strip_lock);
+    }
     s_prof_flush += esp_cpu_get_cycle_count() - t0;
 }
 
 /* Room for n rows of the frame from row. */
 static uint8_t *strip_rows(int row, int n)
 {
-    if (s_strip_rows && (row != s_strip_row0 + s_strip_rows || s_strip_rows + n > STRIP_ROWS)) flush_strip();
+    if (s_strip_rows && row != s_strip_row0 + s_strip_rows) flush_strip(false);
+    if (s_strip_rows + n > STRIP_ROWS + 1) flush_strip(true);
     if (!s_strip_rows) {
         s_strip_waits += s_strip_busy[s_strip];
         wait_strip(s_strip);
@@ -662,11 +752,8 @@ static volatile int s_old_fetching = -1;
 static uint32_t s_old_late, s_old_errors;
 static bool s_old_errors_field;
 
-/* A channel pair of their own, with descriptors written uncached: the async memcpy driver writes the
- * source back through the cache and builds descriptors on every call, some 40K cycles for one PSRAM row. */
 static gdma_channel_handle_t s_old_tx, s_old_rx;
 static dma_descriptor_align8_t s_old_desc[2 * OLD_GROUP] __attribute__((aligned(64)));
-#define UNCACHED(p) ((void *)CACHE_LL_L2MEM_NON_CACHE_ADDR(p))
 
 static bool IRAM_ATTR old_done(gdma_channel_handle_t chan, gdma_event_data_t *e, void *arg)
 {
@@ -677,23 +764,8 @@ static bool IRAM_ATTR old_done(gdma_channel_handle_t chan, gdma_event_data_t *e,
 
 static esp_err_t old_dma_init(void)
 {
-    gdma_channel_alloc_config_t ccfg = {0};
-    esp_err_t err = gdma_new_axi_channel(&ccfg, &s_old_tx, &s_old_rx);
+    esp_err_t err = new_copy_channel(&s_old_tx, &s_old_rx, old_done);
     if (err != ESP_OK) return err;
-    gdma_trigger_t m2m = GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_M2M, 0);
-    uint32_t free_ids = 0;
-    gdma_get_free_m2m_trig_id_mask(s_old_tx, &free_ids);
-    m2m.instance_id = __builtin_ctz(free_ids);
-    gdma_connect(s_old_rx, m2m);
-    gdma_connect(s_old_tx, m2m);
-    gdma_strategy_config_t strategy = {.owner_check = true, .auto_update_desc = true, .eof_till_data_popped = true};
-    gdma_apply_strategy(s_old_tx, &strategy);
-    gdma_apply_strategy(s_old_rx, &strategy);
-    gdma_transfer_config_t xfer = {.max_data_burst_size = 64, .access_ext_mem = true};
-    gdma_config_transfer(s_old_tx, &xfer);
-    gdma_config_transfer(s_old_rx, &xfer);
-    gdma_rx_event_callbacks_t cbs = {.on_recv_eof = old_done};
-    gdma_register_rx_event_callbacks(s_old_rx, &cbs, NULL);
     /* No cached copy may be written back over what the DMA or the uncached alias put there. */
     s_old = heap_caps_aligned_calloc(64, 2, sizeof *s_old, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!s_old) return ESP_ERR_NO_MEM;
@@ -1338,8 +1410,7 @@ static bool start(const char *channel)
             return false;
         }
         build_lo();
-        async_memcpy_config_t mcfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
-        if (esp_async_memcpy_install_gdma_axi(&mcfg, &s_mcp) != ESP_OK) {
+        if (strip_dma_init() != ESP_OK) {
             say("decode: no DMA channel for the frame\n");
             return false;
         }
