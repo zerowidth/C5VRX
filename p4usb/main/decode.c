@@ -205,8 +205,8 @@ static uint32_t s_noise_lines;
 typedef struct {
     int8_t k[2][9][16];
     int shift;
-} luma_t;
-static luma_t s_lumas[2] __attribute__((aligned(16)));
+} __attribute__((aligned(16))) luma_t;
+static luma_t s_lumas[2];
 static const luma_t *volatile s_luma = &s_lumas[0];
 static uint8_t *s_frame, *s_prev;
 
