@@ -163,6 +163,12 @@ static volatile int32_t s_neg_i, s_neg_q;
 static volatile bool s_bs_pending, s_bs_broken;
 static uint32_t s_bs_reload_errors;
 static float s_bs_err_i, s_bs_err_q;
+/* The offset last settled on at each gain, in quarter units, or DC_UNKNOWN. The offset moves about half a
+ * unit a gain step and more at high gains, and a table that is 3 units out triples its error. */
+#define DC_UNKNOWN INT16_MIN
+static int16_t (*s_dc_at_gain)[2];
+/* Control passes since the gain last moved; the sums of the first hold samples from both gains. */
+static int s_bs_since_gain = 100;
 static uint32_t s_bs_short, s_bs_mixed, s_bs_rewrites, s_bs_reload_us;
 
 /* Demodulator and sync state, owned by the decode task. */
@@ -286,6 +292,20 @@ static void set_gain(int gain)
     if (c5_request(cmd, reply, sizeof reply, 1000)) s_gain = gain;
 }
 
+static void remember_dc(int qi, int qq)
+{
+    if (!s_dc_at_gain) {
+        /* In PSRAM: internal RAM is short. */
+        s_dc_at_gain = heap_caps_malloc((GAIN_MAX + 1) * sizeof *s_dc_at_gain, MALLOC_CAP_SPIRAM);
+        if (!s_dc_at_gain) return;
+        for (int g = 0; g <= GAIN_MAX; ++g) s_dc_at_gain[g][0] = DC_UNKNOWN;
+    }
+    if (s_gain >= 0 && s_gain <= GAIN_MAX) {
+        s_dc_at_gain[s_gain][0] = qi;
+        s_dc_at_gain[s_gain][1] = qq;
+    }
+}
+
 static void steer_gain(void)
 {
     if (!s_agc) return;
@@ -317,18 +337,35 @@ static void control_bs(void)
     s_dc_power = s_dc_clipped = 0;
     s_rms = (int)lrintf(sqrtf(power));
     s_clip_permille = clipped * 1000 / n;
+    int gain = s_gain;
     steer_gain();
+    if (s_bs_pending) return;
 
-    /* How far the table's offset sits above the signal's centre, from the excess of negative signs. One
-     * half second's reading wanders a unit or two on a weak signal, so it is smoothed over about eight. */
-    if (s_bs_pending || s_rms < 4) return;
-    float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
-    s_bs_err_i += (di - s_bs_err_i) / 8;
-    s_bs_err_q += (dq - s_bs_err_q) / 8;
-    if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) return;
-    s_bs_dc_i -= fminf(fmaxf(s_bs_err_i, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
-    s_bs_dc_q -= fminf(fmaxf(s_bs_err_q, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
-    s_bs_err_i = s_bs_err_q = 0;
+    if (s_gain != gain) {
+        /* The offset moves with the gain, so the table goes straight to what this gain had before. */
+        s_bs_since_gain = 0;
+        s_bs_err_i = s_bs_err_q = 0;
+        if (!s_dc_at_gain || s_dc_at_gain[s_gain][0] == DC_UNKNOWN) return;
+        if (s_dc_at_gain[s_gain][0] == s_lut_dc_i && s_dc_at_gain[s_gain][1] == s_lut_dc_q) return;
+        s_bs_dc_i = s_dc_at_gain[s_gain][0] / 4.0f;
+        s_bs_dc_q = s_dc_at_gain[s_gain][1] / 4.0f;
+    } else {
+        if (s_bs_since_gain++ == 0 || s_rms < 4) return;
+        /* How far the table's offset sits above the signal's centre, from the excess of negative signs.
+         * One half second's reading wanders a unit or two on a weak signal, so it is smoothed over about
+         * eight, except just after a gain step, when the offset may be units out. */
+        float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
+        int over = s_bs_since_gain <= 3 ? 1 : 8;
+        s_bs_err_i += (di - s_bs_err_i) / over;
+        s_bs_err_q += (dq - s_bs_err_q) / over;
+        if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) {
+            if (fabsf(s_bs_err_i) < BS_DC_STEP / 2 && fabsf(s_bs_err_q) < BS_DC_STEP / 2) remember_dc(s_lut_dc_i, s_lut_dc_q);
+            return;
+        }
+        s_bs_dc_i -= fminf(fmaxf(s_bs_err_i, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
+        s_bs_dc_q -= fminf(fmaxf(s_bs_err_q, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
+        s_bs_err_i = s_bs_err_q = 0;
+    }
     iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
     /* The decode task loads it, in the vertical interval. */
     s_bs_pending = true;
@@ -352,10 +389,13 @@ static void control(void)
     s_dc_power = s_dc_clipped = 0;
     s_rms = (int)lrintf(sqrtf(fmaxf(power - dc_i * dc_i - dc_q * dc_q, 0)));
     s_clip_permille = clipped * 1000 / n;
+
+    int gain = s_gain;
     steer_gain();
 
     /* Quarter-LSB steps, so small drift doesn't rebuild the table every time. */
     int qi = lrintf(dc_i * 4), qq = lrintf(dc_q * 4);
+    if (s_gain == gain) remember_dc(qi, qq);
     if (abs(qi - s_lut_dc_i) < 2 && abs(qq - s_lut_dc_q) < 2) return;
     uint8_t *spare = s_lut == s_luts[0] ? s_luts[1] : s_luts[0];
     build_lut(spare, qi / 4.0f, qq / 4.0f, true);
@@ -1248,6 +1288,15 @@ static void control_task(void *arg)
         static bool muted;
         if (muted) mute_early_logs(false);
         muted = s_muted;
+        /* A start with no transmitter on could not check how the C5 came up, so the first one to lock
+         * most of a field gets a second start. */
+        static int locked;
+        locked = s_running && !iq_verified() && s_last_hits > COLOR_HITS_ON ? locked + 1 : 0;
+        if (locked >= 2) {
+            locked = 0;
+            decode_start(NULL);
+            continue;
+        }
         if (s_running) control();
     }
 }
@@ -1429,7 +1478,8 @@ static bool start(const char *channel)
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
     if (!iq_start(channel, EVERY)) return false;
-    set_gain(s_gain);
+    /* Where iq_start found the signal unclipped is a better start than wherever the last channel left it. */
+    set_gain(s_agc ? iq_gain() : s_gain);
     esp_err_t err = start_rx();
     if (err != ESP_OK) {
         say("decode: %s\n", esp_err_to_name(err));

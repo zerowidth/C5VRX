@@ -388,22 +388,121 @@ static void bs_capture(const char *name, size_t samples, float dc_i, float dc_q)
     else stats();
 }
 
-static bool pick_edge(void)
+/* A PSRAM capture's first 64,512 bytes hold the capture before it. */
+#define STALE 32256
+/* Enough fresh samples to set the gain by. */
+#define GAIN_SAMPLES (STALE + 65536)
+#define PROBE_GAIN_MIN 22
+#define PROBE_GAIN_MAX 70
+#define START_TRIES 5
+
+static int s_probe_gain = 52;
+
+typedef struct {
+    /* Per mille of samples standing further outside their two neighbours than the lane's RMS, for I and Q. */
+    uint32_t glitch[2];
+    uint32_t rms, clip;
+    /* Per mille of samples within half the mean power of it: most of an FM carrier's, 4 in 10 of noise's. */
+    uint32_t ring;
+} quality_t;
+
+/* A lane sampled while the C5's bus is changing reads garbage where it crosses zero, since every bit turns
+ * over there: Q read -19, -113, 45 in one bad start. That happens in about three C5 starts in ten, on the Q
+ * lanes, and adds some 16 dB of noise to the picture. Neither P4 edge avoids it, and restarting the C5's
+ * clock does not move it; only a C5 reset does. */
+static quality_t quality(size_t samples)
+{
+    quality_t q = {0};
+    size_t n = samples - STALE - 2;
+    uint64_t power = 0;
+    int means[2];
+    for (int lane = 0; lane < 2; ++lane) {
+        int shift = lane * 8;
+        int64_t sum = 0, sq = 0;
+        for (size_t k = STALE; k < samples; ++k) {
+            int v = (int8_t)(s_buf[k] >> shift);
+            sum += v;
+            sq += v * v;
+            if (v >= 125 || v <= -125) ++q.clip;
+        }
+        int mean = means[lane] = sum / (int64_t)(samples - STALE);
+        uint64_t var = sq / (samples - STALE) - (int64_t)mean * mean;
+        power += var;
+        int margin = 0;
+        while ((uint64_t)(margin + 1) * (margin + 1) <= var) ++margin;
+        uint32_t count = 0;
+        for (size_t k = STALE + 1; k + 1 < samples; ++k) {
+            int a = (int8_t)(s_buf[k - 1] >> shift), v = (int8_t)(s_buf[k] >> shift), b = (int8_t)(s_buf[k + 1] >> shift);
+            int lo = a < b ? a : b, hi = a < b ? b : a;
+            if (v < lo - margin || v > hi + margin) ++count;
+        }
+        q.glitch[lane] = (uint32_t)((uint64_t)count * 1000 / n);
+    }
+    while ((uint64_t)(q.rms + 1) * (q.rms + 1) <= power) ++q.rms;
+    uint32_t near = 0;
+    for (size_t k = STALE; k < samples; ++k) {
+        int i = (int8_t)s_buf[k] - means[0], v = (int8_t)(s_buf[k] >> 8) - means[1];
+        uint32_t p = i * i + v * v;
+        near += p > power / 2 && p < power * 3 / 2;
+    }
+    q.ring = (uint32_t)((uint64_t)near * 1000 / (samples - STALE));
+    q.clip = (uint32_t)((uint64_t)q.clip * 1000 / (samples - STALE));
+    return q;
+}
+
+static bool set_probe_gain(int gain)
+{
+    char cmd[16], reply[48];
+    s_probe_gain = gain;
+    snprintf(cmd, sizeof cmd, "gain %d", gain);
+    return c5_request(cmd, reply, sizeof reply, 500);
+}
+
+/* The C5 starts at a gain that clips a near transmitter flat, which hides everything a probe looks for. */
+static bool settle_gain(void)
+{
+    for (int pass = 0; pass < 8; ++pass) {
+        if (capture(s_psram, GAIN_SAMPLES, s_edge) != ESP_OK) return false;
+        quality_t q = quality(GAIN_SAMPLES);
+        int gain = s_probe_gain;
+        if (q.clip > 20) gain -= 6;
+        else if (q.rms < 30) gain += 6;
+        gain = gain < PROBE_GAIN_MIN ? PROBE_GAIN_MIN : gain > PROBE_GAIN_MAX ? PROBE_GAIN_MAX : gain;
+        if (gain == s_probe_gain) break;
+        if (!set_probe_gain(gain)) return false;
+    }
+    return true;
+}
+
+/* A clean carrier glitches 1 to 4 times in a thousand samples and a lane read mid-change 15 to 26. Noise
+ * does as often as either, so nothing can be said without a carrier. */
+#define GLITCH_MAX 8
+#define RING_MIN 600
+static bool s_verified;
+
+/* Picks the edge whose worse lane glitches less, and says whether even that one is being read mid-change. */
+static bool pick_edge(bool *bad)
 {
     const parlio_sample_edge_t edges[] = {PARLIO_SAMPLE_EDGE_POS, PARLIO_SAMPLE_EDGE_NEG};
-    uint32_t r[2];
+    quality_t q[2];
+    uint32_t worst[2];
     for (int e = 0; e < 2; ++e) {
         esp_err_t err = capture(s_psram, PROBE_SAMPLES, edges[e]);
         if (err != ESP_OK) {
             say("iq: capture failed, %s\n", esp_err_to_name(err));
             return false;
         }
-        r[e] = roughness(PROBE_SAMPLES);
+        q[e] = quality(PROBE_SAMPLES);
+        worst[e] = q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1];
     }
-    s_edge = r[1] < r[0] ? PARLIO_SAMPLE_EDGE_NEG : PARLIO_SAMPLE_EDGE_POS;
-    say("roughness rise %lu.%02lu, fall %lu.%02lu: using %s\n", (unsigned long)(r[0] / 100),
-        (unsigned long)(r[0] % 100), (unsigned long)(r[1] / 100), (unsigned long)(r[1] % 100),
-        s_edge == PARLIO_SAMPLE_EDGE_POS ? "rise" : "fall");
+    int e = worst[1] < worst[0];
+    s_edge = edges[e];
+    s_verified = q[e].ring >= RING_MIN;
+    *bad = s_verified && worst[e] > GLITCH_MAX;
+    say("glitches per mille, I and Q: rise %lu %lu, fall %lu %lu, at gain %d and RMS %lu: using %s%s\n",
+        (unsigned long)q[0].glitch[0], (unsigned long)q[0].glitch[1], (unsigned long)q[1].glitch[0],
+        (unsigned long)q[1].glitch[1], s_probe_gain, (unsigned long)q[e].rms, e ? "fall" : "rise",
+        *bad ? ", which reads a lane mid-change" : s_verified ? "" : ", unchecked for want of a carrier");
     return true;
 }
 
@@ -436,11 +535,9 @@ static bool prepare(void)
     return true;
 }
 
-bool iq_start(const char *channel, int every)
+static bool start_c5(const char *channel, int every)
 {
-    if (!prepare()) return false;
     char cmd[24], reply[96];
-    decode_stop();
     if (!c5_run_c5rx(2000)) {
         say("iq: c5rx did not start\n");
         return false;
@@ -462,7 +559,30 @@ bool iq_start(const char *channel, int every)
             strlcpy(s_tuned, channel, sizeof s_tuned);
         }
     }
-    return pick_edge();
+    return true;
+}
+
+bool iq_start(const char *channel, int every)
+{
+    if (!prepare()) return false;
+    decode_stop();
+    for (int try = 0; try < START_TRIES; ++try) {
+        bool bad = false;
+        if (!start_c5(channel, every) || !set_probe_gain(s_probe_gain) || !settle_gain() || !pick_edge(&bad)) return false;
+        if (!bad) return true;
+        say("iq: resetting the C5 for another try\n");
+    }
+    return true;
+}
+
+int iq_gain(void)
+{
+    return s_probe_gain;
+}
+
+bool iq_verified(void)
+{
+    return s_verified;
 }
 
 const char *iq_channel(unsigned *mhz)
@@ -476,6 +596,11 @@ parlio_sample_edge_t iq_edge(void)
     return s_edge;
 }
 
+void iq_set_edge(parlio_sample_edge_t edge)
+{
+    s_edge = edge;
+}
+
 void iq_command(int argc, char **argv)
 {
     if (!prepare()) return;
@@ -485,7 +610,8 @@ void iq_command(int argc, char **argv)
     if (strcmp(sub, "start") == 0) {
         iq_start(argc > 2 ? argv[2] : "R3", argc > 3 ? atoi(argv[3]) : 2);
     } else if (strcmp(sub, "edge") == 0) {
-        pick_edge();
+        bool bad;
+        pick_edge(&bad);
     } else if (strcmp(sub, "dump") == 0) {
         dump();
     } else if (strcmp(sub, "bs") == 0) {
