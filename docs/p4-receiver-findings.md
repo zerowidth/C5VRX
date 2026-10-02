@@ -9,11 +9,49 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - I carries a DC offset that grows with gain: about 20 of ±127 at gain 64 and about 32 at 68. Q's is near 0. Upper I lanes that look stuck are sign bits riding on that offset. The phase table has to be built around the measured offset, or a small signal's phase is badly distorted.
 - The gain index is steep and nonlinear. On one bench setup, index 62 gave an I/Q RMS of 19, 72 gave 61 with 0.4% clipped, and 80 gave 114 with 69% clipped.
 - The carrier sits within about 0.3 MHz of the tuned center. R3 is reached from Wi-Fi channel 144 with `phy_set_freq`.
-- About three C5 starts in ten come up with the lanes read while they change, which adds about 18 dB of noise: sync tip noise is about 1000 kHz against 100 to 160 on the same signal, and 220 of 262 lines lock against 253. The samples are wrong where a lane crosses zero, since every bit turns over there: Q read -19, -113, 45 in one capture, and 3.7% of samples sat far off a carrier's ring whose radius otherwise varied 4%. Both lanes glitch, Q more.
-- That state is fixed at the C5's reset. Retuning 12 times, restarting its clock 10 times and running the clock at other divisors in between all left it as it was, and neither P4 edge avoids it: at one sample in six the edges are 37.5 ns apart, a whole 3 bus periods, so they read the bus at the same point. Why the C5 comes up that way is not known.
-- `iq_start` now sets a gain that doesn't clip, counts the samples that stand further outside their two neighbours than the lane's RMS (1 to 4 per thousand clean, 15 to 26 mid-change), and resets the C5 again when the better edge still exceeds 8. In 12 starts, 3 needed one more reset and all 12 ended clean. Noise glitches as often as either, so a start with no carrier (under 60% of samples near the mean power) goes unchecked, and the decoder starts once more when a transmitter first locks most of a field.
-- Every measurement in this document from before this was found may have been made in either state. The weak-signal figures of about 1000 kHz and 220 lines were the bad one.
 - Nothing upstream filters the video: a sync edge rises from tip to blanking within one 75 ns sample, so 3.58 MHz chroma would pass.
+
+## C5 starts that read the lanes mid-change
+
+About three C5 starts in ten come up with the P4 sampling the I/Q lanes while they change, which adds about 18 dB of noise. The P4 detects this and resets the C5 until it comes up clean, but what sets it is not known and nothing moves the sampling point.
+
+How it happens:
+
+- The C5 routes the modem's diagnostic bus straight to 14 pads through the GPIO matrix. The bus takes a new value every 12.5 ns, timed by the modem's own clock.
+- The sample clock on the 15th wire comes from somewhere else: the C5's PARLIO transmitter, dividing its 240 MHz PLL output by 18.
+- Nothing registers the data onto that clock. The P4 latches all 14 lanes on the clock's edge, which has to land where they are steady. On a bad start it lands on the change, and some lanes hold the last sample's bit and some the next one's.
+- Neighbouring bus samples mostly differ in their low bits, so a mixed read is nearly right. Where a lane crosses zero every upper bit turns over at once and a mixed read is garbage: Q read -19, -113, 45 in one capture.
+
+What it does, on the same signal at the same gain:
+
+- 3.7% of samples sit far off the carrier's ring, whose radius otherwise varies 4%. Both lanes glitch, Q more than I.
+- Sync tip noise is about 1000 kHz against 100 to 160, and 220 of 262 lines lock against 253.
+- Every measurement in this document from before this was found may have been made in either state. The weak-signal figures of about 1000 kHz and 220 lines were the bad one.
+
+What is established:
+
+- It is fixed at the C5's reset: 3 bad starts in 10, 3 in 10 and 3 in 12.
+- Retuning 12 times, restarting the C5's clock 10 times, and running the clock at other divisors in between 10 more times all left it as it was.
+- Neither P4 edge avoids it. At one sample in six the edges are 37.5 ns apart, a whole 3 bus periods, so they read the bus at the same point.
+
+What is not known:
+
+- What sets it. The guess is how the modem's 80 MHz clock and the 240 MHz clock line up at boot: three positions 4.17 ns apart, one of them bad, which fits the rate.
+- That guess has a hole: restarting the PARLIO clock should restart its divider on any 240 MHz tick and move the phase, and 20 restarts never did. Either the restart doesn't reset the divider or the cause is something else, such as the bus changing at a different moment on those starts.
+- How much margin a clean start has. If it is small, temperature or drift could carry a session over the edge, and nothing would notice.
+- Whether the standalone C5 receiver, which samples the same bus on a looped PARLIO clock, has the same lottery.
+
+The workaround, in `iq_start`:
+
+- It sets a gain that doesn't clip, since a clipped signal hides the glitches, then counts the samples that stand further outside their two neighbours than the lane's RMS: 1 to 4 per thousand clean, 15 to 26 mid-change. Above 8 on the better edge it resets the C5 and tries again, up to five times. In 12 starts, 3 needed one more reset and all 12 ended clean.
+- Noise glitches as often as either, so a start with no carrier (under 60% of samples near the mean power) goes unchecked. The decoder starts once more when a transmitter first locks most of a field. That path is untested.
+- A retry adds about 2 s to the start.
+
+Ways to fix it properly:
+
+1. Find something on the C5 that shifts its clock by one 4.17 ns step.
+2. Keep one sample in 5 or 7. The clock's halves are then unequal, the P4's two edges read the bus 4.17 ns apart, and one of them is clean. That changes the sample rate, which the decoder's line and subcarrier timing take to be 13.33 MS/s.
+3. Look at the clock against a Q lane on an oscilloscope, on good and bad starts, for the margin. The Saleae's 50 MS/s is too slow.
 
 ## The C5's gain table
 
@@ -67,7 +105,7 @@ What the C5 + P4 receiver has shown on the hardware so far: the C5-Zero exportin
 - The driver counts one DMA node per interrupt and falls behind when two nodes finish before it runs. The decoder reads the write position from the AXI-GDMA instead: the channel's `in_dscr_bf0` points at the current descriptor, whose second word is its buffer address.
 - A soft-delimiter EOF that lands mid-node ends that node early and leaves the rest of it stale, which showed up as staircase shifts in the picture. The ring (24 nodes of 4032 bytes) and the EOF period (8 nodes) are whole numbers of nodes.
 - The driver's node interrupt finds a zero length on the first node of every receive and logs "finished buffer is NULL or length is 0" with an early log, which prints straight to the UART at 115200 baud from the interrupt. That takes 6.4 ms with core 0's interrupts off, so the tick stops, the decode task on core 1 is not woken, and it loses about a ring and a half of samples (100 lines). It happened at every decoder start and retune, with or without the BitScrambler. The decoder now turns the ROM's printing off from each start until the control task's next pass.
-- The P4's two sampling edges read the C5's bus at the same point (see [The C5's I/Q](#the-c5s-iq)), so the choice between them matters little. `iq_start` keeps the one that glitches less.
+- The P4's two sampling edges read the C5's bus at the same point (see [C5 starts that read the lanes mid-change](#c5-starts-that-read-the-lanes-mid-change)), so the choice between them matters little. `iq_start` keeps the one that glitches less.
 
 ## P4 CPU and memory
 
