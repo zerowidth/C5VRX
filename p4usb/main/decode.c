@@ -201,10 +201,14 @@ static int s_tip = -57 * 16, s_blank = -17 * 16;
 static int32_t s_tip_sum, s_porch_sum, s_level_lines;
 static uint64_t s_noise_sq;
 static uint32_t s_noise_lines;
-/* Demodulated sample, as a uint8_t, to pixel level. */
-static uint8_t s_map[256];
-/* The same for the sum of four samples, which nulls the subcarrier's dots out of luma when there is color. */
-static uint8_t s_map4[1024];
+/* What luma_row needs to turn samples into pixel levels: for whole and half-sample line starts, the
+ * vectors it takes (see luma.S), and its shift. Two copies, so a line never draws with half of a new one. */
+typedef struct {
+    int8_t k[2][9][16];
+    int shift;
+} luma_t;
+static luma_t s_lumas[2] __attribute__((aligned(16)));
+static const luma_t *volatile s_luma = &s_lumas[0];
 static uint8_t *s_frame, *s_prev;
 
 /* Per-field counters for the status line. */
@@ -406,15 +410,39 @@ static void set_maps(void)
 {
     int span = s_blank - s_tip;
     if (span < 8 * 16) span = 8 * 16;
-    /* White is 100 IRE above blanking, and sync 40 below. */
-    for (int v = -128; v < 128; ++v) {
-        int pix = (v * 16 - s_blank) * 255 * 2 / (span * 5);
-        s_map[(uint8_t)v] = pix < 0 ? 0 : pix > 255 ? 255 : pix;
+    luma_t *m = s_luma == &s_lumas[0] ? &s_lumas[1] : &s_lumas[0];
+    /* White is 100 IRE above blanking, and sync 40 below: a pixel is 408 / span times the sum of four
+     * samples above blanking. The weights' sum carries that gain, as large as int8 weights allow. */
+    int shift = 0, sum = 0;
+    for (int k = 12; k >= 0; --k) {
+        sum = (1632 << k) / span;
+        shift = k;
+        if (sum <= 504) break;
     }
-    for (int v = -512; v < 512; ++v) {
-        int pix = (v * 16 - 4 * s_blank) * 255 * 2 / (span * 20);
-        s_map4[v + 512] = pix < 0 ? 0 : pix > 255 ? 255 : pix;
+    if (sum > 504) sum = 504;
+    /* Blanking, and the 128 levels that centre the result for the signed clamp, come off each sample in
+     * whole units, and the rest, with the rounding, off the sum. */
+    int bias = (128 << shift) - (shift ? 1 << (shift - 1) : 0);
+    int whole = lrintf(s_blank / 16.0f + (float)bias / sum);
+    whole = whole < -127 ? -127 : whole > 127 ? 127 : whole;
+    int rest = (whole * 16 - s_blank) * sum / 16 - bias;
+    int a = 0, b = 1;
+    for (int k = 1, best = INT32_MAX; k <= 127; ++k) {
+        int q = (rest + (rest < 0 ? -k / 2 : k / 2)) / k;
+        if (abs(q) <= 127 && abs(q * k - rest) < best) best = abs(q * k - rest), a = q, b = k;
     }
+    /* The sum of four samples nulls the subcarrier's dots out of luma. A line starting half a sample late
+     * is the mean of two such sums, which is five samples weighted 1 2 2 2 1. */
+    int w[2][5] = {{sum / 4, (sum + 2) / 4, (sum + 3) / 4, (sum + 1) / 4, 0}};
+    int ends = sum / 8, mid = sum - 2 * ends;
+    w[1][0] = w[1][4] = ends;
+    w[1][1] = mid / 3, w[1][2] = (mid + 2) / 3, w[1][3] = (mid + 1) / 3;
+    for (int h = 0; h < 2; ++h) {
+        const int v[9] = {whole, w[h][1], w[h][2], w[h][3], w[h][4], a, b, w[h][0], 0x80};
+        for (int k = 0; k < 9; ++k) memset(m->k[h][k], v[k], 16);
+    }
+    m->shift = shift;
+    s_luma = m;
 }
 
 /* The burst vector, filtered over lines, and the color killer's state. */
@@ -522,7 +550,7 @@ static uint8_t *strip_rows(int row, int n)
 /* The luma filter reads one sample before and two after each pixel. */
 #define LINE_SPAN (PICTURE_START + VIDEO_WIDTH + 32)
 /* A line's samples in one piece, for each core, when the line straddles the end of the ring. */
-static uint8_t s_wrapped[2][(LINE_Q16 >> 16) + 64] __attribute__((aligned(16)));
+static uint8_t s_wrapped[(LINE_Q16 >> 16) + 64] __attribute__((aligned(16)));
 
 static const int8_t *line_samples(uint32_t l, uint8_t *wrapped)
 {
@@ -579,7 +607,7 @@ static void chroma_blocks(const int8_t *s, uint32_t l, bool half, int32_t *zr, i
  * degrees on the U axis with 20 IRE amplitude; then full-range Cb and Cr at 100 IRE to 255. The signs
  * were set against SMPTE bars. zr and zi hold two lines' blocks from index 1, with room either side: the
  * subcarrier turns half a cycle a line, so luma detail that leaks into chroma cancels while chroma adds. */
-static void chroma_words(int32_t *zr, int32_t *zi, uint32_t *uv)
+static void chroma_words(int32_t *zr, int32_t *zi, uint64_t *uv)
 {
     enum { N = VIDEO_WIDTH / MIX };
     float m2 = s_burst_re * s_burst_re + s_burst_im * s_burst_im;
@@ -595,7 +623,8 @@ static void chroma_words(int32_t *zr, int32_t *zi, uint32_t *uv)
         int32_t cb = 128 + ((re * a1 + im * a2) >> 12), cr = 128 + ((re * a3 + im * a4) >> 12);
         cb = cb < 0 ? 0 : cb > 255 ? 255 : cb;
         cr = cr < 0 ? 0 : cr > 255 ? 255 : cr;
-        uv[j] = (uint32_t)cr | (uint32_t)cb << 16;
+        uint32_t pair = (uint32_t)(cr | cb << 8) * 0x00010001u;
+        uv[j] = pair | (uint64_t)pair << 32;
     }
 }
 
@@ -755,32 +784,18 @@ static void forget_old(void)
     s_old_errors_field = false;
 }
 
-/* 8 pixels to one chroma word, each Y a running 4-sample sum, or with `half` the mean of two, which
- * starts the line half a sample later. */
-static inline __attribute__((always_inline)) void luma_row(uint32_t *dst, const int8_t *s, const uint32_t *uv, bool half)
+void luma_row(const int8_t *s, uint8_t *dst, const uint64_t *uv, int n, const int8_t (*k)[16], int shift);
+
+/* A line's picture samples from one before the first, at a 16-byte boundary for luma_row. */
+static const int8_t *picture_samples(uint32_t l)
 {
-    const uint8_t *map4 = s_map4 + 512;
-    int32_t p0 = s[-1], p1 = s[0], p2 = s[1];
-    int32_t sum = p0 + p1 + p2;
-    for (int x = 0; x < VIDEO_WIDTH; x += MIX, s += MIX, dst += MIX / 2) {
-        uint32_t c = *uv++;
-        int32_t q0 = s[2], q1 = s[3], q2 = s[4], q3 = s[5], q4 = s[6], q5 = s[7], q6 = s[8], q7 = s[9];
-        int32_t a0 = sum + q0, a1 = a0 - p0 + q1, a2 = a1 - p1 + q2, a3 = a2 - p2 + q3;
-        int32_t a4 = a3 - q0 + q4, a5 = a4 - q1 + q5, a6 = a5 - q2 + q6, a7 = a6 - q3 + q7;
-        sum = a7 - q4;
-        if (half) {
-            int32_t a8 = sum + s[10];
-            a0 = (a0 + a1) >> 1, a1 = (a1 + a2) >> 1, a2 = (a2 + a3) >> 1, a3 = (a3 + a4) >> 1;
-            a4 = (a4 + a5) >> 1, a5 = (a5 + a6) >> 1, a6 = (a6 + a7) >> 1, a7 = (a7 + a8) >> 1;
-        }
-        dst[0] = (uint32_t)map4[a0] << 8 | (uint32_t)map4[a1] << 24 | c;
-        dst[1] = (uint32_t)map4[a2] << 8 | (uint32_t)map4[a3] << 24 | c;
-        dst[2] = (uint32_t)map4[a4] << 8 | (uint32_t)map4[a5] << 24 | c;
-        dst[3] = (uint32_t)map4[a6] << 8 | (uint32_t)map4[a7] << 24 | c;
-        p0 = q5;
-        p1 = q6;
-        p2 = q7;
-    }
+    static int8_t copy[VIDEO_WIDTH + 32] __attribute__((aligned(16)));
+    uint32_t start = (l + PICTURE_START - 1) % HIST, n = VIDEO_WIDTH + 16;
+    if (start % 16 == 0 && start + n <= HIST) return s_hist + start;
+    uint32_t first = HIST - start < n ? HIST - start : n;
+    memcpy(copy, s_hist + start, first);
+    memcpy(copy + first, s_hist, n - first);
+    return copy;
 }
 
 /* Each Y of a missing row is the median of the Ys above, below and in the previous field: where the
@@ -796,24 +811,18 @@ static void draw_line(const job_t *j)
         int row = j->row, first = row > 0 ? row - 1 : row, n = row - first + 1 + (row + 2 == VIDEO_HEIGHT);
         uint8_t *rows = strip_rows(first, n);
         uint32_t *dst = (uint32_t *)(rows + (row - first) * ROW_BYTES);
-        const int8_t *s = line_samples(j->l, s_wrapped[0]) + PICTURE_START;
         /* The encoder reads its Y0 V Y1 U as big-endian halfwords, so in memory they are V Y0 U Y1. */
         uint32_t t0 = esp_cpu_get_cycle_count();
         ++s_prof_lines;
-        if (j->color) {
-            /* Per block of MIX pixels, Cb and Cr placed where the encoder's words want them. */
-            static uint32_t uv[VIDEO_WIDTH / MIX];
-            if (j->z) chroma_words(j->z, j->z + VIDEO_WIDTH / MIX + 2, uv);
-            s_prof_chroma += esp_cpu_get_cycle_count() - t0;
-            if (j->half)
-                luma_row(dst, s, uv, true);
-            else
-                luma_row(dst, s, uv, false);
-        } else {
-            const uint8_t *map = s_map;
-            const uint8_t *u = (const uint8_t *)s;
-            for (int x = 0; x < VIDEO_WIDTH; x += 2) dst[x / 2] = (uint32_t)map[u[x]] << 8 | (uint32_t)map[u[x + 1]] << 24 | 0x00800080u;
-        }
+        /* Per block of MIX pixels, Cr and Cb where the encoder's words want them. */
+        static uint64_t uv[VIDEO_WIDTH / MIX] __attribute__((aligned(16)));
+        if (!j->color)
+            memset(uv, 0x80, sizeof uv);
+        else if (j->z)
+            chroma_words(j->z, j->z + VIDEO_WIDTH / MIX + 2, uv);
+        s_prof_chroma += esp_cpu_get_cycle_count() - t0;
+        const luma_t *m = s_luma;
+        luma_row(picture_samples(j->l), (uint8_t *)dst, uv, VIDEO_WIDTH / 16, m->k[j->half], m->shift);
         const uint8_t *below = (const uint8_t *)dst;
         if (row > 0) {
             const uint8_t *old = old_row(row - 1);
@@ -856,7 +865,7 @@ static void render_line(void)
         job_t j = {.l = s_line + (halves >> 1), .row = row, .draw = draw, .last = last, .half = halves & 1};
         bool second = (s_vline - FIRST_ACTIVE) % 2;
         if (draw && s_job_head - s_job_tail < JOBS) {
-            const int8_t *src = line_samples(j.l, s_wrapped[1]);
+            const int8_t *src = line_samples(j.l, s_wrapped);
             if (s_hit) measure_burst(src, j.l);
             j.color = s_color;
             if (s_color) {
@@ -1408,10 +1417,10 @@ static void status(void)
         (unsigned long)s_overruns, (unsigned long)(s_draw_load.permille / 10),
         (unsigned long)(s_draw_load.permille % 10), (unsigned long)s_draw_dropped);
     if (s_prof_lines)
-        say("per drawn line: %lu cycles, %lu of them chroma, and %lu of chroma on core 1\n",
+        say("per drawn line: %lu cycles, %lu of them chroma, %lu more starting copies to the frame, and %lu of chroma on core 1\n",
             (unsigned long)(s_prof_pix / s_prof_lines), (unsigned long)(s_prof_chroma / s_prof_lines),
-            (unsigned long)(s_prof_chroma1 / s_prof_lines));
-    s_prof_pix = s_prof_chroma = s_prof_lines = s_prof_chroma1 = 0;
+            (unsigned long)(s_prof_flush / s_prof_lines), (unsigned long)(s_prof_chroma1 / s_prof_lines));
+    s_prof_pix = s_prof_chroma = s_prof_lines = s_prof_chroma1 = s_prof_flush = 0;
 }
 
 /* Runs the stopped decoder over whatever the ring holds, to price each stage per demodulated sample. */
