@@ -246,14 +246,18 @@ static int find_dma_channel(void)
     return -1;
 }
 
-/* The ring offset of the node the DMA finished last or is still filling; everything before it is done.
- * A descriptor's second word is its buffer address. */
+/* The ring offset up to which the DMA's data is in memory. The register names a node while the one
+ * before it is still being written, so the reader stays a node behind that. A descriptor's second word
+ * is its buffer address. */
 static uint32_t dma_offset(void)
 {
     uint32_t desc = AXI_DMA.in[s_dma_ch].conf.in_dscr_bf0.val;
     if (!desc) return s_read;
     uint32_t off = ((const uint32_t *)desc)[1] - (uint32_t)s_ring;
-    return off < RING_BYTES ? off : s_read;
+    if (off >= RING_BYTES) return s_read;
+    uint32_t done = (off + RING_BYTES - NODE_BYTES) % RING_BYTES;
+    /* Just after a start the DMA is on the first node and nothing is done. */
+    return (done - s_read + RING_BYTES) % RING_BYTES < RING_BYTES - NODE_BYTES ? done : s_read;
 }
 
 /* Words carry I and Q as 2v+1 for signed 7-bit v. The table sees the top 6 bits of I, so it takes the
