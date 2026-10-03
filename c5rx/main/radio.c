@@ -51,6 +51,7 @@ extern void phy_force_rx_gain(bool enable, uint8_t gain_idx);
 extern void phy_set_freq(uint16_t freq_mhz, int offset);
 extern int phy_get_noise_floor(void);
 extern int phy_get_rssi(void);
+extern void phy_11p_set(int enable, int mode);
 
 static const char BANDS[] = "RABEFL";
 static const uint16_t CHANNEL_MHZ[6][8] = {
@@ -72,11 +73,14 @@ static const struct {
 };
 #define MIN_MHZ 5180
 #define MAX_MHZ 5945
+/* The tuned frequency from which the 802.11p front-end setting lowers the noise. */
+#define MHZ_11P 5750
 
 static bool s_started;
 static char s_channel[4];
 static uint16_t s_mhz;
 static uint8_t s_gain = DEFAULT_GAIN;
+static bool s_11p;
 static parlio_tx_unit_handle_t s_clock;
 static uint8_t *s_clock_pattern;
 
@@ -124,6 +128,7 @@ static void receive_state(void)
     phy_rfagc_disable();
     phy_wifi_fbw_sel(1);
     phy_force_rx_gain(true, s_gain);
+    phy_11p_set(s_11p, 0);
 }
 
 static esp_err_t start(void)
@@ -197,6 +202,7 @@ esp_err_t radio_tune(const char *name)
     if ((err = esp_wifi_set_channel(WIFI_CENTERS[best].channel, WIFI_SECOND_CHAN_NONE)) != ESP_OK) return err;
     if (mhz != WIFI_CENTERS[best].mhz) phy_set_freq(mhz, 0);
     continuous_modem();
+    s_11p = mhz >= MHZ_11P;
     receive_state();
     strlcpy(s_channel, label, sizeof s_channel);
     s_mhz = mhz;
@@ -217,6 +223,12 @@ void radio_set_gain(uint8_t index)
 {
     s_gain = index;
     if (s_started) phy_force_rx_gain(true, index);
+}
+
+void radio_11p(int enable, int mode)
+{
+    s_11p = enable;
+    if (s_started) phy_11p_set(enable, mode);
 }
 
 uint8_t radio_gain(void)

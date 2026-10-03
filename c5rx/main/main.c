@@ -73,6 +73,9 @@ static void run_command(char *line)
     } else if (strcmp(argv[0], "gain") == 0 && argc == 2) {
         radio_set_gain((uint8_t)atoi(argv[1]));
         reply("ok gain %u", radio_gain());
+    } else if (strcmp(argv[0], "11p") == 0 && argc == 3) {
+        radio_11p(atoi(argv[1]), atoi(argv[2]));
+        reply("ok 11p %d %d", atoi(argv[1]), atoi(argv[2]));
     } else if (strcmp(argv[0], "iq") == 0 && (argc == 2 || argc == 3 || argc == 5) && strcmp(argv[1], "on") == 0) {
         link_stop();
         int every = argc >= 3 ? atoi(argv[2]) : 2;

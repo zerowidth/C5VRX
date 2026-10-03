@@ -11,6 +11,7 @@ esp_err_t radio_tune(const char *channel);
 const char *radio_channel(void);
 uint16_t radio_mhz(void);
 void radio_set_gain(uint8_t index);
+void radio_11p(int enable, int mode);
 uint8_t radio_gain(void);
 /* Wideband RSSI and noise floor in dBm; false when the PHY gave an implausible value. */
 bool radio_rssi(int *dbm);
