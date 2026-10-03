@@ -1508,7 +1508,8 @@ static bool start(const char *channel, bool force)
             return false;
         }
         /* Above sync, so the gain comes down even when a clipped signal floods the sync detector. */
-        xTaskCreatePinnedToCore(control_task, "decode_ctl", 3072, NULL, 6, NULL, 0);
+        /* Its restart probes the C5, and a probe's receive puts 6 KB of DMA descriptors on the stack. */
+        xTaskCreatePinnedToCore(control_task, "decode_ctl", 12288, NULL, 6, NULL, 0);
         set_thresholds();
         set_maps();
         s_frame = video_field_buffer();
