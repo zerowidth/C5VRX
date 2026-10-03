@@ -160,8 +160,6 @@ static float s_bs_err_i, s_bs_err_q;
  * unit a gain step and more at high gains, and a table that is 3 units out triples its error. */
 #define DC_UNKNOWN INT16_MIN
 static int16_t (*s_dc_at_gain)[2];
-/* Control passes since the gain last moved; the sums of the first hold samples from both gains. */
-static int s_bs_since_gain = 100;
 static uint32_t s_bs_short, s_bs_mixed, s_bs_rewrites, s_bs_reload_us;
 
 /* Demodulator and sync state, owned by the decode task. */
@@ -300,12 +298,14 @@ static void remember_dc(int qi, int qq)
     }
 }
 
-static void steer_gain(void)
+/* While the table's centre sits outside the carrier's ring the RMS reads high, so it can raise the gain
+ * but not lower it. */
+static void steer_gain(bool rms_known)
 {
     if (!s_agc) return;
     int gain = s_gain;
     if (s_clip_permille > CLIP_PERMILLE_HEAVY) gain -= GAIN_STEP_HEAVY;
-    else if (s_clip_permille > CLIP_PERMILLE_MAX || s_rms > RMS_HIGH) gain -= GAIN_STEP;
+    else if (s_clip_permille > CLIP_PERMILLE_MAX || (rms_known && s_rms > RMS_HIGH)) gain -= GAIN_STEP;
     else if (s_rms < RMS_LOW) gain += GAIN_STEP;
     gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
     if (gain != s_gain) set_gain(gain);
@@ -330,26 +330,46 @@ static void control(void)
     uint32_t clipped = s_dc_clipped;
     s_dc_n = s_neg_i = s_neg_q = 0;
     s_dc_power = s_dc_clipped = 0;
-    s_rms = (int)lrintf(sqrtf(power));
+    /* How far the table's centre sits from the ring's, as a share of its radius, from the excess of negative
+     * signs. I's power is taken about the table's centre, so an offset adds twice its square to it. */
+    float si = sinf((float)M_PI * (neg_i - 0.5f)), sq = sinf((float)M_PI * (neg_q - 0.5f));
+    float radius = sqrtf(power / (1 + 2 * si * si));
+    /* With every I on one side the centre is outside the ring: the power is mostly offset, and the radius
+     * is somewhere under its root. Q has no power of its own, so outside the ring it is at least a radius out. */
+    bool outside = neg_i < 0.02f || neg_i > 0.98f, outside_q = !outside && (neg_q < 0.02f || neg_q > 0.98f);
+    float di = outside ? copysignf(sqrtf(power / 2), si) : si * radius, dq = outside ? 0 : sq * radius;
+    s_rms = (int)lrintf(outside ? sqrtf(power) : radius);
     s_clip_permille = clipped * 1000 / n;
     int gain = s_gain;
-    steer_gain();
+    steer_gain(!outside);
+    bool stepped = s_gain != gain;
+    if (stepped) {
+        /* The next pass reads the new gain alone. */
+        s_dc_n = s_neg_i = s_neg_q = 0;
+        s_dc_power = s_dc_clipped = 0;
+        s_bs_err_i = s_bs_err_q = 0;
+    }
     if (s_bs_pending) return;
 
-    if (s_gain != gain) {
-        /* The offset moves with the gain, so the table goes straight to what this gain had before. */
-        s_bs_since_gain = 0;
-        s_bs_err_i = s_bs_err_q = 0;
-        if (!s_dc_at_gain || s_dc_at_gain[s_gain][0] == DC_UNKNOWN) return;
-        /* A reload costs lines, so a table within a step of this gain's offset stays. */
+    bool known = stepped && s_dc_at_gain && s_dc_at_gain[s_gain][0] != DC_UNKNOWN;
+    if (known) {
+        /* The offset moves with the gain, so the table goes straight to what this gain had before. A reload
+         * costs lines, so a table within a step of it stays. */
         if (abs(s_dc_at_gain[s_gain][0] - s_lut_dc_i) < 4 * BS_DC_STEP && abs(s_dc_at_gain[s_gain][1] - s_lut_dc_q) < 4 * BS_DC_STEP) return;
         s_bs_dc_i = s_dc_at_gain[s_gain][0] / 4.0f;
         s_bs_dc_q = s_dc_at_gain[s_gain][1] / 4.0f;
+    } else if (s_rms < 4) {
+        return;
+    } else if (outside || outside_q) {
+        /* No smoothing: the table is useless until its centre is inside the ring. Taken at the last gain
+         * when the gain has just stepped, which is still nearer than the table is. */
+        s_bs_dc_i -= di;
+        s_bs_dc_q -= dq;
+        s_bs_err_i = s_bs_err_q = 0;
+    } else if (stepped) {
+        return;
     } else {
-        if (s_bs_since_gain++ == 0 || s_rms < 4) return;
-        /* How far the table's offset sits above the signal's centre, from the excess of negative signs.
-         * One half second's reading wanders up to 3 units through fades, so it is smoothed over about eight. */
-        float di = s_rms * sinf((float)M_PI * (neg_i - 0.5f)), dq = s_rms * sinf((float)M_PI * (neg_q - 0.5f));
+        /* One half second's reading wanders up to 3 units through fades, so it is smoothed over about eight. */
         const int over = 8;
         s_bs_err_i += (di - s_bs_err_i) / over;
         s_bs_err_q += (dq - s_bs_err_q) / over;
