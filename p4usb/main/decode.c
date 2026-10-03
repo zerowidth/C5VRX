@@ -1470,7 +1470,7 @@ static esp_err_t start_rx(void)
     return ESP_OK;
 }
 
-static bool start(const char *channel)
+static bool start(const char *channel, bool force)
 {
     if (!s_ring) {
         s_ring = heap_caps_aligned_calloc(128, 1, RING_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
@@ -1497,7 +1497,9 @@ static bool start(const char *channel)
         xTaskCreatePinnedToCore(draw_task, "decode_draw", 4096, NULL, 7, &s_draw_task, 0);
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, 10, &s_task, 1);
     }
-    if (!iq_start(channel, EVERY)) return false;
+    /* A failed probe still leaves the decoder running on the last edge and gain, as it must always run. */
+    bool probed = iq_start(channel, EVERY);
+    if (!probed && !force) return false;
     /* Where iq_start found the signal unclipped is a better start than wherever the last channel left it. */
     set_gain(s_agc ? iq_gain() : s_gain);
     /* The table starts on the offset the probe's raw capture measured, which the sign balance takes seconds
@@ -1512,7 +1514,7 @@ static bool start(const char *channel)
         return false;
     }
     say("decoding\n");
-    return true;
+    return probed;
 }
 
 static char s_channel[8] = "R3";
@@ -1608,9 +1610,9 @@ static void bench(void)
         (unsigned long)(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000ull / FS_HZ));
 }
 
-static bool start_on(const char *channel)
+static bool start_on(const char *channel, bool force)
 {
-    if (!start(channel)) return false;
+    if (!start(channel, force)) return false;
     strlcpy(s_channel, iq_channel(&s_mhz), sizeof s_channel);
     return true;
 }
@@ -1619,13 +1621,13 @@ bool decode_start(const char *channel)
 {
     decode_stop();
     if (channel && strcasecmp(channel, s_channel) != 0) {
-        if (start_on(channel)) return true;
+        if (start_on(channel, false)) return true;
         say("decode: back to %s\n", s_channel);
         decode_stop();
-        start_on(s_channel);
+        start_on(s_channel, true);
         return false;
     }
-    return start_on(s_channel);
+    return start_on(s_channel, true);
 }
 
 const char *decode_channel(unsigned *mhz)
