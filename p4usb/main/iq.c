@@ -567,6 +567,15 @@ static bool prepare(void)
     return true;
 }
 
+static void note_tune(const char *reply, const char *asked)
+{
+    /* A bare frequency tunes with no label, so fall back to what was asked for. */
+    if (sscanf(reply, "ok tune %7s %u", s_tuned, &s_mhz) != 2) {
+        s_mhz = (unsigned)atoi(reply + 8);
+        strlcpy(s_tuned, asked, sizeof s_tuned);
+    }
+}
+
 static bool start_c5(const char *channel, int every)
 {
     char cmd[24], reply[96];
@@ -585,12 +594,20 @@ static bool start_c5(const char *channel, int every)
             return false;
         }
         say("%s\n", reply);
-        /* A bare frequency tunes with no label, so fall back to what was asked for. */
-        if (i == 0 && sscanf(reply, "ok tune %7s %u", s_tuned, &s_mhz) != 2) {
-            s_mhz = (unsigned)atoi(reply + 8);
-            strlcpy(s_tuned, channel, sizeof s_tuned);
-        }
+        if (i == 0) note_tune(reply, channel);
     }
+    return true;
+}
+
+bool iq_retune(const char *channel)
+{
+    char cmd[24], reply[96];
+    snprintf(cmd, sizeof cmd, "tune %s", channel);
+    if (!c5_request(cmd, reply, sizeof reply, 5000)) {
+        say("iq: %s: %s\n", cmd, reply);
+        return false;
+    }
+    note_tune(reply, channel);
     return true;
 }
 

@@ -17,6 +17,7 @@ bool iq_verified(void);
 void iq_dc(float *i, float *q);
 /* The C5's name and frequency for the channel last tuned. */
 const char *iq_channel(unsigned *mhz);
+bool iq_retune(const char *channel);
 parlio_sample_edge_t iq_edge(void);
 void iq_set_edge(parlio_sample_edge_t edge);
 /* A PARLIO RX unit on the C5's clock and 14 lanes: I in the low byte and Q in the high byte of each

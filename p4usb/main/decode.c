@@ -1619,6 +1619,12 @@ static bool start_on(const char *channel, bool force)
 
 bool decode_start(const char *channel)
 {
+    /* The C5 streams I/Q across a retune and the gain loop follows the new signal, so no restart is needed. */
+    if (s_running && channel && strcasecmp(channel, s_channel) != 0) {
+        if (!iq_retune(channel)) return false;
+        strlcpy(s_channel, iq_channel(&s_mhz), sizeof s_channel);
+        return true;
+    }
     decode_stop();
     if (channel && strcasecmp(channel, s_channel) != 0) {
         if (start_on(channel, false)) return true;
