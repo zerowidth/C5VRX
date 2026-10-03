@@ -71,7 +71,7 @@ static const struct {
     {157, 5785}, {161, 5805}, {165, 5825}, {169, 5845}, {173, 5865}, {177, 5885},
 };
 #define MIN_MHZ 5180
-#define MAX_MHZ 5885
+#define MAX_MHZ 5945
 
 static bool s_started;
 static char s_channel[4];
