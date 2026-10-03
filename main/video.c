@@ -295,13 +295,11 @@ static volatile int s_last_phy_rssi_dbm = -127;
 static volatile bool s_noise_floor_valid;
 static volatile bool s_phy_rssi_valid;
 
-/* TX GPIO mapping: 6-bit resistor DAC.
- * Order: DAC bit 0 (LSB) .. DAC bit 5 (MSB) on data_gpio_nums[0..5].
- * Bits 6..7 unused (set to -1).
- * Verified against C5VRX-2 realtime.c (standard 8-bit PARLIO TX, non-parlio4). */
-static const int s_dac_gpio[8] = {23, 24, 11, 12, 8, 9, -1, -1};
+/* 6-bit resistor DAC, bit 0 (8.2k) .. bit 5 (240R), ascending the Waveshare
+ * C5-Zero's right edge. GPIO 7 is skipped because it is a strapping pin. */
+static const int s_dac_gpio[8] = {6, 8, 9, 10, 12, 11, -1, -1};
 /* 4-bit mode drives the four MSB resistor branches: weights 4/8/16/32. */
-static const int s_dac4_gpio[4] = {11, 12, 8, 9};
+static const int s_dac4_gpio[4] = {9, 10, 12, 11};
 
 _Static_assert(IQ_RATE_HZ == 40000000u, "IQ rate must be 40 MHz");
 _Static_assert(DAC_RATE_HZ == 40000000u, "DAC rate must be 40 MHz");
@@ -337,11 +335,9 @@ static esp_err_t prepare_rx(void)
         .clk_in_gpio_num   = -1,
         .clk_out_gpio_num  = -1,
         .valid_gpio_num    = -1,
-        /* GPIO order must match s_iq_pins[] in rf.c:
-         * Q[9:6] on GPIO 1,0,25,7 then I[9:6] on GPIO 10,5,3,4. */
         .data_gpio_nums    = {
-            GPIO_NUM_1, GPIO_NUM_0, GPIO_NUM_25, GPIO_NUM_7,
-            GPIO_NUM_10, GPIO_NUM_5, GPIO_NUM_3, GPIO_NUM_4,
+            rf_iq_pins[0], rf_iq_pins[1], rf_iq_pins[2], rf_iq_pins[3],
+            rf_iq_pins[4], rf_iq_pins[5], rf_iq_pins[6], rf_iq_pins[7],
         },
         .flags = {
             .free_clk    = true,   /* RX clock is derived from PHY, not gated */
@@ -4947,6 +4943,8 @@ esp_err_t video_start(void)
 
     settings_load();
     apply_rx_profile(s_rx_profile);
+    /* Bench testing: ignore the saved channel and start on R3. */
+    (void)rf_set_channel(FPV_BAND_R * 8u + 2u);
 
     /* Zero the ring before starting. Flush to DMA-visible SRAM. */
     memset(s_raw_ring, 0, sizeof(s_raw_ring));

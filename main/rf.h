@@ -3,6 +3,12 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "arc_phy.h"
+#include "soc/gpio_num.h"
+
+#define RF_IQ_LANES 8
+
+/* Loopback pads carrying Q4/I4, in PARLIO RX data line order. */
+extern const gpio_num_t rf_iq_pins[RF_IQ_LANES];
 
 /**
  * rf_start() - Initialize the ESP32-C5 Wi-Fi/PHY receive-only frontend.
