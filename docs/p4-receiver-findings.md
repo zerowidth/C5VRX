@@ -65,7 +65,7 @@ What `iq_start` does:
 - While it reads mid-change it slips the clock and counts again, up to 16 times. On noise, where the edges are judged apart, it settles for one clean edge after 8.
 - With a carrier and each edge judged alone at 10 per thousand, 14 starts took 1 to 4 probes each and all decoded with 151 to 249 kHz of sync tip noise. Six of the 14 came up mid-change.
 - Judged on the sum, 24 starts all ended clean: 18 on the first probe, 5 after one slip and 1 after two, the second probe of that one being a 38 and 7 read. Sync tip noise after the last was 182 kHz.
-- On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is the poorer guide. So a start with no carrier is marked, and the decoder starts once more when a transmitter first locks most of a field. That restart has not been watched happening.
+- On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is the poorer guide. So a start with no carrier is marked, and the decoder starts once more when a transmitter first locks most of a field. The restart runs on the control task, whose 3 KB stack the probe's receive overflowed (about 6 KB of DMA descriptors), so the first lock after a boot on an empty channel panicked. With 12 KB it restarts about a second after the lock and is decoding again 2 s later.
 - Before slipping was found, the P4 reset the C5 instead until it came up clean: with a carrier, 3 starts in 12 needed one more reset and all 12 ended clean.
 
 Still to do:
@@ -230,6 +230,11 @@ The decoder runs `bs_phase.bsasm` on PARLIO RX.
 
 - With the CPU's table gone, the first table is built around the mean of the start's raw probe capture, which is taken at the gain the decoder starts with. Starting from zero instead, the sign balance closes an eighth of the error each half second and rewrites the table each time. Three starts from the probe's offset needed no rewrite in the 20 to 30 s after, at 40.8 to 41.0% of core 1.
 - By eye on a moving transmitter the BitScrambler's picture was good enough to drop the CPU's table.
+- R4 (5769 MHz, reached from Wi-Fi channel 153) decodes as R3 does: 253 to 254 of 262 lines, sync tip near -2.3 MHz and 80 to 90 kHz of sync tip noise at gain 37 to 40.
+- An empty channel at gain 77 has an I offset of about 84 to 90, against about 1 at gain 37. Retuning from there to a strong transmitter left the table's centre outside the carrier's ring. Every I then has one sign, I's power reads as the offset (RMS 148 for a true 45), and the gain went to its floor of 30 while the offset walked back 6 units a pass: about 15 s without a picture.
+- With every I (or Q) on one side, the table now moves in one pass: by the root of half the power on I, which is the offset when it dwarfs the radius, and by a radius on Q. Meanwhile the RMS is an upper bound, so it may raise the gain but only clipping lowers it. Inside the ring the offset is the sign balance times the radius, and the radius is the root of the power over 1 + 2s², s being the sine the balance gives. The same retune now locks in 2.3 to 3.0 s.
+- The sums are cleared after each gain step, so every pass reads one gain. Before, the pass after a step was skipped, and a gain stepping every pass held the offset still.
+- Applying every reading over 6 units without smoothing was tried and dropped: with the transmitter off it rewrote the table every pass.
 
 Not done yet:
 
