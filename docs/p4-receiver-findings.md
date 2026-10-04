@@ -96,7 +96,7 @@ Still to do:
 - Luma is each pixel's sum of four samples smoothed 1 2 1 (seven taps, in `luma.S`). Against the plain sum, flat areas of a recording were 3.6 dB quieter from field to field (2.2 levels rms against 3.3, after JPEG), OSD text stayed crisp, and core 0 went from 39% to 43%. The response gives up 0.5 dB at 1 MHz and 2 dB at 2 MHz. `decode luma plain` returns to the plain sum for comparison, and `decode luma peak` peaks it -1 4 -1 instead, which brings back an OSD outline beside a stem (one or two samples wide, and averaged with the stem by the sum) for twice the noise of the smoothed sum. By eye the smoothed sum is still the better picture, so it stays the default.
 - A line with an FM click is drawn in the color of the lines above. A click is a step of most of a cycle between two samples, and it rings in the chroma band as a dash of saturated color. In a raw capture, lines with a dash had a sample-to-sample step of 150 or more of the 256 in a cycle, and clean lines stayed under 80 (an OSD edge is about 72), so `jumps.S` finds each line's largest step and 110 marks a click. The line and the one it shares chroma with take the last pair's color, and the click stays as a black or white speck, so the noise still shows without the dash. At 320 kHz of sync-tip noise about one line in ten had a click. It costs 2.5% of core 1. `decode clicks gray` draws them without color instead, which showed as gray rows in a colorful scene, and `decode clicks off` draws them in their own color for comparison.
 - With the plain sum, lines starting on a half sample (five taps, 1 2 2 2 1) carried 3.8 dB less noise than whole-sample ones, by calculation for noise rising 6 dB an octave. Smoothed, the two differ by 0.8 dB.
-- The phase table's rounding matters only at low amplitude. At RMS 19 the porch noise was 241 kHz with a 6+6-bit table against 185 kHz exact; at RMS 61 it was 172 against 164. Hence the gain control now aims for RMS 40-72, and a 7+7-bit table isn't worth its 32 KB. The table now in use keeps 6 bits of I and all 7 of Q in 16 KB, since indexing by the raw word brought the seventh Q bit for free.
+- The phase table's rounding matters only at low amplitude. At RMS 19 the porch noise was 241 kHz with a 6+6-bit table against 185 kHz exact; at RMS 61 it was 172 against 164. Hence the gain control now aims for RMS 40-72, and a 7+7-bit table isn't worth its 32 KB. The CPU's table then kept 6 bits of I and all 7 of Q in 16 KB, since indexing by the raw word brought the seventh Q bit for free. The BitScrambler's companded lookup has since replaced it and reads all 7 bits of each (see [In the decoder](#in-the-decoder)).
 - The signal can degrade within minutes for reasons outside the receiver: in one session porch noise rose to 700-870 kHz at every gain from 62 to 72 and lock fell to 40-210 of 262 lines.
 - The OSD alone carries no colorburst: the back porch shows nothing above noise at 3.58 or 4.43 MHz, where a 40 IRE burst would stand about 20 dB clear. With a camera attached the burst is there. `iq.py burst` checks this.
 
@@ -180,7 +180,7 @@ What is left is the lookup alone, with a smaller table, leaving the CPU to subtr
 
 Simulated back-porch noise in kHz for each table, against an exact demodulator, from [phase_table_sim.py](../p4usb/tools/phase_table_sim.py). The model is a constant-envelope carrier with an I offset of 20 and noise set to the measured exact figure, and it reproduces the measured 6+6 results above (241 against 185 at RMS 19).
 
-| I/Q RMS | Exact | 6+7 (in use, 16 KB) | 6+5 (2048×8) | Bipartite (1024×16) | Companded (1024×16) |
+| I/Q RMS | Exact | 6+7 (the CPU's table, 16 KB) | 6+5 (2048×8) | Bipartite (1024×16) | Companded (1024×16) |
 |---|---|---|---|---|---|
 | 20 | 187 | 216 | 303 | 258 | 190 |
 | 30 | 175 | 189 | 251 | 198 | 182 |
@@ -189,7 +189,7 @@ Simulated back-porch noise in kHz for each table, against an exact demodulator, 
 | 72 | 167 | 171 | 184 | 171 | 175 |
 | 90 | 167 | 170 | 178 | 170 | 174 |
 
-The bipartite and companded pairs both come within 3% of the table in use across the gain control's range (RMS 40-72), and the companded pair is quieter than it below RMS 40, because log spacing keeps the phase error from growing as the signal shrinks. The single 6+5 table is 0.6 to 1.5 dB noisier in that range.
+The bipartite and companded pairs both come within 3% of the CPU's table across the gain control's range (RMS 40-72), and the companded pair is quieter than it below RMS 40, because log spacing keeps the phase error from growing as the signal shrinks. The single 6+5 table is 0.6 to 1.5 dB noisier in that range.
 
 ### On the hardware
 
