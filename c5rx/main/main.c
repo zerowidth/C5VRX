@@ -8,16 +8,60 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include "lanes.h"
 #include "link.h"
 #include "radio.h"
 
-/* Waveshare C5-Zero antenna switch: low selects the on-board antenna. */
+/* Waveshare C5-Zero antenna switch: low selects the on-board antenna, high the U.FL. */
 #define ANTENNA_SEL_GPIO GPIO_NUM_26
 /* Long enough for the P4 to hear the step's line and sample the bus. */
 #define WALK_STEP_MS 20
 #define CONSOLE_UART UART_NUM_0
+
+static bool s_external;
+
+static void antenna_set(bool external)
+{
+    s_external = external;
+    gpio_set_level(ANTENNA_SEL_GPIO, external);
+}
+
+/* Saved here because the P4 resets the C5 on every decoder start. */
+static void antenna_load(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    nvs_handle_t nvs;
+    uint8_t external = 0;
+    if (err == ESP_OK && nvs_open("c5rx", NVS_READONLY, &nvs) == ESP_OK) {
+        nvs_get_u8(nvs, "antenna", &external);
+        nvs_close(nvs);
+    }
+    gpio_set_direction(ANTENNA_SEL_GPIO, GPIO_MODE_OUTPUT);
+    antenna_set(external);
+}
+
+static esp_err_t antenna_save(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("c5rx", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(nvs, "antenna", s_external);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+static const char *antenna_name(void)
+{
+    return s_external ? "ext" : "int";
+}
 
 static void walk_step(const char *name)
 {
@@ -89,11 +133,23 @@ static void run_command(char *line)
     } else if (strcmp(argv[0], "clk") == 0 && argc == 3 && strcmp(argv[1], "slip") == 0) {
         radio_clock_slip(atoi(argv[2]));
         reply("ok clk slip %d", atoi(argv[2]));
+    } else if (strcmp(argv[0], "antenna") == 0 && argc == 1) {
+        reply("ok antenna %s", antenna_name());
+    } else if (strcmp(argv[0], "antenna") == 0 && argc == 2 &&
+               (strcmp(argv[1], "int") == 0 || strcmp(argv[1], "ext") == 0)) {
+        bool external = argv[1][0] == 'e';
+        esp_err_t err = ESP_OK;
+        if (external != s_external) {
+            antenna_set(external);
+            err = antenna_save();
+        }
+        if (err == ESP_OK) reply("ok antenna %s", antenna_name());
+        else reply("err antenna %s not saved: %s", antenna_name(), esp_err_to_name(err));
     } else if (strcmp(argv[0], "status") == 0) {
         int rssi = 0, noise = 0;
         bool have_rssi = radio_rssi(&rssi), have_noise = radio_noise_floor(&noise);
-        reply("ok status ch=%s freq=%u gain=%u rssi=%d%s noise=%d%s", radio_channel(), radio_mhz(), radio_gain(),
-              rssi, have_rssi ? "" : "?", noise, have_noise ? "" : "?");
+        reply("ok status ch=%s freq=%u gain=%u rssi=%d%s noise=%d%s ant=%s", radio_channel(), radio_mhz(), radio_gain(),
+              rssi, have_rssi ? "" : "?", noise, have_noise ? "" : "?", antenna_name());
     } else {
         reply("err unknown command %s", argv[0]);
     }
@@ -101,8 +157,7 @@ static void run_command(char *line)
 
 void app_main(void)
 {
-    gpio_set_direction(ANTENNA_SEL_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(ANTENNA_SEL_GPIO, 0);
+    antenna_load();
 
     ESP_ERROR_CHECK(uart_driver_install(CONSOLE_UART, 256, 0, 0, NULL, 0));
     printf("c5rx ready\n");

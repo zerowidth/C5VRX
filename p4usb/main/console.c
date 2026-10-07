@@ -79,6 +79,14 @@ static void cmd_channel(int argc, char **argv)
     say("channel %s %u\n", chan, mhz);
 }
 
+static void cmd_antenna(int argc, char **argv)
+{
+    char cmd[24] = "antenna", reply[96];
+    if (argc > 1) snprintf(cmd, sizeof cmd, "antenna %s", argv[1]);
+    /* The C5 saves the choice, and its `ok ` is dropped so the reply reads like channel's. */
+    say("%s\n", c5_request(cmd, reply, sizeof reply, 1000) ? reply + 3 : reply);
+}
+
 static const command_t s_commands[] = {
     {"help", cmd_help, "list commands"},
     {"info", cmd_info, "chip revision, uptime and bridge counters"},
@@ -88,6 +96,7 @@ static const command_t s_commands[] = {
     {"iq", iq_command, "capture two fields of I/Q; start [channel] tunes the C5 and picks a clock edge; dump sends the capture"},
     {"decode", decode_command, "on [channel] tunes the C5 and decodes its video into the camera; off stops; alone shows lock and load; luma plain|soft|peak sets the luma filter, clicks hold|gray|off whether a line with an FM click takes the color above, none or its own, and tnr auto|LEVELS the noise reduction over fields; bench times the demodulator"},
     {"channel", cmd_channel, "channel [BAND+N | MHZ] retunes (bands R A B E F L, 5180-5945 MHz); alone prints channel and MHz"},
+    {"antenna", cmd_antenna, "antenna [int | ext] picks the C5's on-board antenna or its U.FL socket, and is kept across restarts; alone prints the one in use"},
     {"video", video_command, "frame and JPEG stats; grab prints the newest JPEG as base64; quality N sets the JPEG quality's ceiling"},
     {"reboot", cmd_reboot, "restart the P4; reboot download enters its ROM loader"},
     {"c5", c5_command, "hold, run or download-reset the C5; log on|off relays its UART; send talks to c5rx"},
