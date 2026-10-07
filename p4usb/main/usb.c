@@ -87,7 +87,7 @@ static const char *const s_strings[] = {
     [STR_PRODUCT] = "C5VRX Receiver",
     [STR_SERIAL] = s_serial,
     [STR_CONSOLE] = "C5VRX Console",
-    [STR_VIDEO] = "C5VRX Video",
+    [STR_VIDEO] = "P4USB",
 };
 
 /* The P4's high-speed DWC2 controller: each IN endpoint's DIEPCTL, whose USBAEP bit the core clears on bus reset. */
