@@ -47,6 +47,12 @@
 /* A detected hsync this close to the predicted one steers the line clock. */
 #define LOCK_WINDOW US(3)
 #define LOST_AFTER_LINES 30
+/* The sync detector slices a sum of this many blocks, about an hsync's width: noise that breaks a pulse up in
+ * the blocks themselves averages out of it. A pulse's edges cross mid-level half a sum late. */
+#define SYNC_BLOCKS 16
+#define SYNC_DELAY (SYNC_BLOCKS * 4 / 2)
+/* An hsync's width, which places its leading edge from its trailing one: the porch after it holds no picture. */
+#define HSYNC_WIDTH US(4.7)
 #define FIELD_LINES 262
 #define FIRST_ACTIVE 20
 #define ACTIVE_LINES (VIDEO_HEIGHT / 2)
@@ -131,6 +137,8 @@ static volatile bool s_running;
 static int s_lut_dc_i, s_lut_dc_q;
 static volatile int32_t s_dc_n;
 static volatile uint32_t s_dc_power, s_dc_clipped;
+/* Nodes looked at, and those whose samples mostly clipped, which are left out of the sums. */
+static volatile uint32_t s_dc_nodes, s_dc_hot;
 static int s_gain = 60;
 static bool s_agc = true;
 static int s_rms, s_clip_permille;
@@ -180,6 +188,8 @@ static uint8_t s_prev_phase;
 static bool s_low;
 static uint32_t s_low_start;
 static int32_t s_thr_lo, s_thr_hi;
+/* The sum of the last SYNC_BLOCKS blocks, each held under s_clamp so bright picture cannot hide a pulse's start. */
+static int32_t s_box, s_clamp;
 static uint32_t s_histogram[256];
 
 static uint32_t s_line;
@@ -325,11 +335,21 @@ static void control(void)
         return;
     }
     int32_t n = s_dc_n;
+    /* Another transmitter's bursts clip a few nodes whole and say nothing of this one's level: a Wi-Fi
+     * station clipping 1 to 4% of samples held the gain 22 steps under a weak carrier. Most nodes clipping
+     * is the carrier itself. */
+    if (s_dc_nodes >= 128 && s_dc_hot * 2 > s_dc_nodes) {
+        s_clip_permille = 1000;
+        steer_gain(false);
+        s_dc_n = s_neg_i = s_neg_q = 0;
+        s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
+        return;
+    }
     if (n < 4096) return;
     float power = (float)s_dc_power / n, neg_i = (float)s_neg_i / n, neg_q = (float)s_neg_q / n;
     uint32_t clipped = s_dc_clipped;
     s_dc_n = s_neg_i = s_neg_q = 0;
-    s_dc_power = s_dc_clipped = 0;
+    s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
     /* How far the table's centre sits from the ring's, as a share of its radius, from the excess of negative
      * signs. I's power is taken about the table's centre, so an offset adds twice its square to it. */
     float si = sinf((float)M_PI * (neg_i - 0.5f)), sq = sinf((float)M_PI * (neg_q - 0.5f));
@@ -346,7 +366,7 @@ static void control(void)
     if (stepped) {
         /* The next pass reads the new gain alone. */
         s_dc_n = s_neg_i = s_neg_q = 0;
-        s_dc_power = s_dc_clipped = 0;
+        s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
         s_bs_err_i = s_bs_err_q = 0;
     }
     if (s_bs_pending) return;
@@ -438,6 +458,7 @@ static void set_thresholds(void)
     if (span < 8 * 16) span = 8 * 16;
     int thr = (s_tip + s_blank) / 32, hyst = span / 128;
     s_thr_lo = BOX * (thr - hyst);
+    s_clamp = BOX * (s_blank + span / 2) / 16;
     s_thr_hi = BOX * (thr + hyst);
 }
 
@@ -1050,8 +1071,15 @@ static void render_line(void)
     }
     if (s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1) emit_field();
 
-    /* Every 13th sample of each line is plenty for the level histogram. */
-    for (uint32_t i = 0; i < (LINE_Q16 >> 16); i += 13) ++s_histogram[(uint8_t)(s_hist[(s_line + i) % HIST] + 128)];
+    /* The level histogram takes the mean the sync detector slices, every 16 samples: a sample's own noise
+     * drags the sync tip's percentile well under the tip on a weak signal. */
+    int32_t sum = 0;
+    for (uint32_t i = 0, at = s_line & ~3u; i < (LINE_Q16 >> 16); i += 4) {
+        sum += s_blocks[((at + i) % HIST) / 4];
+        if (i < 4 * SYNC_BLOCKS) continue;
+        sum -= s_blocks[((at + i - 4 * SYNC_BLOCKS) % HIST) / 4];
+        if (!(i & 12)) ++s_histogram[(uint8_t)(sum / (4 * SYNC_BLOCKS) + 128)];
+    }
     if (s_hit) {
         ++s_field_hits;
         if (s_vline & 1) {
@@ -1137,49 +1165,74 @@ static int32_t box_at(uint32_t m)
     return s_hist[m % HIST] + s_hist[(m - 1) % HIST] + s_hist[(m - 2) % HIST] + s_hist[(m - 3) % HIST];
 }
 
-/* The first sample near a block crossing where the sliding 4-sample sum crosses too. */
-static uint32_t refine(uint32_t block, bool falling, int32_t thr)
+/* The sliding 4-sample sum's falling crossing nearest a sample, or the sample when there is none in reach. */
+static uint32_t leading_edge(uint32_t near, int32_t thr)
 {
-    for (uint32_t m = block - 4; m != block + 4; ++m) {
-        int32_t b = box_at(m);
-        if (falling ? b < thr : b > thr) return m;
+    uint32_t best = near;
+    int reach = 13;
+    int32_t before = box_at(near - reach);
+    for (int d = 1 - reach; d < reach; ++d) {
+        int32_t b = box_at(near + d);
+        if (before >= thr && b < thr && abs(d) < reach) {
+            best = near + d;
+            reach = abs(d);
+        }
+        before = b;
     }
-    return block;
+    return best;
+}
+
+static int32_t clamped_block(uint32_t nb)
+{
+    int32_t b = s_blocks[(nb % HIST) / 4];
+    return b > s_clamp ? s_clamp : b;
+}
+
+static int32_t box_ending(uint32_t nb)
+{
+    int32_t sum = 0;
+    for (int k = 0; k < SYNC_BLOCKS; ++k) sum += clamped_block(nb - 4 * k);
+    return sum;
 }
 
 static void detect(uint32_t until)
 {
-    const int16_t *blocks = s_blocks;
     uint32_t nb = s_nb, render_at = s_render_at;
-    int32_t thr_lo = s_thr_lo, thr_hi = s_thr_hi;
+    int32_t thr_lo = s_thr_lo, thr_hi = s_thr_hi, box = s_box;
     bool low = s_low;
     for (; (int32_t)(until - nb) >= 4; nb += 4) {
-        int32_t b = blocks[(nb % HIST) / 4];
+        box += clamped_block(nb) - clamped_block(nb - 4 * SYNC_BLOCKS);
         if (low) {
-            if (b > thr_hi) {
+            if (box > SYNC_BLOCKS * thr_hi) {
                 low = false;
-                uint32_t end = refine(nb + 3, false, thr_hi);
-                on_pulse(s_low_start, end - s_low_start);
+                uint32_t end = nb - SYNC_DELAY, width = end - s_low_start;
+                bool hsync = width >= HSYNC_MIN && width <= HSYNC_MAX;
+                on_pulse(hsync ? leading_edge(end - HSYNC_WIDTH, thr_lo) : s_low_start, width);
                 render_at = s_render_at;
                 /* Locked in the picture, nothing matters until the next hsync's window, so skip there. */
                 if (s_hit && s_vline > VSYNC_LINE + VSYNC_WINDOW && s_vline < FIELD_LINES - VSYNC_WINDOW - 1) {
                     uint32_t skip = (s_line + (s_period >> 16) - LOCK_WINDOW - 8) & ~3u;
-                    if ((int32_t)(skip - nb) > 4) nb = skip - 4;
+                    if ((int32_t)(skip - nb) > 4) {
+                        nb = skip - 4;
+                        box = box_ending(nb);
+                    }
                 }
             }
-        } else if (b < thr_lo) {
+        } else if (box < SYNC_BLOCKS * thr_lo) {
             low = true;
-            s_low_start = refine(nb + 3, true, thr_lo);
+            s_low_start = nb - SYNC_DELAY;
         }
         if ((int32_t)(nb + 4 - render_at) >= 0) {
             render_line();
             render_at = s_render_at;
             thr_lo = s_thr_lo;
             thr_hi = s_thr_hi;
+            box = box_ending(nb);
         }
     }
     s_nb = nb;
     s_low = low;
+    s_box = box;
 }
 
 void bs_demod(const uint8_t *src, int8_t *dst, int16_t *blocks, uint32_t n, uint8_t *prev, int odd);
@@ -1220,11 +1273,16 @@ static void process_bs(const uint8_t *b, uint32_t bytes)
         neg_i += (phase >> 6 ^ phase >> 7) & 1;
         neg_q += phase >> 7;
     }
-    s_dc_power += power;
-    s_dc_clipped += clipped;
-    s_neg_i += neg_i;
-    s_neg_q += neg_q;
-    s_dc_n += DC_WORDS;
+    ++s_dc_nodes;
+    if (clipped > DC_WORDS / 4) {
+        ++s_dc_hot;
+    } else {
+        s_dc_power += power;
+        s_dc_clipped += clipped;
+        s_neg_i += neg_i;
+        s_neg_q += neg_q;
+        s_dc_n += DC_WORDS;
+    }
 
     uint32_t n = s_n;
     for (uint32_t done = 0; done < words;) {
@@ -1289,7 +1347,7 @@ static void skip_stale(uint32_t stale)
     s_read = 0;
     s_read_us = esp_timer_get_time();
     s_dc_n = s_neg_i = s_neg_q = 0;
-    s_dc_power = s_dc_clipped = 0;
+    s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
 }
 
 /* The LUT takes writes only while the program is halted, and a halt alone leaves the DMA racing through
