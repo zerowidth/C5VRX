@@ -309,6 +309,7 @@ The P4 assumes nothing about the C5's firmware. At boot it holds the C5 in reset
 - `decode` alone starts with the channel and its MHz, then shows lock, levels, gain, load and overruns, and includes the C5's own `status` reply. Its subcommands:
   - `decode gain auto|N` sets the gain control.
   - `decode sat N` sets the saturation.
+  - `decode wraps fix|off` chooses whether wrapped phase differences are corrected.
   - `decode bench` prices each stage in cycles per sample.
 - `iq bs pass|half|check|relut|phase [samples [dc_i dc_q]]` captures through a BitScrambler program on PARLIO RX: `pass` and `half` copy each word or its low byte, `check` runs the companded phase lookup and compares every sample with the same lookup done on the CPU, `relut` also rewrites the table part way through, and `phase` runs the decoder's program and reports where its two bytes change places.
 - `iq start [channel [every]]` resets the C5, tunes it (default R3), starts the I/Q export keeping one of every `every` bus samples (default 2, so 40 MS/s) and picks the P4's clock edge. `iq` captures two fields (1.4 M samples, 35 ms) into PSRAM and prints I/Q statistics, and `iq dump` sends the raw 16-bit words. `p4usb/tools/iq.py` runs the capture and dump from the Mac and has offline checks: `lanes` shows each lane's activity and `field` FM-demodulates the capture into an image of lines. It needs numpy, pillow and pyserial.

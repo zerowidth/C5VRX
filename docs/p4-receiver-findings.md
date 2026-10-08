@@ -87,6 +87,17 @@ Still to do:
 - That transmitter deviates from -5.0 MHz at the sync tip to +4.4 MHz at white, twice the first one's. At 13.33 MS/s the phase difference wraps at ±6.67 MHz, 1.7 MHz past the sync tip. With noise added to a capture, that cost about 2 dB of threshold against summing two differences taken at 26.67 MS/s.
 - The internal antenna receives that transmitter as strongly as the external one, with about 2 dB less noise, but a far larger offset: I sat at -127 at gain 74 on E4, and Q near 95 at gains 74 to 77 on R4.
 
+## A weak signal
+
+A transmitter 50 ft away behind two interior walls arrived at a C/N of about 3 to 5 dB at the top of the gain table, with an I/Q RMS of 8 to 11. A separate receiver showed a reasonable picture from it. The decoder locked 0 to 35 lines of 262 until the three changes below, and 190 to 250 after them, in color.
+
+- Wi-Fi stations nearby put bursts of 0.1 to 0.5 ms on the channel 1 to 4% of the time, and each clips every sample while it lasts. Between bursts nothing clips, even at gain 77. The gain control read the bursts as overload and held the gain at 53 to 57, which left the carrier under one step tall. It now leaves out of its sums any node whose samples mostly clip, unless most nodes do, which is the carrier itself.
+- The sync slicer on 4-sample sums lost a pulse to any one noisy block. On raw captures of that signal, a 4.7 µs mean found hsync within 1 µs on 93 to 97% of lines while a model of the slicer locked 9 to 50%. The detector now slices the sum of 16 blocks, each held under half the sync depth above blanking so bright picture cannot hide a pulse's start. Both edges cross mid-level 32 samples late, so widths are unchanged. The leading edge is placed 4.7 µs before the trailing one, whose porch holds no picture, then moved to the nearest falling crossing of the 4-sample sum within 12 samples. On a strong capture it gave the slicer's edge on 471 lines of 482 and one sample earlier on the rest.
+- Until lines lock, the levels come from a histogram. Taken from single samples, noise put its 2nd percentile 2 MHz under the sync tip and the threshold under the tip's own mean, so nothing locked. It is now taken from the same 16-block mean.
+- A phase difference past half a turn wraps: at 13.33 MS/s that is 6.67 MHz, 1.7 MHz beyond this transmitter's sync tip and 2.3 MHz beyond its white. Noise drew black specks in white areas and white ones in black. `despeck.S` takes a sample half a turn or more from the mean of the two either side of it as wrapped, and puts it at the end of the range it wrapped past. With noise added to a strong capture, luma specks (errors over 1.5 MHz) fell from 4.5 to 0.2 per thousand at a C/N of 9 dB, 15 to 2.4 at 7 dB and 43 to 16 at 5 dB, the same as summing three differences taken at 40 MS/s with the rule applied. It costs about 9% of core 1. `decode wraps off` turns it off.
+- With these, core 1 runs at about 65% on a locked color picture, against 43% before.
+- The internal antenna cannot be used at the top of the gain table: Q's offset sat at the rail at gain 77 on three channels.
+
 ## The C5's gain table
 
 - The IDF 6.1 PHY library (esp-phy-lib 5695f4f) keeps the gain table where main's pinned library (59c1234) does: stage spans at `phy_param+0x422` and table maxima at `+0x124..0x126`, confirmed in `phy_set_rx_gain_table`'s disassembly.
