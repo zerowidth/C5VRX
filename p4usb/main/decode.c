@@ -197,6 +197,9 @@ static uint32_t s_low_start;
 static int32_t s_thr_lo, s_thr_hi;
 /* The sum of the last SYNC_BLOCKS blocks, each held under s_clamp so bright picture cannot hide a pulse's start. */
 static int32_t s_box, s_clamp;
+/* The slicer's levels for a field's mean, and how far this line sits above them in sixteenths of a unit: an
+ * AC-coupled transmitter's level rose a fifth of its sync depth after each vsync. */
+static int32_t s_thr_lo_mean, s_thr_hi_mean, s_clamp_mean, s_tilt;
 static uint32_t s_histogram[256];
 
 static uint32_t s_line;
@@ -420,7 +423,12 @@ static void control(void)
 }
 
 /* Until lines lock, levels come from each field's histogram: the sync tip is the 2nd percentile and
- * blanking is the median of what lies 1-3 MHz above it. */
+ * blanking is the median of what lies 1-3 MHz above it. A transmitter with half the usual deviation puts
+ * its picture in that band, so fields that fail to lock try fixed sync depths in turn. */
+#define DEPTH_FIELDS 3
+static const int16_t DEPTH_KHZ[] = {0, 1200, 1700, 800};
+static uint32_t s_unlocked_fields;
+
 static void set_thresholds(void);
 static void set_maps(void);
 
@@ -442,11 +450,15 @@ static void update_levels(void)
     memset(s_histogram, 0, sizeof s_histogram);
     tip = (tip - 128) * 16;
     blank = (blank - 128) * 16;
-    if (s_level_lines >= LEVEL_LINES_MIN) {
+    bool locked = s_level_lines >= LEVEL_LINES_MIN;
+    if (locked) {
         tip = s_tip_sum * 16 / (s_level_lines * (TIP_END - TIP_START));
         blank = s_porch_sum * 16 / (s_level_lines * (PORCH_END - PORCH_START));
+        s_unlocked_fields = 0;
+    } else {
+        int depth = DEPTH_KHZ[s_unlocked_fields++ / DEPTH_FIELDS % (sizeof DEPTH_KHZ / sizeof *DEPTH_KHZ)];
+        if (depth) blank = tip + depth * 16 / KHZ_PER_UNIT;
     }
-    bool locked = s_level_lines >= LEVEL_LINES_MIN;
     if (locked) {
         /* A weak signal's noise would read as motion at a fixed threshold, so it follows a sample's noise. */
         int span = s_blank - s_tip < 8 * 16 ? 8 * 16 : s_blank - s_tip;
@@ -456,11 +468,20 @@ static void update_levels(void)
     }
     s_field_noise_sq = 0;
     s_tip_sum = s_porch_sum = s_level_lines = 0;
-    s_tip = (3 * s_tip + tip) / 4;
-    s_blank = (3 * s_blank + blank) / 4;
+    /* A depth on trial has three fields to lock, too few for the average to reach it. */
+    s_tip = locked ? (3 * s_tip + tip) / 4 : tip;
+    s_blank = locked ? (3 * s_blank + blank) / 4 : blank;
     set_thresholds();
     /* Noise keeps the last locked picture levels, so it shows as snow rather than a gray wash. */
     if (locked) set_maps();
+}
+
+static void tilt_thresholds(void)
+{
+    int32_t tilt = BOX * s_tilt / 16;
+    s_thr_lo = s_thr_lo_mean + tilt;
+    s_thr_hi = s_thr_hi_mean + tilt;
+    s_clamp = s_clamp_mean + tilt;
 }
 
 static void set_thresholds(void)
@@ -468,9 +489,10 @@ static void set_thresholds(void)
     int span = s_blank - s_tip;
     if (span < 8 * 16) span = 8 * 16;
     int thr = (s_tip + s_blank) / 32, hyst = span / 128;
-    s_thr_lo = BOX * (thr - hyst);
-    s_clamp = BOX * (s_blank + span / 2) / 16;
-    s_thr_hi = BOX * (thr + hyst);
+    s_thr_lo_mean = BOX * (thr - hyst);
+    s_clamp_mean = BOX * (s_blank + span / 2) / 16;
+    s_thr_hi_mean = BOX * (thr + hyst);
+    tilt_thresholds();
 }
 
 static void set_maps(void)
@@ -1091,15 +1113,27 @@ static void render_line(void)
         sum -= s_blocks[((at + i - 4 * SYNC_BLOCKS) % HIST) / 4];
         if (!(i & 12)) ++s_histogram[(uint8_t)(sum / (4 * SYNC_BLOCKS) + 128)];
     }
-    if (s_hit) {
-        ++s_field_hits;
-        if (s_vline & 1) {
-            int32_t t = 0, b = 0, t2 = 0;
-            for (int i = TIP_START; i < TIP_END; ++i) {
-                int32_t v = s_hist[(s_line + i) % HIST];
-                t += v;
-                t2 += v * v;
-            }
+    s_field_hits += s_hit;
+    if (s_missed >= LOST_AFTER_LINES && s_tilt) {
+        s_tilt = 0;
+        tilt_thresholds();
+    }
+    if ((s_vline & 1) && s_missed < LOST_AFTER_LINES) {
+        int32_t t = 0, b = 0, t2 = 0;
+        for (int i = TIP_START; i < TIP_END; ++i) {
+            int32_t v = s_hist[(s_line + i) % HIST];
+            t += v;
+            t2 += v * v;
+        }
+        /* A missed line's tip is read where the line clock puts it: the lines after vsync miss until the
+         * slicer has followed the level up. */
+        if (s_vline > VSYNC_LINE + VSYNC_WINDOW && s_vline < FIELD_LINES - VSYNC_WINDOW - 1) {
+            int32_t tilt = t * 16 / (TIP_END - TIP_START) - s_tip, most = (s_blank - s_tip) / 2;
+            tilt = tilt > most ? most : tilt < -most ? -most : tilt;
+            s_tilt += (tilt - s_tilt) / 2;
+            tilt_thresholds();
+        }
+        if (s_hit) {
             /* The sync tip is flat, so its scatter about each line's own mean is the demodulator's noise. */
             s_noise_sq += t2 * (TIP_END - TIP_START) - t * t;
             s_field_noise_sq += t2 * (TIP_END - TIP_START) - t * t;
