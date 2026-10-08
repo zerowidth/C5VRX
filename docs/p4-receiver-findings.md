@@ -113,6 +113,13 @@ A quad's transmitter on R4 gave no lock at any range on a first flight test, wit
 - The picture's black level still takes the field's mean, so the tilt remains in the picture as a brightness gradient down its top third. It has not been judged by eye.
 - Neither change has been run against the bench transmitter or a weak signal.
 
+## Gain in flight
+
+- With lock fixed, a second flight still lost the picture for seconds at a time, at levels well inside the receiver's reach. The level fell at least 25 dB inside a second as the quad flew out (gain 47 and RMS 77, then RMS 3), and the loop, stepping 2 indices twice a second, took 6 seconds to follow. Coming back it sat too high and clipped.
+- The loop now runs every 50 ms and steps straight to an RMS of 54, 10 indices at most, dropping the pass after a step because the ring still holds samples from the old gain. The offset's smoothing covers the same four seconds as before. Released from gain 30 or 77 on the quad's carrier it was back at 45 with full lock within 0.2 s, and it held 45 without hunting, with one table reload in 10 s.
+- On a third flight of 74 s the decoder held 240 or more lines for 59 s, against about 20 of 67 s on the second, and logged no new overruns or dropped lines. Gain ran from 45 to 77 and reached 77 two seconds after the quad left.
+- Every second it was not locked had the gain at 77 and an RMS of 12 to 27, bar two: one just after the 25-step climb to 77, with RMS 54, and one fade to RMS 7 at gain 70. Sync-tip noise in those seconds was 630 to 1475 kHz against this transmitter's 1.3 MHz of sync. That is the receiver's limit on this quad, and the distance was not measured.
+
 ## The C5's gain table
 
 - The IDF 6.1 PHY library (esp-phy-lib 5695f4f) keeps the gain table where main's pinned library (59c1234) does: stage spans at `phy_param+0x422` and table maxima at `+0x124..0x126`, confirmed in `phy_set_rx_gain_table`'s disassembly.
