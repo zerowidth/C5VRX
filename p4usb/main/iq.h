@@ -11,8 +11,6 @@ void iq_command(int argc, char **argv);
 bool iq_start(const char *channel, int every);
 /* The gain iq_start left the C5 at. */
 int iq_gain(void);
-/* Whether iq_start had a carrier to place the clock by; if not, start again once there is one. */
-bool iq_verified(void);
 /* The I/Q offset iq_start measured at that gain, in the lanes' 2v+1 units. */
 void iq_dc(float *i, float *q);
 /* The C5's name and frequency for the channel last tuned. */

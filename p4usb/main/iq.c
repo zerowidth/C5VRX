@@ -487,8 +487,6 @@ static bool settle_gain(void)
 #define HIGH_MAX 12.0f
 #define RING_MIN 600
 
-/* Whether the last probe had a carrier. */
-static bool s_verified;
 static int s_dc[2];
 
 /* Captures on each edge and keeps the one read further from the change. Reports whether each edge is clean. */
@@ -507,7 +505,6 @@ static bool pick_edge(bool clean[2])
     }
     int e = q[1].high < q[0].high;
     s_edge = edges[e];
-    s_verified = q[e].ring >= RING_MIN;
     s_dc[0] = q[e].mean[0];
     s_dc[1] = q[e].mean[1];
     say("power past the receive filter over the total: rise %.2f, fall %.2f; gain %d, RMS %lu%s: using %s%s\n",
@@ -637,11 +634,6 @@ bool iq_start(const char *channel, int every)
 int iq_gain(void)
 {
     return s_probe_gain;
-}
-
-bool iq_verified(void)
-{
-    return s_verified;
 }
 
 void iq_dc(float *i, float *q)
