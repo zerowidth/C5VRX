@@ -22,3 +22,10 @@ bool radio_noise_floor(int *dbm);
 esp_err_t radio_iq_start(int every, int q_top, int i_top);
 void radio_iq_stop(void);
 void radio_clock_slip(uint32_t us);
+/* Starts a scan, which only works before the first tune; results are read by index once it is done. */
+esp_err_t radio_scan(void);
+bool radio_scan_result(unsigned index, unsigned *channel, int *rssi, unsigned *bssid);
+/* Lab only: calls one of a few PHY functions by name. Returns its result, or -1 for an unknown name. */
+long radio_call(const char *name, uint32_t a, uint32_t b, uint32_t c);
+esp_err_t radio_sniff(uint8_t channel);
+bool radio_sniff_result(unsigned i, unsigned *key, unsigned *count, unsigned *beacons, int *rssi, int *noise, int *len);

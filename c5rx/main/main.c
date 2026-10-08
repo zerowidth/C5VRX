@@ -15,6 +15,11 @@
 #include "link.h"
 #include "radio.h"
 
+/* PHY internals for the lab commands. */
+extern unsigned char phy_param[];
+extern uint8_t phy_i2c_readReg(uint8_t block, uint8_t host, uint8_t reg);
+extern void phy_i2c_writeReg(uint8_t block, uint8_t host, uint8_t reg, uint8_t value);
+
 /* Waveshare C5-Zero antenna switch: low selects the on-board antenna, high the U.FL. */
 #define ANTENNA_SEL_GPIO GPIO_NUM_26
 /* Long enough for the P4 to hear the step's line and sample the bus. */
@@ -95,9 +100,9 @@ static void reply(const char *fmt, ...)
 
 static void run_command(char *line)
 {
-    char *argv[4];
+    char *argv[6];
     int argc = 0;
-    for (char *tok = strtok(line, " "); tok && argc < 4; tok = strtok(NULL, " ")) argv[argc++] = tok;
+    for (char *tok = strtok(line, " "); tok && argc < 6; tok = strtok(NULL, " ")) argv[argc++] = tok;
     if (argc == 0) return;
 
     if (strcmp(argv[0], "ping") == 0) {
@@ -145,6 +150,45 @@ static void run_command(char *line)
         }
         if (err == ESP_OK) reply("ok antenna %s", antenna_name());
         else reply("err antenna %s not saved: %s", antenna_name(), esp_err_to_name(err));
+    } else if (strcmp(argv[0], "scan") == 0 && argc == 1) {
+        esp_err_t err = radio_scan();
+        if (err == ESP_OK) reply("ok scan started");
+        else reply("err %s", esp_err_to_name(err));
+    } else if (strcmp(argv[0], "scan") == 0 && argc == 2) {
+        unsigned channel, bssid;
+        int rssi;
+        if (radio_scan_result((unsigned)atoi(argv[1]), &channel, &rssi, &bssid)) reply("ok ap ch=%u rssi=%d bssid=%04x", channel, rssi, bssid);
+        else reply("err no such result");
+    } else if (strcmp(argv[0], "sniff") == 0 && argc == 3 && strcmp(argv[1], "on") == 0) {
+        esp_err_t err = radio_sniff((uint8_t)atoi(argv[2]));
+        if (err == ESP_OK) reply("ok sniff %d", atoi(argv[2]));
+        else reply("err %s", esp_err_to_name(err));
+    } else if (strcmp(argv[0], "sniff") == 0 && argc == 2) {
+        unsigned key, count, beacons;
+        int rssi, noise, len;
+        if (radio_sniff_result((unsigned)atoi(argv[1]), &key, &count, &beacons, &rssi, &noise, &len)) {
+            reply("ok tx=%04x n=%u beacons=%u rssi=%d noise=%d len=%d", key, count, beacons, rssi, noise, len);
+        } else {
+            reply("err no such result");
+        }
+    } else if (strcmp(argv[0], "peek") == 0 && argc == 2) {
+        reply("ok peek %08lx", (unsigned long)*(volatile uint32_t *)strtoul(argv[1], NULL, 16));
+    } else if (strcmp(argv[0], "poke") == 0 && argc == 3) {
+        *(volatile uint32_t *)strtoul(argv[1], NULL, 16) = strtoul(argv[2], NULL, 16);
+        reply("ok poke");
+    } else if (strcmp(argv[0], "i2c") == 0 && (argc == 4 || argc == 5)) {
+        uint8_t block = strtoul(argv[1], NULL, 16), host = atoi(argv[2]), reg = atoi(argv[3]);
+        if (argc == 5) phy_i2c_writeReg(block, host, reg, strtoul(argv[4], NULL, 16));
+        reply("ok i2c %02x", phy_i2c_readReg(block, host, reg));
+    } else if (strcmp(argv[0], "param") == 0 && (argc == 2 || argc == 3)) {
+        unsigned offset = strtoul(argv[1], NULL, 16);
+        if (argc == 3) phy_param[offset] = strtoul(argv[2], NULL, 16);
+        reply("ok param %02x", phy_param[offset]);
+    } else if (strcmp(argv[0], "call") == 0 && argc >= 2) {
+        /* Lab only: a PHY function by name with up to three integer arguments. */
+        uint32_t a[3] = {0};
+        for (int k = 2; k < argc && k < 5; ++k) a[k - 2] = strtoul(argv[k], NULL, 0);
+        reply("ok call %ld", (long)radio_call(argv[1], a[0], a[1], a[2]));
     } else if (strcmp(argv[0], "status") == 0) {
         int rssi = 0, noise = 0;
         bool have_rssi = radio_rssi(&rssi), have_noise = radio_noise_floor(&noise);

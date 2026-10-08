@@ -131,8 +131,11 @@ static void receive_state(void)
     phy_11p_set(s_11p, 0);
 }
 
-static esp_err_t start(void)
+static bool s_wifi_up;
+
+static esp_err_t wifi_up(void)
 {
+    if (s_wifi_up) return ESP_OK;
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -161,12 +164,45 @@ static esp_err_t start(void)
     /* BW40 gives the full video bandwidth; there is no BW20 fallback. */
     wifi_bandwidths_t bw = {.ghz_2g = WIFI_BW20, .ghz_5g = WIFI_BW40};
     if ((err = esp_wifi_set_bandwidths(WIFI_IF_STA, &bw)) != ESP_OK) return err;
+    s_wifi_up = true;
+    return ESP_OK;
+}
+
+static esp_err_t start(void)
+{
+    esp_err_t err = wifi_up();
+    if (err != ESP_OK) return err;
     if ((err = esp_wifi_set_promiscuous(true)) != ESP_OK) return err;
     wifi_promiscuous_filter_t filter = {.filter_mask = 0};
     esp_wifi_set_promiscuous_filter(&filter);
     if ((err = lock_rx_only()) != ESP_OK) return err;
     s_started = true;
     return ESP_OK;
+}
+
+/* A scan with the vendor AGC still on, before the first tune turns it off for good: each access point's
+ * RSSI is an absolute level to set the forced-gain I/Q against. */
+esp_err_t radio_scan(void)
+{
+    if (s_started) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = wifi_up();
+    if (err != ESP_OK) return err;
+    return esp_wifi_scan_start(NULL, false);
+}
+
+bool radio_scan_result(unsigned index, unsigned *channel, int *rssi, unsigned *bssid)
+{
+    static wifi_ap_record_t aps[24];
+    static uint16_t count;
+    if (index == 0) {
+        count = sizeof aps / sizeof aps[0];
+        if (esp_wifi_scan_get_ap_records(&count, aps) != ESP_OK) count = 0;
+    }
+    if (index >= count) return false;
+    *channel = aps[index].primary;
+    *rssi = aps[index].rssi;
+    *bssid = aps[index].bssid[4] << 8 | aps[index].bssid[5];
+    return true;
 }
 
 static bool parse_channel(const char *name, char *label, uint16_t *mhz)
@@ -315,4 +351,83 @@ void radio_iq_stop(void)
         s_clock = NULL;
     }
     lanes_drive_low();
+}
+
+/* Lab only: frames heard with the vendor AGC on, by transmitter, to set the forced-gain I/Q against. */
+#define SNIFF_SLOTS 16
+static struct {
+    uint16_t key, count, beacons;
+    int32_t rssi, noise, len;
+} s_sniff[SNIFF_SLOTS];
+
+static void sniffed(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    const wifi_promiscuous_pkt_t *pkt = buf;
+    unsigned len = pkt->rx_ctrl.sig_len;
+    /* Frames too short for a second address are acknowledgements and the like. */
+    uint16_t key = len >= 20 ? pkt->payload[14] << 8 | pkt->payload[15] : 0xffff;
+    for (int i = 0; i < SNIFF_SLOTS; ++i) {
+        if (s_sniff[i].count && s_sniff[i].key != key) continue;
+        s_sniff[i].key = key;
+        ++s_sniff[i].count;
+        s_sniff[i].beacons += len >= 20 && pkt->payload[0] == 0x80;
+        s_sniff[i].rssi += pkt->rx_ctrl.rssi;
+        s_sniff[i].noise += pkt->rx_ctrl.noise_floor;
+        s_sniff[i].len += len;
+        return;
+    }
+}
+
+esp_err_t radio_sniff(uint8_t channel)
+{
+    if (s_started) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = wifi_up();
+    if (err != ESP_OK) return err;
+    memset(s_sniff, 0, sizeof s_sniff);
+    if ((err = esp_wifi_set_promiscuous_rx_cb(sniffed)) != ESP_OK) return err;
+    if ((err = esp_wifi_set_promiscuous(true)) != ESP_OK) return err;
+    return esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+}
+
+bool radio_sniff_result(unsigned i, unsigned *key, unsigned *count, unsigned *beacons, int *rssi, int *noise, int *len)
+{
+    if (i >= SNIFF_SLOTS || !s_sniff[i].count) return false;
+    *key = s_sniff[i].key;
+    *count = s_sniff[i].count;
+    *beacons = s_sniff[i].beacons;
+    *rssi = s_sniff[i].rssi / s_sniff[i].count;
+    *noise = s_sniff[i].noise / s_sniff[i].count;
+    *len = s_sniff[i].len / s_sniff[i].count;
+    return true;
+}
+
+typedef long (*phy_fn_t)(uint32_t, uint32_t, uint32_t);
+extern void phy_pbus_set_rxgain(void);
+extern void phy_pbus_rd(void);
+extern void phy_pbus_xpd_rx_on(void);
+extern void phy_read_hw_noisefloor(void);
+extern void phy_check_sigrssi_en(void);
+extern void phy_get_sigrssi(void);
+extern void phy_pbus_debugmode(void);
+extern void phy_pbus_workmode(void);
+extern void phy_pbus_force_test(void);
+extern void phy_enable_agc(void);
+
+long radio_call(const char *name, uint32_t a, uint32_t b, uint32_t c)
+{
+    static const struct {
+        const char *name;
+        void (*fn)(void);
+    } FNS[] = {
+        {"pbus_set_rxgain", phy_pbus_set_rxgain}, {"pbus_rd", phy_pbus_rd}, {"pbus_xpd_rx_on", phy_pbus_xpd_rx_on},
+        {"read_hw_noisefloor", phy_read_hw_noisefloor}, {"check_sigrssi_en", phy_check_sigrssi_en},
+        {"get_sigrssi", phy_get_sigrssi}, {"pbus_debugmode", phy_pbus_debugmode}, {"pbus_workmode", phy_pbus_workmode},
+        {"pbus_force_test", phy_pbus_force_test}, {"force_rx_gain", (void (*)(void))phy_force_rx_gain},
+        {"enable_agc", phy_enable_agc}, {"disable_agc", (void (*)(void))phy_disable_agc},
+        {"rfagc_disable", (void (*)(void))phy_rfagc_disable}, {"fbw_sel", (void (*)(void))phy_wifi_fbw_sel},
+    };
+    for (size_t i = 0; i < sizeof FNS / sizeof FNS[0]; ++i) {
+        if (strcmp(name, FNS[i].name) == 0) return ((phy_fn_t)FNS[i].fn)(a, b, c);
+    }
+    return -1;
 }
