@@ -84,7 +84,10 @@ static void cmd_antenna(int argc, char **argv)
     char cmd[24] = "antenna", reply[96];
     if (argc > 1) snprintf(cmd, sizeof cmd, "antenna %s", argv[1]);
     /* The C5 saves the choice, and its `ok ` is dropped so the reply reads like channel's. */
-    say("%s\n", c5_request(cmd, reply, sizeof reply, 1000) ? reply + 3 : reply);
+    bool ok = c5_request(cmd, reply, sizeof reply, 1000);
+    say("%s\n", ok ? reply + 3 : reply);
+    /* The C5 nulls its I/Q offset at start for the antenna then in use; the other's rails I or Q at high gain. */
+    if (ok && argc > 1 && decode_running()) decode_start(NULL);
 }
 
 static const command_t s_commands[] = {
