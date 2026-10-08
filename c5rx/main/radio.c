@@ -73,14 +73,14 @@ static const struct {
 };
 #define MIN_MHZ 5180
 #define MAX_MHZ 5945
-/* The tuned frequency from which the 802.11p front-end setting lowers the noise. */
-#define MHZ_11P 5750
 
 static bool s_started;
 static char s_channel[4];
 static uint16_t s_mhz;
 static uint8_t s_gain = DEFAULT_GAIN;
-static bool s_11p;
+/* The PHY's 802.11p setting narrows the receive filter to about 12 MHz and leaves the P4 two clock positions
+ * in three that read the lanes steady, against one in three without it. */
+static bool s_11p = true;
 static parlio_tx_unit_handle_t s_clock;
 static uint8_t *s_clock_pattern;
 
@@ -202,7 +202,6 @@ esp_err_t radio_tune(const char *name)
     if ((err = esp_wifi_set_channel(WIFI_CENTERS[best].channel, WIFI_SECOND_CHAN_NONE)) != ESP_OK) return err;
     if (mhz != WIFI_CENTERS[best].mhz) phy_set_freq(mhz, 0);
     continuous_modem();
-    s_11p = mhz >= MHZ_11P;
     receive_state();
     strlcpy(s_channel, label, sizeof s_channel);
     s_mhz = mhz;
