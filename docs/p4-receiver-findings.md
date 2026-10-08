@@ -102,6 +102,17 @@ A transmitter 50 ft away behind two interior walls arrived at a C/N of about 3 t
 - That 15 to 17 dB was the worst of six positions. Moving the board a few centimetres at a time, with the operator still, gave C/N on the external and internal antennas of 18.5 and 11.5 dB, 14.5 and 6.5, 20 and 12, and 22.5 and 18, each pair repeating within 1.5 dB. The external antenna led by 4.5 to 8 dB and ranged over 8.5 dB between positions; the internal one ranged over 16 dB, so its deep fades, not a fixed loss, made it look far worse. A person moving near the board shifted the external reading by 6 dB.
 - The external antenna's lead does not load the internal one. With the U.FL unplugged at the last position the internal antenna read 16.6 to 16.9 dB against 18 with it attached, and the open socket read about 0 dB, so the switch isolates the two paths by 17 dB or more.
 
+## A transmitter with half the deviation
+
+A quad's transmitter on R4 gave no lock at any range on a first flight test, with the signal strong: gain 45 to 59, I/Q RMS 50 to 75, vsync found, 0 of 262 lines and no color. Raw captures showed clean NTSC that an offline slicer locked on 98% of lines.
+
+- Its sync is 1.3 MHz deep, tip at -2.37 MHz and blanking at -1.07 MHz, against 2.46 MHz from the bench transmitter. Tip to white is about 5.5 MHz against 9.4. The cause was not found: a transmitter set low, or a video line terminated twice, would both do it. The demodulated picture is 6 dB closer to the noise than the bench transmitter's at the same level.
+- Unlocked, the decoder took blanking as the median of what lies 1 to 3 MHz above the tip. That band holds this transmitter's picture, so blanking read -0.1 to -0.3 MHz and the threshold sat below the real blanking level's noise. Lines never locked, so the levels were never measured from line timing. A model of the detector found 53 of 379 lines with those levels and 298 with a 1.2 MHz depth.
+- Fields that fail to lock now try fixed depths of 1.2, 1.7 and 0.8 MHz above the tip in turn, three fields each, after the histogram's own. The quad then locked, at 125 to 160 lines of 262.
+- The rest were lines after vsync. The whole waveform rises about 270 kHz after each vsync and settles over some 80 lines, the tilt of an AC-coupled video path. That is a fifth of this sync depth, and it narrowed the pulses the slicer measured to 3.0 to 3.3 us, under the 3.4 us it accepts. The slicer's thresholds and clamp now follow each line's tip, read on odd lines where the line clock puts it, hit or missed. With that the quad holds 251 to 254 lines at gain 59, sync-tip noise 137 kHz.
+- The picture's black level still takes the field's mean, so the tilt remains in the picture as a brightness gradient down its top third. It has not been judged by eye.
+- Neither change has been run against the bench transmitter or a weak signal.
+
 ## The C5's gain table
 
 - The IDF 6.1 PHY library (esp-phy-lib 5695f4f) keeps the gain table where main's pinned library (59c1234) does: stage spans at `phy_param+0x422` and table maxima at `+0x124..0x126`, confirmed in `phy_set_rx_gain_table`'s disassembly.
