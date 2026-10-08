@@ -87,6 +87,11 @@
 /* The top of the C5's gain table; indices above it clip on noise alone. */
 #define GAIN_MAX 77
 #define GAIN_STEP 2
+/* A quad flying past moved the level 25 dB in a second. The index is about a decibel a step, so a pass
+ * steps straight to the middle of the range, this far at most. */
+#define CONTROL_MS 50
+#define RMS_AIM 54
+#define GAIN_STEP_MOST 10
 /* Heavy clipping, as when a signal returns while the gain sits at its maximum, steps down faster. */
 #define CLIP_PERMILLE_HEAVY 100
 #define GAIN_STEP_HEAVY 8
@@ -324,9 +329,12 @@ static void steer_gain(bool rms_known)
 {
     if (!s_agc) return;
     int gain = s_gain;
+    int off = (int)lrintf(20 * log10f((float)RMS_AIM / (s_rms < 1 ? 1 : s_rms)));
+    off = off > GAIN_STEP_MOST ? GAIN_STEP_MOST : off < -GAIN_STEP_MOST ? -GAIN_STEP_MOST : off;
     if (s_clip_permille > CLIP_PERMILLE_HEAVY) gain -= GAIN_STEP_HEAVY;
-    else if (s_clip_permille > CLIP_PERMILLE_MAX || (rms_known && s_rms > RMS_HIGH)) gain -= GAIN_STEP;
-    else if (s_rms < RMS_LOW) gain += GAIN_STEP;
+    else if (rms_known && s_rms > RMS_HIGH) gain += off < -GAIN_STEP ? off : -GAIN_STEP;
+    else if (s_clip_permille > CLIP_PERMILLE_MAX) gain -= GAIN_STEP;
+    else if (s_rms < RMS_LOW) gain += off;
     gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
     if (gain != s_gain) set_gain(gain);
 }
@@ -336,7 +344,10 @@ static esp_err_t start_rx(void);
 /* A survey tunes away, and what it reads there says nothing of this channel's gain or offset. */
 static volatile bool s_survey;
 
-/* Twice a second: steer the C5's gain and re-centre the phase table on the I/Q offset. The BitScrambler's
+/* Samples still in the ring when the gain steps were taken at the last gain, so the pass after a step is dropped. */
+static bool s_gain_settling;
+
+/* Every CONTROL_MS: steer the C5's gain and re-centre the phase table on the I/Q offset. The BitScrambler's
  * bytes carry no raw I/Q. Power comes from I's magnitude code, and the offset from the balance of the sign
  * bits: a carrier circling its centre spends half its time on each side. */
 static void control(void)
@@ -348,6 +359,12 @@ static void control(void)
         return;
     }
     if (s_survey) return;
+    if (s_gain_settling) {
+        s_gain_settling = false;
+        s_dc_n = s_neg_i = s_neg_q = 0;
+        s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
+        return;
+    }
     int32_t n = s_dc_n;
     /* Another transmitter's bursts clip a few nodes whole and say nothing of this one's level: a Wi-Fi
      * station clipping 1 to 4% of samples held the gain 22 steps under a weak carrier. Most nodes clipping
@@ -355,6 +372,7 @@ static void control(void)
     if (s_dc_nodes >= 128 && s_dc_hot * 2 > s_dc_nodes) {
         s_clip_permille = 1000;
         steer_gain(false);
+        s_gain_settling = true;
         s_dc_n = s_neg_i = s_neg_q = 0;
         s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
         return;
@@ -378,7 +396,7 @@ static void control(void)
     steer_gain(!outside);
     bool stepped = s_gain != gain;
     if (stepped) {
-        /* The next pass reads the new gain alone. */
+        s_gain_settling = true;
         s_dc_n = s_neg_i = s_neg_q = 0;
         s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
         s_bs_err_i = s_bs_err_q = 0;
@@ -403,8 +421,8 @@ static void control(void)
     } else if (stepped) {
         return;
     } else {
-        /* One half second's reading wanders up to 3 units through fades, so it is smoothed over about eight. */
-        const int over = 8;
+        /* Half a second's reading wanders up to 3 units through fades, so it is smoothed over about four seconds. */
+        const int over = 4000 / CONTROL_MS;
         s_bs_err_i += (di - s_bs_err_i) / over;
         s_bs_err_q += (dq - s_bs_err_q) / over;
         if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) {
@@ -1473,7 +1491,7 @@ static void bs_reload(void)
 static void control_task(void *arg)
 {
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(CONTROL_MS));
         /* Any start is at least a node behind by now, except one in the last moment, which waits a pass. */
         static bool muted;
         if (muted) mute_early_logs(false);
