@@ -159,6 +159,10 @@ static uint16_t *s_bs_lut;
 static float s_bs_dc_i, s_bs_dc_q;
 /* Twice the square of each magnitude code's centre: I/Q power from I's code alone. */
 static uint32_t s_bs_power[32];
+/* Four times each magnitude code's centre, and their signed sum over the nodes s_dc_power counts. Only a
+ * survey reads it, so it wraps the rest of the time. */
+static int16_t s_bs_centre4[32];
+static volatile uint32_t s_dc_sum_i;
 static const dma_descriptor_align8_t *s_desc[NODES];
 static volatile int32_t s_neg_i, s_neg_q;
 static volatile bool s_bs_pending, s_bs_broken;
@@ -326,6 +330,9 @@ static void steer_gain(bool rms_known)
 
 static esp_err_t start_rx(void);
 
+/* A survey tunes away, and what it reads there says nothing of this channel's gain or offset. */
+static volatile bool s_survey;
+
 /* Twice a second: steer the C5's gain and re-centre the phase table on the I/Q offset. The BitScrambler's
  * bytes carry no raw I/Q. Power comes from I's magnitude code, and the offset from the balance of the sign
  * bits: a carrier circling its centre spends half its time on each side. */
@@ -337,6 +344,7 @@ static void control(void)
         start_rx();
         return;
     }
+    if (s_survey) return;
     int32_t n = s_dc_n;
     /* Another transmitter's bursts clip a few nodes whole and say nothing of this one's level: a Wi-Fi
      * station clipping 1 to 4% of samples held the gain 22 steps under a weak carrier. Most nodes clipping
@@ -1300,13 +1308,14 @@ static void process_bs(const uint8_t *b, uint32_t bytes)
     }
     lane = first;
     const bool odd = first == 1;
-    uint32_t power = 0, clipped = 0, neg_i = 0, neg_q = 0;
+    uint32_t power = 0, clipped = 0, neg_i = 0, neg_q = 0, sum_i = 0;
     for (uint32_t k = 0; k < DC_WORDS && k < words - 1; ++k) {
         /* Past the marked byte, the phase that follows belongs to the next sample, which is as good. */
-        uint32_t phase = b[2 * k + odd], info = b[2 * k + 1 + odd];
+        uint32_t phase = b[2 * k + odd], info = b[2 * k + 1 + odd], neg = (phase >> 6 ^ phase >> 7) & 1;
         power += s_bs_power[info & 31];
         clipped += (info & 0x60) != 0;
-        neg_i += (phase >> 6 ^ phase >> 7) & 1;
+        sum_i += neg ? -s_bs_centre4[info & 31] : s_bs_centre4[info & 31];
+        neg_i += neg;
         neg_q += phase >> 7;
     }
     ++s_dc_nodes;
@@ -1314,6 +1323,7 @@ static void process_bs(const uint8_t *b, uint32_t bytes)
         ++s_dc_hot;
     } else {
         s_dc_power += power;
+        s_dc_sum_i += sum_i;
         s_dc_clipped += clipped;
         s_neg_i += neg_i;
         s_neg_q += neg_q;
@@ -1534,7 +1544,10 @@ void decode_stop(void)
 
 static esp_err_t start_bs(void)
 {
-    for (int c = 0; c < 32; ++c) s_bs_power[c] = (uint32_t)lrintf(2 * iq_bs_code_centre(c) * iq_bs_code_centre(c));
+    for (int c = 0; c < 32; ++c) {
+        s_bs_power[c] = (uint32_t)lrintf(2 * iq_bs_code_centre(c) * iq_bs_code_centre(c));
+        s_bs_centre4[c] = (int16_t)lrintf(4 * iq_bs_code_centre(c));
+    }
     /* In PSRAM: only the control task touches it, and internal RAM is short. */
     if (!s_bs_lut) s_bs_lut = heap_caps_malloc(1024 * sizeof *s_bs_lut, MALLOC_CAP_SPIRAM);
     if (!s_bs_lut) return ESP_ERR_NO_MEM;
@@ -1749,6 +1762,72 @@ const char *decode_channel(unsigned *mhz)
 {
     *mhz = s_mhz;
     return s_channel;
+}
+
+/* The gain index is about a decibel a step, so this stays put while the gain loop moves. */
+static int level_db(int rms, int gain)
+{
+    return (int)lrintf(20 * log10f(rms < 1 ? 1 : rms)) + GAIN_MAX - gain;
+}
+
+bool decode_signal(int *level)
+{
+    *level = level_db(s_rms, s_gain);
+    return s_running && s_last_vsync_ok && s_last_hits > FIELD_LINES * 3 / 4;
+}
+
+#define SURVEY_SETTLE_MS 4
+#define SURVEY_MS 8
+#define SURVEY_GAIN_STEP 16
+
+/* The RMS over the next SURVEY_MS, or -1 when too much of it clipped. The I/Q offset moves by tens of
+ * units across a band while the phase table stays centred for the channel decoded, so this is I's
+ * variance about its own mean, doubled for Q, rather than the power about the table's centre. */
+static int survey_rms(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(SURVEY_SETTLE_MS));
+    s_dc_n = 0;
+    s_dc_power = s_dc_sum_i = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
+    vTaskDelay(pdMS_TO_TICKS(SURVEY_MS));
+    uint32_t n = s_dc_n, power = s_dc_power, clipped = s_dc_clipped, nodes = s_dc_nodes, hot = s_dc_hot;
+    float mean = n ? (float)(int32_t)s_dc_sum_i / (4 * (float)n) : 0;
+    if (hot * 2 > nodes || clipped * 10 > n) return -1;
+    float var = n ? (float)power / n - 2 * mean * mean : 0;
+    return var > 0 ? (int)lrintf(sqrtf(var)) : 0;
+}
+
+bool decode_survey(const char *const *channels, int n, int8_t *levels, bool (*stop)(void))
+{
+    if (!s_running) return false;
+    char cmd[24], reply[96];
+    const int gain = s_gain;
+    bool all = true;
+    s_survey = true;
+    for (int i = 0; i < n; ++i) {
+        if (stop && stop()) {
+            all = false;
+            break;
+        }
+        snprintf(cmd, sizeof cmd, "tune %s", channels[i]);
+        if (!c5_request(cmd, reply, sizeof reply, 1000)) {
+            levels[i] = 0;
+            continue;
+        }
+        int rms = survey_rms();
+        for (int tries = 0; rms < 0 && s_gain > GAIN_MIN && tries < 3; ++tries) {
+            set_gain(s_gain - SURVEY_GAIN_STEP < GAIN_MIN ? GAIN_MIN : s_gain - SURVEY_GAIN_STEP);
+            rms = survey_rms();
+        }
+        levels[i] = (int8_t)level_db(rms < 0 ? 127 : rms, s_gain);
+        if (s_gain != gain) set_gain(gain);
+    }
+    snprintf(cmd, sizeof cmd, "tune %s", s_channel);
+    c5_request(cmd, reply, sizeof reply, 1000);
+    vTaskDelay(pdMS_TO_TICKS(SURVEY_SETTLE_MS));
+    s_dc_n = s_neg_i = s_neg_q = 0;
+    s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
+    s_survey = false;
+    return all;
 }
 
 void decode_command(int argc, char **argv)
