@@ -85,7 +85,7 @@ Still to do:
 - The floor past the receive filter is the lanes' rounding alone on a clean read, so decimating folds in nothing from outside the filter.
 - A transmitter set to 25 mW at 8 ft, through RHCP antennas, arrived at -53 to -60 dBm, 33 to 40 dB over the noise. Free space puts 25 mW there near -38 dBm, so that link lost 15 to 20 dB somewhere outside the receiver.
 - That transmitter deviates from -5.0 MHz at the sync tip to +4.4 MHz at white, twice the first one's. At 13.33 MS/s the phase difference wraps at ±6.67 MHz, 1.7 MHz past the sync tip. With noise added to a capture, that cost about 2 dB of threshold against summing two differences taken at 26.67 MS/s.
-- The internal antenna receives that transmitter as strongly as the external one, with about 2 dB less noise, but a far larger offset: I sat at -127 at gain 74 on E4, and Q near 95 at gains 74 to 77 on R4.
+- The internal antenna received that transmitter as strongly as the external one, with about 2 dB less noise. Its far larger offset in that test (I at -127 at gain 74 on E4, Q near 95 at gains 74 to 77 on R4) came from switching antennas after the C5 had started, as described under the weak signal below.
 
 ## A weak signal
 
@@ -96,7 +96,9 @@ A transmitter 50 ft away behind two interior walls arrived at a C/N of about 3 t
 - Until lines lock, the levels come from a histogram. Taken from single samples, noise put its 2nd percentile 2 MHz under the sync tip and the threshold under the tip's own mean, so nothing locked. It is now taken from the same 16-block mean.
 - A phase difference past half a turn wraps: at 13.33 MS/s that is 6.67 MHz, 1.7 MHz beyond this transmitter's sync tip and 2.3 MHz beyond its white. Noise drew black specks in white areas and white ones in black. `despeck.S` takes a sample half a turn or more from the mean of the two either side of it as wrapped, and puts it at the end of the range it wrapped past. With noise added to a strong capture, luma specks (errors over 1.5 MHz) fell from 4.5 to 0.2 per thousand at a C/N of 9 dB, 15 to 2.4 at 7 dB and 43 to 16 at 5 dB, the same as summing three differences taken at 40 MS/s with the rule applied. It costs about 9% of core 1. `decode wraps off` turns it off.
 - With these, core 1 runs at about 65% on a locked color picture, against 43% before.
-- The internal antenna cannot be used at the top of the gain table: Q's offset sat at the rail at gain 77 on three channels.
+- The C5 nulls its I/Q offset when it starts, for the antenna selected then. Started on the external antenna, R4 at gain 75 read an offset of +1, +1 there and -22, +127 (railed) on the internal one; started on the internal antenna it read -7, +6 there and +15, -119 on the external one. The earlier note that the internal antenna cannot be used at high gain was this. `antenna int|ext` now restarts a running decoder, without which the gain loop cycled 67 to 75 on the railed antenna and locked nothing.
+- The null is less sure on the internal antenna: one start of four left R4 at -82, +77 at gain 72, and its offset on the neighbouring channels ran +27 to +75 in I against under 20 on the external one.
+- At this range the internal antenna is 15 dB down. Each started on its own antenna at gain 76, R4 less the noise read on 5732 and 5806 MHz gave a carrier of 1750 over noise of 21 on the external antenna (C/N 19 dB), and 56 over 33 on the internal one (C/N 2 dB). The decoder locked 250 to 254 of 262 lines on the external antenna and 20 to 218 on the internal one, both at gain 77. At 8 ft the two were level, so most of the 15 dB is probably where the board sits in the room's multipath and the chip antenna's linear polarisation against an RHCP transmitter; the board has not been moved to check.
 
 ## The C5's gain table
 
