@@ -100,6 +100,7 @@ A transmitter 50 ft away behind two interior walls arrived at a C/N of about 3 t
 - The null is less sure on the internal antenna: one start of four left R4 at -82, +77 at gain 72, and its offset on the neighbouring channels ran +27 to +75 in I against under 20 on the external one.
 - At this range the internal antenna is 15 dB down. Each started on its own antenna at gain 76, R4 less the noise read on 5732 and 5806 MHz gave a carrier of 1750 over noise of 21 on the external antenna (C/N 19 dB), and 56 over 33 on the internal one (C/N 2 dB). The decoder locked 250 to 254 of 262 lines on the external antenna and 20 to 218 on the internal one, both at gain 77.
 - That 15 to 17 dB was the worst of six positions. Moving the board a few centimetres at a time, with the operator still, gave C/N on the external and internal antennas of 18.5 and 11.5 dB, 14.5 and 6.5, 20 and 12, and 22.5 and 18, each pair repeating within 1.5 dB. The external antenna led by 4.5 to 8 dB and ranged over 8.5 dB between positions; the internal one ranged over 16 dB, so its deep fades, not a fixed loss, made it look far worse. A person moving near the board shifted the external reading by 6 dB.
+- The external antenna's lead does not load the internal one. With the U.FL unplugged at the last position the internal antenna read 16.6 to 16.9 dB against 18 with it attached, and the open socket read about 0 dB, so the switch isolates the two paths by 17 dB or more.
 
 ## The C5's gain table
 
