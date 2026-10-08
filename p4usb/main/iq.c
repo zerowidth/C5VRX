@@ -403,60 +403,60 @@ static void bs_capture(const char *name, size_t samples, float dc_i, float dc_q)
 static int s_probe_gain = 52;
 
 typedef struct {
-    /* Per mille of samples standing further outside their two neighbours than the lane's RMS, for I and Q. */
-    uint32_t glitch[2];
     uint32_t rms, clip;
     /* Per mille of samples within half the mean power of it: most of an FM carrier's, 4 in 10 of noise's. */
     uint32_t ring;
-    /* Per mille under 0.35 or over 2.1 times the mean power: off a carrier's ring, as garbage reads are. */
-    uint32_t off_ring;
+    /* Power the fourth difference passes, over the total, each less its share of rounding. */
+    float high;
     int mean[2];
 } quality_t;
 
-/* A lane sampled while the C5's bus is changing reads garbage where it crosses zero, since every bit turns
- * over there: Q read -19, -113, 45 in one bad start. That happens in about three C5 starts in ten, on the Q
- * lanes, and adds some 16 dB of noise to the picture. Neither P4 edge avoids it, and restarting the C5's
- * clock does not move it; only a C5 reset does. */
+/* The fourth difference's power gain for white noise, and the rounding's variance on both lanes (2v+1 steps). */
+#define DIFF4_GAIN 70.0
+#define ROUNDING (2.0 / 3)
+
+/* A lane sampled while the C5's bus is changing takes some bits from one sample and some from the next. At
+ * 40 MS/s the receive filter leaves nothing above about 10 MHz, so a clean read has almost no power there
+ * and a mixed one spreads it evenly: a carrier read 0.02 to 0.05 clean and 19 to 44 mixed, noise under 7
+ * and over 25. */
 static quality_t quality(size_t samples)
 {
     quality_t q = {0};
-    size_t n = samples - STALE - 2;
+    size_t n = samples - STALE;
     uint64_t power = 0;
+    double total = 0, high = 0;
     int *means = q.mean;
     for (int lane = 0; lane < 2; ++lane) {
         int shift = lane * 8;
         int64_t sum = 0, sq = 0;
+        uint64_t diff = 0;
         for (size_t k = STALE; k < samples; ++k) {
             int v = (int8_t)(s_buf[k] >> shift);
             sum += v;
             sq += v * v;
             if (v >= 125 || v <= -125) ++q.clip;
+            if (k >= STALE + 4) {
+                int d = v - 4 * (int8_t)(s_buf[k - 1] >> shift) + 6 * (int8_t)(s_buf[k - 2] >> shift) -
+                        4 * (int8_t)(s_buf[k - 3] >> shift) + (int8_t)(s_buf[k - 4] >> shift);
+                diff += (uint32_t)(d * d);
+            }
         }
-        int mean = means[lane] = sum / (int64_t)(samples - STALE);
-        uint64_t var = sq / (samples - STALE) - (int64_t)mean * mean;
-        power += var;
-        int margin = 0;
-        while ((uint64_t)(margin + 1) * (margin + 1) <= var) ++margin;
-        uint32_t count = 0;
-        for (size_t k = STALE + 1; k + 1 < samples; ++k) {
-            int a = (int8_t)(s_buf[k - 1] >> shift), v = (int8_t)(s_buf[k] >> shift), b = (int8_t)(s_buf[k + 1] >> shift);
-            int lo = a < b ? a : b, hi = a < b ? b : a;
-            if (v < lo - margin || v > hi + margin) ++count;
-        }
-        q.glitch[lane] = (uint32_t)((uint64_t)count * 1000 / n);
-
+        int mean = means[lane] = sum / (int64_t)n;
+        power += sq / n - (int64_t)mean * mean;
+        total += (double)sq / n - ((double)sum / n) * ((double)sum / n);
+        high += (double)diff / (n - 4);
     }
+    /* Under a step of signal there is only rounding to judge by. */
+    q.high = total > 3 * ROUNDING ? (float)((high - DIFF4_GAIN * ROUNDING) / (total - ROUNDING)) : 0;
     while ((uint64_t)(q.rms + 1) * (q.rms + 1) <= power) ++q.rms;
-    uint32_t near = 0, off = 0;
+    uint32_t near = 0;
     for (size_t k = STALE; k < samples; ++k) {
         int i = (int8_t)s_buf[k] - means[0], v = (int8_t)(s_buf[k] >> 8) - means[1];
         uint32_t p = i * i + v * v;
         near += p > power / 2 && p < power * 3 / 2;
-        off += p * 20 < power * 7 || p * 10 > power * 21;
     }
-    q.ring = (uint32_t)((uint64_t)near * 1000 / (samples - STALE));
-    q.off_ring = (uint32_t)((uint64_t)off * 1000 / (samples - STALE));
-    q.clip = (uint32_t)((uint64_t)q.clip * 1000 / (samples - STALE));
+    q.ring = (uint32_t)((uint64_t)near * 1000 / n);
+    q.clip = (uint32_t)((uint64_t)q.clip * 1000 / n);
     return q;
 }
 
@@ -484,26 +484,12 @@ static bool settle_gain(void)
     return true;
 }
 
-/* With a carrier, a lane read mid-change puts 3 or 4 samples in a hundred well off its ring and a clean one
- * almost none. The glitch count is a poorer test there: 1 to 8 clean and 6 to 26 not. Noise has no ring, and
- * glitches 6 to 9 times in a thousand read clean, as independent samples do, and 11 to 200 or hardly at all
- * otherwise, the last when the garbage is most of the lane's power. */
-#define OFF_RING_MAX 20
-#define NOISE_GLITCH_MIN 4
-#define NOISE_GLITCH_MAX 9
+#define HIGH_MAX 12.0f
 #define RING_MIN 600
 
-/* Whether the last probe had a carrier to judge by; noise is a poorer guide. */
+/* Whether the last probe had a carrier. */
 static bool s_verified;
 static int s_dc[2];
-
-static bool mid_change(const quality_t *q)
-{
-    if (q->ring >= RING_MIN) return q->off_ring > OFF_RING_MAX;
-    uint32_t worst = q->glitch[0] > q->glitch[1] ? q->glitch[0] : q->glitch[1];
-    uint32_t least = q->glitch[0] < q->glitch[1] ? q->glitch[0] : q->glitch[1];
-    return worst > NOISE_GLITCH_MAX || least < NOISE_GLITCH_MIN;
-}
 
 /* Captures on each edge and keeps the one read further from the change. Reports whether each edge is clean. */
 static bool pick_edge(bool clean[2])
@@ -517,23 +503,16 @@ static bool pick_edge(bool clean[2])
             return false;
         }
         q[e] = quality(PROBE_SAMPLES);
-        clean[e] = !mid_change(&q[e]);
+        clean[e] = q[e].high <= HIGH_MAX;
     }
-    /* The edges are 3 bus periods apart and read the bus at the same point, so a carrier is judged on both. */
-    if (q[0].ring >= RING_MIN && q[1].ring >= RING_MIN) {
-        clean[0] = clean[1] = q[0].off_ring + q[1].off_ring <= 2 * OFF_RING_MAX;
-    }
-    uint32_t score[2];
-    for (int e = 0; e < 2; ++e) score[e] = q[e].off_ring * 1000 + (q[e].glitch[0] > q[e].glitch[1] ? q[e].glitch[0] : q[e].glitch[1]);
-    int e = clean[0] != clean[1] ? clean[1] : score[1] < score[0];
+    int e = q[1].high < q[0].high;
     s_edge = edges[e];
     s_verified = q[e].ring >= RING_MIN;
     s_dc[0] = q[e].mean[0];
     s_dc[1] = q[e].mean[1];
-    say("per mille glitching on I and Q and off the ring: rise %lu %lu %lu, fall %lu %lu %lu; gain %d, RMS %lu%s: using %s%s\n",
-        (unsigned long)q[0].glitch[0], (unsigned long)q[0].glitch[1], (unsigned long)q[0].off_ring,
-        (unsigned long)q[1].glitch[0], (unsigned long)q[1].glitch[1], (unsigned long)q[1].off_ring, s_probe_gain,
-        (unsigned long)q[e].rms, q[e].ring >= RING_MIN ? "" : ", no carrier", e ? "fall" : "rise",
+    say("power past the receive filter over the total: rise %.2f, fall %.2f; gain %d, RMS %lu%s: using %s%s\n",
+        (double)q[0].high, (double)q[1].high, s_probe_gain, (unsigned long)q[e].rms,
+        q[e].ring >= RING_MIN ? "" : ", no carrier", e ? "fall" : "rise",
         clean[e] ? "" : ", which reads a lane mid-change");
     return true;
 }
@@ -611,16 +590,16 @@ bool iq_retune(const char *channel)
     return true;
 }
 
-/* How the C5's clock edge falls against its bus is settled at its reset and wrong about three times in
- * ten. Running the clock a tick slow for a moment moves the edge some ticks later, so this slips it until
- * both of the P4's edges read clean, which puts the one in use well inside the steady part. */
+/* The probe's rate, at which the receive filter leaves the top of the band empty. */
+#define PROBE_EVERY 2
+
+/* How the C5's clock edge falls against its bus is settled at its reset, and wrong one time in three with
+ * the 802.11p setting and two in three without. Running the clock a tick slow for a moment moves the edge
+ * some ticks later, so this slips it until both of the P4's edges read clean. */
 #define SLIP_TRIES 16
 
-bool iq_start(const char *channel, int every)
+static bool place_clock(void)
 {
-    if (!prepare()) return false;
-    decode_stop();
-    if (!start_c5(channel, every) || !set_probe_gain(s_probe_gain) || !settle_gain()) return false;
     bool clean[2], one_clean = false;
     for (int try = 0; try < SLIP_TRIES; ++try) {
         if (!pick_edge(clean)) return false;
@@ -635,6 +614,23 @@ bool iq_start(const char *channel, int every)
         }
     }
     if (!one_clean) say("iq: no clean clock position found\n");
+    return true;
+}
+
+bool iq_start(const char *channel, int every)
+{
+    if (!prepare()) return false;
+    decode_stop();
+    if (!start_c5(channel, PROBE_EVERY) || !set_probe_gain(s_probe_gain) || !settle_gain() || !place_clock()) return false;
+    if (every == PROBE_EVERY) return true;
+    /* The clock keeps its place against the bus across a change of rate. */
+    char cmd[16], reply[64];
+    snprintf(cmd, sizeof cmd, "iq on %d", every);
+    if (!c5_request(cmd, reply, sizeof reply, 5000)) {
+        say("iq: %s: %s\n", cmd, reply);
+        return false;
+    }
+    s_every = every;
     return true;
 }
 
