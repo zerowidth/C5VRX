@@ -56,22 +56,36 @@ What is not known:
 - Whether the two clean positions differ. The counts do not tell them apart.
 - Whether the standalone C5 receiver, which samples the same bus on a looped PARLIO clock, has the same lottery.
 
-What `iq_start` does:
+What `iq_start` does now:
 
-- It sets a gain that leaves the RMS between 30 and 80 with under 2% clipped, since a clipped signal hides what the test looks for.
-- With a carrier it counts, on each P4 edge, the samples well off the carrier's ring (under 0.35 or over 2.1 times the mean power). The two edges read the bus at the same point, so it judges their sum: over 40 per thousand counts as mid-change, between the 25 and 62 of the map above.
-- With no carrier (under 60% of samples near the mean power) there is no ring, so it counts the samples that stand further outside their two neighbours than the lane's RMS. Noise gives 6 to 9 per thousand read clean, as independent samples do, and 11 to 200, or hardly any when the garbage is most of the lane's power, otherwise.
-- That second count is a poor test with a carrier: clean reads gave 1 to 8 and bad ones 6 to 26, and a start it passed at 6 and 9 decoded with 1025 kHz of noise. That is why a carrier is judged by its ring.
-- While it reads mid-change it slips the clock and counts again, up to 16 times. On noise, where the edges are judged apart, it settles for one clean edge after 8.
-- With a carrier and each edge judged alone at 10 per thousand, 14 starts took 1 to 4 probes each and all decoded with 151 to 249 kHz of sync tip noise. Six of the 14 came up mid-change.
-- Judged on the sum, 24 starts all ended clean: 18 on the first probe, 5 after one slip and 1 after two, the second probe of that one being a 38 and 7 read. Sync tip noise after the last was 182 kHz.
-- On noise the search often runs all 16 tries without both edges clean, about 3 s, and noise is the poorer guide. So a start with no carrier is marked, and the decoder starts once more when a transmitter first locks most of a field. The restart runs on the control task, whose 3 KB stack the probe's receive overflowed (about 6 KB of DMA descriptors), so the first lock after a boot on an empty channel panicked. With 12 KB it restarts about a second after the lock and is decoding again 2 s later.
-- Before slipping was found, the P4 reset the C5 instead until it came up clean: with a carrier, 3 starts in 12 needed one more reset and all 12 ended clean.
+- It probes at 40 MS/s whatever rate the decoder runs at, then changes the rate. The clock keeps its place against the bus across the change: 14 positions in 14 read the same at 40 and at 13.33 MS/s.
+- At 40 MS/s the receive filter leaves nothing above about 10 MHz. A clean read has almost no power there and a mixed one spreads it evenly across the band. The probe takes the power the fourth difference (1 -4 6 -4 1) passes, over the total, each less its share of rounding.
+- A carrier read 0.02 to 0.05 clean and 19 to 44 mixed. Noise read -0.2 to 6 clean and 25 to 80 mixed. The limit is 12, and the same test serves both.
+- It replaced the ring and glitch counts. The ring count flagged all 16 positions on a transmitter whose radius varies 11% across its deviation, and noise had no reliable test, so the position was left to chance.
+- 12 starts in 12 on a carrier and 12 in 12 on empty channels ended clean, each checked against a separate capture. The second start when a transmitter first locks is gone.
+
+The 802.11p setting and the clock:
+
+- With the setting on, the P4's two edges read the bus at different points: one can read clean while the other reads mixed. Without it they read alike. That fits a bus that changes at 40 MS/s with the setting and 80 MS/s without, which has not been checked directly.
+- On a carrier, 3 positions in 8 read mixed with the setting and 7 in 8 without. So below 5750 MHz, where the setting was off, most starts were mixed.
+- A mixed read of a strong carrier put 2500 kHz of scatter on the sync tip against 57 to 64 clean, and raised the floor past the filter about 28 dB.
+- A position that reads clean with the setting does so on every frequency tried from 5200 to 5945 MHz (9 positions, 9 frequencies), so a retune keeps it. `c5rx` now uses the setting on every channel.
+- The setting narrows the receive filter from about ±9.5 MHz to ±6 MHz, measured on noise. Above 5830 MHz the skirt is a little wider.
 
 Still to do:
 
 1. Find how much margin the chosen position has, and whether it holds as the boards warm up.
 2. Look at the clock against a Q lane on an oscilloscope, on good and bad starts, for the margin. The Saleae's 50 MS/s is too slow.
+
+## Absolute level and the noise floor
+
+- `c5rx`'s `sniff on CHANNEL` listens with the vendor AGC still on and reports each transmitter's RSSI. An access point on channel 48 read -65 dBm, and the PHY gave its own noise floor as -97 dBm.
+- The same access point's beacons in forced-gain I/Q stood 28.4 dB above the noise at gain 72 without the 802.11p setting. That puts the forced-gain floor near -93 dBm in 19 MHz, a noise figure of about 8 dB, and about -95 dBm in the 12 MHz the setting leaves. Stronger and weaker stations fell where their RSSI put them.
+- Noise at the top of the gain table is the receiver's own, about 19 dB above the lanes' rounding at gain 77, and it follows the gain step for step from 58 up. From 58 to 77 is about 19 dB.
+- The floor past the receive filter is the lanes' rounding alone on a clean read, so decimating folds in nothing from outside the filter.
+- A transmitter set to 25 mW at 8 ft, through RHCP antennas, arrived at -53 to -60 dBm, 33 to 40 dB over the noise. Free space puts 25 mW there near -38 dBm, so that link lost 15 to 20 dB somewhere outside the receiver.
+- That transmitter deviates from -5.0 MHz at the sync tip to +4.4 MHz at white, twice the first one's. At 13.33 MS/s the phase difference wraps at ±6.67 MHz, 1.7 MHz past the sync tip. With noise added to a capture, that cost about 2 dB of threshold against summing two differences taken at 26.67 MS/s.
+- The internal antenna receives that transmitter as strongly as the external one, with about 2 dB less noise, but a far larger offset: I sat at -127 at gain 74 on E4, and Q near 95 at gains 74 to 77 on R4.
 
 ## The C5's gain table
 
@@ -233,7 +247,7 @@ The decoder runs `bs_phase.bsasm` on PARLIO RX.
 - R4 (5769 MHz, reached from Wi-Fi channel 153) decodes as R3 does: 253 to 254 of 262 lines, sync tip near -2.3 MHz and 80 to 90 kHz of sync tip noise at gain 37 to 40.
 - R8 (5917 MHz, reached from Wi-Fi channel 177 with `phy_set_freq`) decodes the same: 253 to 254 lines at gain 40. The old 5885 MHz ceiling was never a measured limit. E8 (5945 MHz) tunes but has not been seen with a transmitter.
 - `phy_11p_set(1, 0)` lowers R8's sync tip noise from 102 to 105 kHz to 87 to 91 kHz, and the picture noise from 8.2 to 7.1 levels, in an on, off, on, off comparison at the same gain, RMS and burst. Mode 1 raises it to 836 kHz. The call writes modem registers and eight analog registers and is not understood beyond that; the PHY keeps the setting and reapplies it on each channel change.
-- The C5 sets it from 5750 MHz up, the range it was reported for. R8 is the only channel compared with a transmitter, so R4 to R7 run with it unmeasured and nothing is known below 5750 MHz. On empty channels it made the C5's RSSI read about 22 dB higher.
+- The C5 first set it from 5750 MHz up, the range it was reported for, and now sets it on every channel (see [C5 starts that read the lanes mid-change](#c5-starts-that-read-the-lanes-mid-change)). No transmitter has been tried below 5750 MHz with it. On empty channels it made the C5's RSSI read about 22 dB higher.
 - An empty channel at gain 77 has an I offset of about 84 to 90, against about 1 at gain 37. Retuning from there to a strong transmitter left the table's centre outside the carrier's ring. Every I then has one sign, I's power reads as the offset (RMS 148 for a true 45), and the gain went to its floor of 30 while the offset walked back 6 units a pass: about 15 s without a picture.
 - With every I (or Q) on one side, the table now moves in one pass: by the root of half the power on I, which is the offset when it dwarfs the radius, and by a radius on Q. Meanwhile the RMS is an upper bound, so it may raise the gain but only clipping lowers it. Inside the ring the offset is the sign balance times the radius, and the radius is the root of the power over 1 + 2s², s being the sine the balance gives. The same retune now locks in 2.3 to 3.0 s.
 - The sums are cleared after each gain step, so every pass reads one gain. Before, the pass after a step was skipped, and a gain stepping every pass held the offset still.
