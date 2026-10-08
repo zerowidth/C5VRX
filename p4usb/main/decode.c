@@ -172,7 +172,9 @@ static uint32_t s_bs_short, s_bs_mixed, s_bs_rewrites, s_bs_reload_us;
 
 /* Demodulator and sync state, owned by the decode task. */
 /* Demodulated samples; the sync detector reads them four at a time. */
-static int8_t s_hist[HIST] __attribute__((aligned(16)));
+/* With a block of room either side, which despeck reads at the ring's ends. */
+static int8_t s_hist_room[16 + HIST + 16] __attribute__((aligned(16)));
+static int8_t *const s_hist = s_hist_room + 16;
 /* The subcarrier at each sample of its 704-sample period (and a picture's width beyond, so a line never
  * wraps), packed as 65536 cos + sin so one multiply-add per sample mixes both. */
 static int32_t s_lo[LO_PERIOD + VIDEO_WIDTH + MIX];
@@ -185,6 +187,7 @@ static int16_t s_blocks[HIST / 4];
 static uint32_t s_nb;
 static uint32_t s_n;
 static uint8_t s_prev_phase;
+static bool s_despeck = true;
 static bool s_low;
 static uint32_t s_low_start;
 static int32_t s_thr_lo, s_thr_hi;
@@ -1071,10 +1074,10 @@ static void render_line(void)
     }
     if (s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1) emit_field();
 
-    /* The level histogram takes the mean the sync detector slices, every 16 samples: a sample's own noise
-     * drags the sync tip's percentile well under the tip on a weak signal. */
+    /* The level histogram takes the mean the sync detector slices, every 16 samples of every fourth line: a
+     * sample's own noise drags the sync tip's percentile well under the tip on a weak signal. */
     int32_t sum = 0;
-    for (uint32_t i = 0, at = s_line & ~3u; i < (LINE_Q16 >> 16); i += 4) {
+    for (uint32_t i = s_vline & 3 ? UINT32_MAX : 0, at = s_line & ~3u; i < (LINE_Q16 >> 16); i += 4) {
         sum += s_blocks[((at + i) % HIST) / 4];
         if (i < 4 * SYNC_BLOCKS) continue;
         sum -= s_blocks[((at + i - 4 * SYNC_BLOCKS) % HIST) / 4];
@@ -1197,17 +1200,19 @@ static int32_t box_ending(uint32_t nb)
 
 static void detect(uint32_t until)
 {
+    const int16_t *blocks = s_blocks;
     uint32_t nb = s_nb, render_at = s_render_at;
-    int32_t thr_lo = s_thr_lo, thr_hi = s_thr_hi, box = s_box;
+    int32_t thr_lo = SYNC_BLOCKS * s_thr_lo, thr_hi = SYNC_BLOCKS * s_thr_hi, box = s_box, clamp = s_clamp;
     bool low = s_low;
     for (; (int32_t)(until - nb) >= 4; nb += 4) {
-        box += clamped_block(nb) - clamped_block(nb - 4 * SYNC_BLOCKS);
+        int32_t in = blocks[(nb % HIST) / 4], out = blocks[((nb - 4 * SYNC_BLOCKS) % HIST) / 4];
+        box += (in > clamp ? clamp : in) - (out > clamp ? clamp : out);
         if (low) {
-            if (box > SYNC_BLOCKS * thr_hi) {
+            if (box > thr_hi) {
                 low = false;
                 uint32_t end = nb - SYNC_DELAY, width = end - s_low_start;
                 bool hsync = width >= HSYNC_MIN && width <= HSYNC_MAX;
-                on_pulse(hsync ? leading_edge(end - HSYNC_WIDTH, thr_lo) : s_low_start, width);
+                on_pulse(hsync ? leading_edge(end - HSYNC_WIDTH, s_thr_lo) : s_low_start, width);
                 render_at = s_render_at;
                 /* Locked in the picture, nothing matters until the next hsync's window, so skip there. */
                 if (s_hit && s_vline > VSYNC_LINE + VSYNC_WINDOW && s_vline < FIELD_LINES - VSYNC_WINDOW - 1) {
@@ -1218,15 +1223,16 @@ static void detect(uint32_t until)
                     }
                 }
             }
-        } else if (box < SYNC_BLOCKS * thr_lo) {
+        } else if (box < thr_lo) {
             low = true;
             s_low_start = nb - SYNC_DELAY;
         }
         if ((int32_t)(nb + 4 - render_at) >= 0) {
             render_line();
             render_at = s_render_at;
-            thr_lo = s_thr_lo;
-            thr_hi = s_thr_hi;
+            thr_lo = SYNC_BLOCKS * s_thr_lo;
+            thr_hi = SYNC_BLOCKS * s_thr_hi;
+            clamp = s_clamp;
             box = box_ending(nb);
         }
     }
@@ -1236,6 +1242,36 @@ static void detect(uint32_t until)
 }
 
 void bs_demod(const uint8_t *src, int8_t *dst, int16_t *blocks, uint32_t n, uint8_t *prev, int odd);
+void despeck(int8_t *s, int16_t *blocks, uint32_t n, const int8_t *k);
+
+/* A phase difference past half a turn wraps to the other end of the range: at 13.33 MS/s that is 6.67 MHz,
+ * 1.7 MHz beyond this transmitter's sync tip, so noise wraps white to black and sync to white. */
+static const int8_t DESPECK_K[] = {-1, 4, 63, -128};
+
+/* Checks despeck against the same rule in C on random samples, since a wrong one would only show as noise. */
+static void check_despeck(void)
+{
+    enum { N = 8 };
+    static int8_t raw[16 * (N + 2)] __attribute__((aligned(16))), out[16 * (N + 2)] __attribute__((aligned(16)));
+    static int16_t sums[4 * N] __attribute__((aligned(16)));
+    uint32_t seed = 1, bad = 0;
+    for (int pass = 0; pass < 64; ++pass) {
+        for (unsigned i = 0; i < sizeof raw; ++i) {
+            seed = seed * 1664525 + 1013904223;
+            /* Mostly near one level, with a few far from it. */
+            raw[i] = (seed >> 24 & 7) ? (int8_t)(60 + (int)(seed >> 16 & 31)) : (int8_t)(seed >> 8);
+        }
+        memcpy(out, raw, sizeof raw);
+        despeck(out + 16, sums, N, DESPECK_K);
+        for (int i = 16; i < 16 * (N + 1); ++i) {
+            int t = (4 * raw[i] - raw[i - 2] - raw[i - 1] - raw[i + 1] - raw[i + 2]) >> 3;
+            int want = t > 63 ? -128 : t < -64 ? 127 : raw[i];
+            bad += out[i] != want;
+        }
+        for (int k = 0; k < 4 * N; ++k) bad += sums[k] != out[16 + 4 * k] + out[17 + 4 * k] + out[18 + 4 * k] + out[19 + 4 * k];
+    }
+    if (bad) say("despeck differs from its C model at %lu places\n", (unsigned long)bad);
+}
 
 /* Which byte of each word has its top bit always set, over 16 words spread across a run: 1 for the even
  * addresses, 2 for the odd. The other byte's top bit is Q's sign, which turns with the carrier. */
@@ -1288,6 +1324,8 @@ static void process_bs(const uint8_t *b, uint32_t bytes)
     for (uint32_t done = 0; done < words;) {
         uint32_t at = n % HIST, run = words - done < HIST - at ? words - done : HIST - at;
         bs_demod(b + 2 * done, s_hist + at, s_blocks + at / 4, run / 16, &s_prev_phase, odd);
+        if (at == 0) memcpy(s_hist_room, s_hist + HIST - 16, 16);
+        if (s_despeck) despeck(s_hist + at, s_blocks + at / 4, run / 16, DESPECK_K);
         done += run;
         n += run;
     }
@@ -1541,6 +1579,7 @@ static esp_err_t start_rx(void)
 
 static bool start(const char *channel, bool force)
 {
+    check_despeck();
     if (!s_ring) {
         s_ring = heap_caps_aligned_calloc(128, 1, RING_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
         if (!s_ring) {
@@ -1728,6 +1767,8 @@ void decode_command(int argc, char **argv)
         s_tnr_auto = strcmp(argv[2], "auto") == 0;
         if (!s_tnr_auto) s_tnr = atoi(argv[2]);
         if (argc > 3) s_tnr_mix = atoi(argv[3]);
+    } else if (strcmp(sub, "wraps") == 0 && argc > 2) {
+        s_despeck = strcmp(argv[2], "off") != 0;
     } else if (strcmp(sub, "clicks") == 0 && argc > 2) {
         s_clicks = strcmp(argv[2], "off") == 0 ? CLICKS_SHOWN : strcmp(argv[2], "gray") == 0 ? CLICKS_GRAY : CLICKS_HOLD;
     } else if (strcmp(sub, "luma") == 0 && argc > 2) {
@@ -1737,6 +1778,6 @@ void decode_command(int argc, char **argv)
     } else if (strcmp(sub, "") == 0) {
         status();
     } else {
-        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | clicks hold|gray|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
+        say("decode [on [channel] | off | gain auto|N | sat PERCENT | luma plain|soft|peak | clicks hold|gray|off | wraps fix|off | tnr auto|LEVELS [SIXTEENTHS] | bench]\n");
     }
 }
