@@ -121,6 +121,20 @@ A quad's transmitter on R4 gave no lock at any range on a first flight test, wit
 - On a third flight of 74 s the decoder held 240 or more lines for 59 s, against about 20 of 67 s on the second, and logged no new overruns or dropped lines. Gain ran from 45 to 77 and reached 77 two seconds after the quad left.
 - Every second it was not locked had the gain at 77 and an RMS of 12 to 27, bar two: one just after the 25-step climb to 77, with RMS 54, and one fade to RMS 7 at gain 70. Sync-tip noise in those seconds was 630 to 1475 kHz against this transmitter's 1.3 MHz of sync. That is the receiver's limit on this quad. The pilot put it at about 200 ft and was losing the picture in the goggles there too, so the two receivers gave out at about the same range, and the short range belongs to the quad's transmitter.
 
+## Flashes on a steady signal and after a channel change
+
+- With the 50 ms gain loop, a strong steady transmitter on R4 flashed or jumped every second or two. Over 30 s the decoder rewrote its phase table 66 times and corrected its field line count 82 times. With the gain fixed it made one of each in 20 s.
+- The RMS read at a fixed gain wanders about 1 dB either way over seconds (58 to 74 at gain 46), across the loop's upper limit of 72. Each gain step then loaded the offset remembered for the new gain, and a difference of one unit was enough to rewrite the table.
+- The offsets remembered per gain had been learned on other channels. The decoder retunes without restarting and kept them: gains 45, 46, 48 and 49 held -4.5, -6, -10 and -3.25 units for I where all four measured about -4.25. A wrong offset misreads the RMS, which stepped the gain again.
+- A rewrite began on field lines 260 to 3 and stops the receive for about 300 us, on top of what the decode task had not yet read, so it ran into the vertical sync. A later broad pulse was then taken for the first, which set the line count and sometimes the field parity wrong for a field.
+- The gain now moves only after six passes outside 40 to 72, or at once below 27, above 100 or when most nodes clip. A remembered offset within 4 units of the table's stays, the smoothed reading rewrites at 2 units rather than 1, and a retune forgets the remembered offsets.
+- A rewrite now starts on field lines 236 to 245 and the rest of that field is left undrawn, so its gap ends before the vertical sync, which sets the count. It costs the bottom 14 to 24 lines of one field, which keep the last frame's rows.
+- On an empty channel the offset grows with baseband gain: 71, 50, 40, 24 and 20 units for I at gains 77, 74, 71, 68 and 65, about 1 dB a step. A gain step from 58 up now scales the offset by the step when the new gain has no remembered one.
+- After a retune or a gain step of 10 or more, the offset is smoothed over two passes rather than 80 for a second, with steps of up to 24 units. Coming back from an empty channel at gain 77 to a strong R4, the decoder held 249 or more lines 0.6 s after the command, against 1.4 s, with the gain at 37 and the offset within 2 units by 1.4 s.
+- After that: no rewrites and no line count corrections in 45 s on a steady signal at gain 60, and one rewrite in 30 s at gain 34.
+- The OLED's band sweep tunes away for about 150 ms every 500 ms for 4 s after a button press. Each sweep showed as noise, reset the levels and moved the line count (24 corrections over one channel change). During a sweep the line and field counts now run on at their last rate and nothing is drawn, so the picture freezes for the sweep and returns in place: no corrections, and 253 or more lines in every field between sweeps.
+- Not judged by eye. On an empty channel beside a strong one (R5, 37 MHz from a transmitter a foot away) the gain still swings between 69 and 77, since the neighbour clips most nodes at 77.
+
 ## The C5's gain table
 
 - The IDF 6.1 PHY library (esp-phy-lib 5695f4f) keeps the gain table where main's pinned library (59c1234) does: stage spans at `phy_param+0x422` and table maxima at `+0x124..0x126`, confirmed in `phy_set_rx_gain_table`'s disassembly.
