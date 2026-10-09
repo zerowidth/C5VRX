@@ -92,6 +92,11 @@
 #define CONTROL_MS 50
 #define RMS_AIM 54
 #define GAIN_STEP_MOST 10
+/* A level a few dB off costs nothing, and each step costs a table reload's lines, so only one this far off
+ * for GAIN_WAIT passes moves the gain. One past RMS_FAR_LOW or RMS_FAR_HIGH moves it at once. */
+#define GAIN_WAIT 6
+#define RMS_FAR_LOW 27
+#define RMS_FAR_HIGH 100
 /* Heavy clipping, as when a signal returns while the gain sits at its maximum, steps down faster. */
 #define CLIP_PERMILLE_HEAVY 100
 #define GAIN_STEP_HEAVY 8
@@ -154,11 +159,16 @@ BITSCRAMBLER_PROGRAM(bs_phase, "bs_phase");
 #define NODES (RING_BYTES / NODE_BYTES)
 /* How far the table's offset may sit from the signal's before the table is rewritten, which stops the
  * receive for a moment. */
-#define BS_DC_STEP 1.0f
+#define BS_DC_STEP 2.0f
 #define BS_DC_MAX_STEP 6.0f
-/* Field lines between which a rewrite's gap falls after the broad pulses and before the picture. */
-#define BS_RELOAD_BEFORE 2
-#define BS_RELOAD_AFTER 3
+#define DC_NEAR 4
+/* From this gain up a step is baseband gain, which the offset is amplified by: on an empty channel it read
+ * 71, 50, 40, 24 and 20 units at gains 77, 74, 71, 68 and 65. */
+#define GAIN_BB_FROM 58
+/* A rewrite starts between these field lines. Its gap is some 17 lines, timed to two lines either way, so
+ * it ends in the last picture lines and the vertical sync that follows sets the count right. */
+#define BS_RELOAD_FROM (FIRST_ACTIVE + ACTIVE_LINES - 24)
+#define BS_RELOAD_TO (FIRST_ACTIVE + ACTIVE_LINES - 14)
 static bitscrambler_handle_t s_bs_handle;
 static uint16_t *s_bs_lut;
 static float s_bs_dc_i, s_bs_dc_q;
@@ -249,6 +259,9 @@ static uint32_t s_overruns;
 static uint32_t s_vjumps;
 /* Broad pulses that fell outside the vsync window, and fields in a row without a vsync in it. */
 static uint32_t s_vsync_ignored;
+/* After a table rewrite the line count is a guess until the next vertical sync, so the field's last lines
+ * are left as they were. */
+static bool s_vline_guessed, s_field_cut;
 static int s_vsync_missed = VSYNC_REACQUIRE;
 typedef struct {
     uint32_t busy_cycles, permille;
@@ -323,6 +336,18 @@ static void remember_dc(int qi, int qq)
     }
 }
 
+/* The offset at each gain moves by tens of units across a band, so a retune starts the table over and
+ * takes its first readings unsmoothed. */
+#define DC_FAST_PASSES 20
+static int s_dc_fast;
+
+static void forget_dc(void)
+{
+    for (int g = 0; s_dc_at_gain && g <= GAIN_MAX; ++g) s_dc_at_gain[g][0] = DC_UNKNOWN;
+    s_bs_err_i = s_bs_err_q = 0;
+    s_dc_fast = DC_FAST_PASSES;
+}
+
 /* While the table's centre sits outside the carrier's ring the RMS reads high, so it can raise the gain
  * but not lower it. */
 static void steer_gain(bool rms_known)
@@ -336,7 +361,54 @@ static void steer_gain(bool rms_known)
     else if (s_clip_permille > CLIP_PERMILLE_MAX) gain -= GAIN_STEP;
     else if (s_rms < RMS_LOW) gain += off;
     gain = gain < GAIN_MIN ? GAIN_MIN : gain > GAIN_MAX ? GAIN_MAX : gain;
-    if (gain != s_gain) set_gain(gain);
+    static int waited;
+    bool far = s_clip_permille > CLIP_PERMILLE_HEAVY || s_rms < RMS_FAR_LOW || (rms_known && s_rms > RMS_FAR_HIGH);
+    if (gain == s_gain || (!far && ++waited < GAIN_WAIT)) {
+        if (gain == s_gain) waited = 0;
+        return;
+    }
+    waited = 0;
+    set_gain(gain);
+}
+
+/* How much the offset grows over a gain step with no reading of its own. */
+static float bb_scale(int from, int to)
+{
+    from = from < GAIN_BB_FROM ? GAIN_BB_FROM : from;
+    to = to < GAIN_BB_FROM ? GAIN_BB_FROM : to;
+    return powf(10, (to - from) / 20.0f);
+}
+
+/* The gain s_bs_dc was found at. */
+static int s_dc_gain;
+
+/* Hands the decode task a table centred on s_bs_dc, to load ahead of the vertical interval. */
+static void rebuild_table(void)
+{
+    s_dc_gain = s_gain;
+    s_bs_dc_i = fminf(fmaxf(s_bs_dc_i, -127), 127);
+    s_bs_dc_q = fminf(fmaxf(s_bs_dc_q, -127), 127);
+    iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
+    s_bs_pending = true;
+    s_lut_dc_i = lrintf(s_bs_dc_i * 4);
+    s_lut_dc_q = lrintf(s_bs_dc_q * 4);
+}
+
+/* After a gain step, moves the offset to what the new gain had before, or else by the baseband gain's
+ * share of the step. A reload costs lines, so a table within DC_NEAR stays and the smoothed reading closes
+ * the rest. */
+static bool follow_gain(void)
+{
+    float i = s_bs_dc_i * bb_scale(s_dc_gain, s_gain), q = s_bs_dc_q * bb_scale(s_dc_gain, s_gain);
+    if (s_dc_at_gain && s_dc_at_gain[s_gain][0] != DC_UNKNOWN) {
+        i = s_dc_at_gain[s_gain][0] / 4.0f;
+        q = s_dc_at_gain[s_gain][1] / 4.0f;
+    }
+    if (fabsf(i - s_bs_dc_i) < DC_NEAR && fabsf(q - s_bs_dc_q) < DC_NEAR) return false;
+    s_bs_dc_i = i;
+    s_bs_dc_q = q;
+    rebuild_table();
+    return true;
 }
 
 static esp_err_t start_rx(void);
@@ -372,6 +444,7 @@ static void control(void)
     if (s_dc_nodes >= 128 && s_dc_hot * 2 > s_dc_nodes) {
         s_clip_permille = 1000;
         steer_gain(false);
+        if (s_gain != s_dc_gain && !s_bs_pending) follow_gain();
         s_gain_settling = true;
         s_dc_n = s_neg_i = s_neg_q = 0;
         s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
@@ -400,17 +473,13 @@ static void control(void)
         s_dc_n = s_neg_i = s_neg_q = 0;
         s_dc_power = s_dc_clipped = s_dc_nodes = s_dc_hot = 0;
         s_bs_err_i = s_bs_err_q = 0;
+        /* A step this large is a signal arriving or leaving, and the offset is found afresh. */
+        if (abs(s_gain - gain) >= GAIN_STEP_MOST) s_dc_fast = DC_FAST_PASSES;
     }
     if (s_bs_pending) return;
 
-    bool known = stepped && s_dc_at_gain && s_dc_at_gain[s_gain][0] != DC_UNKNOWN;
-    if (known) {
-        /* The offset moves with the gain, so the table goes straight to what this gain had before. A reload
-         * costs lines, so a table within a step of it stays. */
-        if (abs(s_dc_at_gain[s_gain][0] - s_lut_dc_i) < 4 * BS_DC_STEP && abs(s_dc_at_gain[s_gain][1] - s_lut_dc_q) < 4 * BS_DC_STEP) return;
-        s_bs_dc_i = s_dc_at_gain[s_gain][0] / 4.0f;
-        s_bs_dc_q = s_dc_at_gain[s_gain][1] / 4.0f;
-    } else if (s_rms < 4) {
+    if (s_gain != s_dc_gain && follow_gain()) return;
+    if (s_rms < 4) {
         return;
     } else if (outside || outside_q) {
         /* No smoothing: the table is useless until its centre is inside the ring. Taken at the last gain
@@ -422,22 +491,25 @@ static void control(void)
         return;
     } else {
         /* Half a second's reading wanders up to 3 units through fades, so it is smoothed over about four seconds. */
-        const int over = 4000 / CONTROL_MS;
+        const int over = s_dc_fast ? 2 : 4000 / CONTROL_MS;
+        if (s_dc_fast) --s_dc_fast;
         s_bs_err_i += (di - s_bs_err_i) / over;
         s_bs_err_q += (dq - s_bs_err_q) / over;
-        if (fabsf(s_bs_err_i) < BS_DC_STEP && fabsf(s_bs_err_q) < BS_DC_STEP) {
-            if (fabsf(s_bs_err_i) < BS_DC_STEP / 2 && fabsf(s_bs_err_q) < BS_DC_STEP / 2) remember_dc(s_lut_dc_i, s_lut_dc_q);
+        /* The quick readings after a retune are rough, and leave the last few units to the slow ones. */
+        const float step = s_dc_fast ? DC_NEAR : BS_DC_STEP;
+        if (fabsf(s_bs_err_i) < step && fabsf(s_bs_err_q) < step) {
+            if (fabsf(s_bs_err_i) < BS_DC_STEP / 2 && fabsf(s_bs_err_q) < BS_DC_STEP / 2) {
+                remember_dc(s_lut_dc_i, s_lut_dc_q);
+                s_dc_gain = s_gain;
+            }
             return;
         }
-        s_bs_dc_i -= fminf(fmaxf(s_bs_err_i, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
-        s_bs_dc_q -= fminf(fmaxf(s_bs_err_q, -BS_DC_MAX_STEP), BS_DC_MAX_STEP);
+        const float most = s_dc_fast ? 4 * BS_DC_MAX_STEP : BS_DC_MAX_STEP;
+        s_bs_dc_i -= fminf(fmaxf(s_bs_err_i, -most), most);
+        s_bs_dc_q -= fminf(fmaxf(s_bs_err_q, -most), most);
         s_bs_err_i = s_bs_err_q = 0;
     }
-    iq_bs_build_lut(s_bs_lut, s_bs_dc_i, s_bs_dc_q);
-    /* The decode task loads it, in the vertical interval. */
-    s_bs_pending = true;
-    s_lut_dc_i = lrintf(s_bs_dc_i * 4);
-    s_lut_dc_q = lrintf(s_bs_dc_q * 4);
+    rebuild_table();
 }
 
 /* Until lines lock, levels come from each field's histogram: the sync tip is the 2nd percentile and
@@ -593,6 +665,7 @@ static void finish_field(void)
 static void emit_field(void)
 {
     if (!s_field_vsync && s_vsync_missed < VSYNC_REACQUIRE) ++s_vsync_missed;
+    s_field_cut = false;
     s_burst = (int)hypotf(s_burst_re, s_burst_im);
     s_color = s_field_hits >= (s_color ? COLOR_HITS_OFF : COLOR_HITS_ON) && s_burst > (s_color ? COLOR_OFF : COLOR_ON);
     update_levels();
@@ -1082,7 +1155,7 @@ static void render_line(void)
 {
     int row = (s_vline - FIRST_ACTIVE) * 2 + s_parity;
     bool last = s_vline == FIRST_ACTIVE + ACTIVE_LINES - 1;
-    bool draw = !s_skip_render && s_vline >= FIRST_ACTIVE && s_vline < FIRST_ACTIVE + ACTIVE_LINES && row < VIDEO_HEIGHT;
+    bool draw = !s_skip_render && !s_field_cut && s_vline >= FIRST_ACTIVE && s_vline < FIRST_ACTIVE + ACTIVE_LINES && row < VIDEO_HEIGHT;
     if (draw || last) {
         /* The line clock's nearest half sample. */
         uint32_t halves = (s_line_frac + 0x4000) >> 15;
@@ -1213,7 +1286,8 @@ static void on_pulse(uint32_t start, uint32_t width)
             s_parity = into > half / 2 && into < half * 3 / 2;
 
             /* The count wraps at 262 and 263 lines alternately, so one line either way is expected. */
-            if (abs(s_vline - VSYNC_LINE) > 1 && s_vline < FIELD_LINES - 1) ++s_vjumps;
+            if (abs(s_vline - VSYNC_LINE) > 1 && s_vline < FIELD_LINES - 1 && !s_vline_guessed) ++s_vjumps;
+            s_vline_guessed = false;
             /* An odd field's first broad pulse starts mid-way through line 3; an even field's starts line 4,
              * which is the line the clock has just begun. */
             s_vline = s_parity ? VSYNC_LINE : VSYNC_LINE + 1;
@@ -1256,6 +1330,26 @@ static int32_t box_ending(uint32_t nb)
     int32_t sum = 0;
     for (int k = 0; k < SYNC_BLOCKS; ++k) sum += clamped_block(nb - 4 * k);
     return sum;
+}
+
+/* Tuned away for a survey, the line and field counts run on at their last rate and nothing is drawn, so
+ * the picture holds still and comes back where it was. */
+static void coast(uint32_t until)
+{
+    while ((int32_t)(until - s_render_at) >= 0) {
+        if (++s_vline >= FIELD_LINES + !s_parity) {
+            s_vline = 0;
+            s_parity ^= 1;
+        }
+        uint32_t next = s_line_frac + s_period;
+        s_line += next >> 16;
+        s_line_frac = next & 0xffff;
+        s_render_at = s_line + RENDER_AT;
+    }
+    s_nb = until & ~3u;
+    s_box = box_ending(s_nb);
+    s_low = false;
+    s_hit = false;
 }
 
 static void detect(uint32_t until)
@@ -1392,7 +1486,8 @@ static void process_bs(const uint8_t *b, uint32_t bytes)
         n += run;
     }
     __atomic_store_n(&s_n, n, __ATOMIC_RELEASE);
-    if (!s_skip_detect) detect(n);
+    if (s_survey) coast(n);
+    else if (!s_skip_detect) detect(n);
 }
 
 /* The driver's descriptor for each node of the ring, found by walking its circular list. */
@@ -1476,13 +1571,17 @@ static void bs_reload(void)
     skip_stale(stale);
     s_bs_reload_us = s_read_us - t0;
     /* The lines that went by meanwhile, counting half a node for what the DMA had not finished. */
+    const int last = FIRST_ACTIVE + ACTIVE_LINES - 1;
     for (int k = (s_bs_reload_us + NODE_BYTES * 250000ll / FS_HZ + 32) / 64; k > 0; --k) {
+        /* The field ends on its last line, so the count stops short of it. */
+        if (s_vline == last - 1) break;
         if (++s_vline >= FIELD_LINES + !s_parity) {
             s_vline = 0;
             s_parity ^= 1;
         }
     }
     s_missed = LOST_AFTER_LINES;
+    s_vline_guessed = s_field_cut = true;
     ++s_bs_rewrites;
     s_bs_pending = false;
 }
@@ -1564,9 +1663,8 @@ static void decode_task(void *arg)
                 s_read = stop % RING_BYTES;
             }
             s_read_us = now;
-            /* The stop and the relock cost about 12 lines, which fit between the last picture line and the first. */
-            bool blank = s_vline >= FIELD_LINES - BS_RELOAD_BEFORE || s_vline <= BS_RELOAD_AFTER;
-            if (s_bs_pending && (blank || s_missed >= LOST_AFTER_LINES)) bs_reload();
+            bool low = s_vline >= BS_RELOAD_FROM && s_vline < BS_RELOAD_TO;
+            if (s_bs_pending && (low || s_missed >= LOST_AFTER_LINES)) bs_reload();
         }
         account(&s_demod_load, t0);
     }
@@ -1678,7 +1776,9 @@ static bool start(const char *channel, bool force)
     set_gain(s_agc ? iq_gain() : s_gain);
     /* The table starts on the offset the probe's raw capture measured, which the sign balance takes seconds
      * and several rewrites to find. */
+    forget_dc();
     iq_dc(&s_bs_dc_i, &s_bs_dc_q);
+    s_dc_gain = s_gain;
     s_lut_dc_i = lrintf(s_bs_dc_i * 4);
     s_lut_dc_q = lrintf(s_bs_dc_q * 4);
     esp_err_t err = start_rx();
@@ -1796,6 +1896,7 @@ bool decode_start(const char *channel)
     /* The C5 streams I/Q across a retune and the gain loop follows the new signal, so no restart is needed. */
     if (s_running && channel && strcasecmp(channel, s_channel) != 0) {
         if (!iq_retune(channel)) return false;
+        forget_dc();
         strlcpy(s_channel, iq_channel(&s_mhz), sizeof s_channel);
         return true;
     }
