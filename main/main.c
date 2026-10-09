@@ -8,6 +8,7 @@
 
 #include "rf.h"
 #include "video.h"
+#include "soc/pcr_struct.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,6 +22,9 @@
 
 void app_main(void)
 {
+    /* IDF gates UART0's clock when it is not the console, and the ROM hangs
+     * waiting for a UART0 reset after a USB-Serial-JTAG (core) reset. */
+    PCR.uart0_sclk_conf.uart0_sclk_en = 1;
 #if CONFIG_C5VRX_BS_RELATIVE_WORKER_PROBE
     bs_relative_worker_probe_run();
 #endif

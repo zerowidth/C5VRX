@@ -1,0 +1,27 @@
+CONFIG_IDF_TARGET="esp32p4"
+# This P4-Pico is a rev v1.3 chip, which v3 builds do not support.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# Console is UART0 on the CH343 USB-C; GPIO 24/25 carry the C5's sample clock and Q7.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=n
+
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_FREERTOS_HZ=1000
+
+# Frame and JPEG buffers live in the in-package PSRAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# The console runs here, and a PARLIO RX receive puts 16 bytes per 4 KB of buffer on the caller's stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
+
+# The decoder's per-sample loop needs optimized code.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# The JPEG encoder writes its whole input back from the cache inside a critical section, which held
+# core 0 for about 5 ms per frame; in 32 KB chunks the decoder's drawing task gets in between.
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS_MAX_LEN=0x8000
+CONFIG_ESP_TASK_WDT_PANIC=y

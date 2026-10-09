@@ -1,0 +1,38 @@
+# Companded phase lookup on PARLIO RX words (I on bits 1..7, Q on bits 9..15), three lookups a sample.
+# The LUT is loaded at run time: the low byte of entries 0..127 and 128..255 turns I and Q into a 5-bit
+# magnitude code and a sign, and the high byte of entry (I code << 5 | Q code) is the first-quadrant angle.
+# The LUT's address is output bits 16..25 of the cycle before.
+# Writes 32 bits a sample for checking: the phase byte, I in bits 8..14, and Q in bit 15 and bits 26..31.
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+emit:
+    # L is the last sample's angle and O6..O7 its signs. Address the I table with the next sample.
+    set 0..5 L8..L13,
+    set 6..7 O6..O7,
+    set 8..14 1..7,
+    set 15 9,
+    set 26..31 10..15,
+    set 16..22 17..23,
+    set 23..25 L,
+    write 32,
+    read 16,
+    jmp q_code
+
+q_code:
+    # L is the I entry: keep its code and sign, and address the Q table.
+    set 8..13 L0..L5,
+    set 16..22 9..15,
+    set 23 H,
+    set 24..25 L,
+    jmp pair
+
+pair:
+    # L is the Q entry: address the pair table with both codes and keep both signs.
+    set 6 O13,
+    set 7 L5,
+    set 16..20 L0..L4,
+    set 21..25 O8..O12,
+    jmp emit

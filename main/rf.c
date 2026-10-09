@@ -87,6 +87,9 @@ static volatile uint32_t s_native_agc_blocked_writes;
 #define SELECTOR_MASK   0x01fe0000u
 #define HP_SRAM_USAGE   0x60095004u
 
+/* Waveshare ESP32-C5-Zero: low selects the on-board antenna, high the U.FL. */
+#define ANTENNA_SEL_GPIO GPIO_NUM_26
+
 /* MODEM_DIAG lane mapping: Q[9:6] on DIAG[6:9], I[9:6] on DIAG[16:19].
  * GPIO mapping correlated against physical ESP32-C5 hardware captures.
  * These GPIOs connect to the PARLIO RX data_gpio_nums[] array (same order). */
@@ -408,6 +411,10 @@ void rf_dump_agc_regs(void)
 
 esp_err_t rf_start(void)
 {
+    gpio_reset_pin(ANTENNA_SEL_GPIO);
+    gpio_set_direction(ANTENNA_SEL_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(ANTENNA_SEL_GPIO, 0);
+
     /* NVS is required by ESP-IDF Wi-Fi/PHY initialization. */
     esp_err_t err = init_nvs();
     if (err != ESP_OK) return err;

@@ -1,0 +1,65 @@
+# Companded phase lookup on PARLIO RX words (I on bits 1..7, Q on bits 9..15), four cycles a sample.
+# The LUT's address is output bits 16..25 of the cycle before. It is loaded at run time (iq_bs_build_lut):
+#   low byte, entries 0..127: I's magnitude code (bits 0..4), sign (5) and clipped flag (6)
+#   low byte, entries 128..255 and 384..511: the same for Q when I is positive and negative, but with bit 5
+#     set in the odd quadrants (signs differ) and Q's sign in bit 7
+#   high byte, entry (x code << 5 | y code): the angle of (x, y) in the first quadrant, 64 to a quarter turn
+# In the odd quadrants the two codes swap places, so the angle is always measured on from the start of the
+# quadrant and the phase needs no arithmetic: it is the quadrant above the angle.
+# Writes 16 bits a sample. Byte 0 is the phase, 256 to a turn. Byte 1 is for the gain control: I's
+# magnitude code in bits 0..4, I and Q clipped in bits 5 and 6, and bit 7 always set so the reader can tell
+# the two bytes apart: the first EOF after a start reaches the DMA between a word's two bytes, so from then
+# on byte 1 sits on the even addresses.
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+emit:
+    # L is the last sample's angle and O6..O7 its quadrant. Address the I table with the next sample.
+    set 0..5 L8..L13,
+    set 6..7 O6..O7,
+    set 8..12 O8..O12,
+    set 13..14 O14..O15,
+    set 15 H,
+    set 16..22 17..23,
+    set 23..25 L,
+    write 16,
+    read 16,
+    jmp i_entry
+
+i_entry:
+    # L is the I entry: keep its code and clipped flag, and address the Q table for I's sign.
+    set 8..12 L0..L4,
+    set 14 L6,
+    set 16..22 9..15,
+    set 23 H,
+    set 24 L5,
+    set 25 L,
+    jmp q_entry
+
+q_entry:
+    # L is the Q entry: keep its code, the quadrant and its clipped flag, and swap the codes if it says so.
+    set 0..4 L0..L4,
+    set 6 L5,
+    set 7 L7,
+    set 8..12 O8..O12,
+    set 14 O14,
+    set 15 L6,
+    if L5 pair_swapped
+
+pair:
+    set 6..7 O6..O7,
+    set 8..12 O8..O12,
+    set 14..15 O14..O15,
+    set 16..20 O0..O4,
+    set 21..25 O8..O12,
+    jmp emit
+
+pair_swapped:
+    set 6..7 O6..O7,
+    set 8..12 O8..O12,
+    set 14..15 O14..O15,
+    set 16..20 O8..O12,
+    set 21..25 O0..O4,
+    jmp emit

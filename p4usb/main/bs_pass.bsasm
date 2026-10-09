@@ -1,0 +1,11 @@
+# Copies each 16-bit PARLIO RX word unchanged, to show the BitScrambler runs in the receive path.
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 0
+cfg lut_width_bits 8
+
+loop:
+    set 0..15 0..15,
+    read 16,
+    write 16,
+    jmp loop
